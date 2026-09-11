@@ -456,6 +456,15 @@ translate:
 #else /* !_WIN32  -- POSIX / Linux */
 /* ======================================================================== */
 
+/* Host path of the file a title last opened (see the Win32 branch). Not
+ * tracked on POSIX yet: the empty string makes the bridge's .wmv FMV
+ * trigger simply not fire. */
+const wchar_t *xbox_LastHostPath(void)
+{
+    static const wchar_t empty[1] = { 0 };
+    return empty;
+}
+
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>

@@ -57,6 +57,8 @@ int  xbox_worker_stack_alloc(void);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
 /* Memory access - same as recomp_types.h MEM32 but without the #define guard */
+uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+
 #define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
 
 /* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */

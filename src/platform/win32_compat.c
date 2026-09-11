@@ -897,33 +897,86 @@ static int prot_from_page(DWORD protect)
     }
 }
 
+/* Host page size. 4 KB on x86 Linux, 16 KB on Apple Silicon -- the guest
+ * always thinks in 4 KB pages, so anything handed to mprotect/mmap has to be
+ * widened to host pages first. */
+static uintptr_t host_page_size(void)
+{
+    static uintptr_t ps;
+    if (!ps) { long v = sysconf(_SC_PAGESIZE); ps = v > 0 ? (uintptr_t)v : 4096; }
+    return ps;
+}
+static void *page_floor(const void *p)
+{
+    return (void *)((uintptr_t)p & ~(host_page_size() - 1));
+}
+static SIZE_T page_span(const void *p, SIZE_T n)
+{
+    uintptr_t ps = host_page_size();
+    uintptr_t lo = (uintptr_t)p & ~(ps - 1);
+    uintptr_t hi = ((uintptr_t)p + n + ps - 1) & ~(ps - 1);
+    return (SIZE_T)(hi - lo);
+}
+
+/* ---- Guest address-space reservation (see win32_compat.h) ------------ */
+static uintptr_t s_guest_lo, s_guest_hi;
+
+LPVOID win32_compat_reserve_guest_space(SIZE_T size)
+{
+    if (s_guest_lo) return (LPVOID)s_guest_lo;
+    void *p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS
+#if defined(MAP_NORESERVE)
+                   | MAP_NORESERVE
+#endif
+                   , -1, 0);
+    if (p == MAP_FAILED) { SetLastError(8); return NULL; }
+    s_guest_lo = (uintptr_t)p;
+    s_guest_hi = s_guest_lo + size;
+    return p;
+}
+
+BOOL win32_compat_in_guest_space(LPCVOID address, SIZE_T size)
+{
+    uintptr_t a = (uintptr_t)address;
+    return s_guest_lo && a >= s_guest_lo && a + size <= s_guest_hi;
+}
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    int inside = address && win32_compat_in_guest_space(address, size);
 
     /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
      * just adjust protection. */
     if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
-        if (mprotect(address, size, prot) == 0)
+        if (mprotect(page_floor(address), page_span(address, size), prot) == 0)
             return address;
         /* fall through to a fresh mapping */
     }
 
+    if (inside) {
+        /* Our own reservation: replacing its PROT_NONE pages is the point. */
+        if ((uintptr_t)address & (host_page_size() - 1)) {
+            SetLastError(87);   /* ERROR_INVALID_PARAMETER: not host-page aligned */
+            return NULL;
+        }
+        flags |= MAP_FIXED;
+    }
 #if defined(MAP_FIXED_NOREPLACE)
-    if (address) flags |= MAP_FIXED_NOREPLACE;
-#elif defined(__APPLE__)
-    /* TODO: mach_vm_map with VM_FLAGS_FIXED (which does fail rather than replace),
-     * or a mach_vm_region probe before an MAP_FIXED call. */
+    else if (address) flags |= MAP_FIXED_NOREPLACE;
 #endif
     void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
                    flags, -1, 0);
     if (p == MAP_FAILED) { SetLastError(8); return NULL; }
-#if !defined(MAP_FIXED_NOREPLACE)
-    /* TODO: Without MAP_FIXED_NOREPLACE (macOS or older kernels) plain
-     * MAP_FIXED would silently unmap whatever already lives there. Getting a
-     * different address means the range was taken: fail as Linux does. */
-#endif
+    if (address && p != address) {
+        /* Without MAP_FIXED_NOREPLACE (macOS) the address is only a hint.
+         * Landing elsewhere means the range was taken: fail as Linux does,
+         * rather than hand back memory the caller will not look for. */
+        munmap(p, size);
+        SetLastError(487);      /* ERROR_INVALID_ADDRESS */
+        return NULL;
+    }
     return p;
 }
 
@@ -940,10 +993,23 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
     return TRUE;
 }
 
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx)
+{
+    BOOL ok = TRUE;
+    pthread_mutex_lock(&once->lock);
+    if (!once->done) {
+        ok = fn(once, param, ctx);
+        once->done = ok ? 1 : 0;
+    }
+    pthread_mutex_unlock(&once->lock);
+    return ok;
+}
+
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
 {
     if (oldProtect) *oldProtect = PAGE_READWRITE;
-    return mprotect(address, size, prot_from_page(newProtect)) == 0;
+    return mprotect(page_floor(address), page_span(address, size),
+                    prot_from_page(newProtect)) == 0;
 }
 
 /* ===================================================================== */
@@ -1044,7 +1110,10 @@ VOID DebugBreak(void) {
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
-    // TODO: Darwin explicit_bzero equivalent is memset_s.
+    /* volatile stores the optimiser may not drop (memset_s needs
+     * __STDC_WANT_LIB_EXT1__ before <string.h>, which is already included). */
+    volatile unsigned char *v = (volatile unsigned char *)ptr;
+    while (cnt--) *v++ = 0;
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1137,6 +1206,15 @@ DWORD GetFileSize(HANDLE h, LPDWORD high)
     if (fstat(fd, &st) != 0) return INVALID_FILE_SIZE;
     if (high) *high = (DWORD)(((uint64_t)st.st_size >> 32) & 0xFFFFFFFFu);
     return (DWORD)(st.st_size & 0xFFFFFFFFu);
+}
+
+BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
+{
+    int fd = w32_handle_fd(h);
+    struct stat st;
+    if (!size || fd < 0 || fstat(fd, &st) != 0) return FALSE;
+    size->QuadPart = (LONGLONG)st.st_size;
+    return TRUE;
 }
 
 BOOL FlushFileBuffers(HANDLE h)
@@ -1296,8 +1374,20 @@ static size_t view_take(const void *addr)
 static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
-    // TODO: use shm_open on macOS 10.12+ or mkstemp + unlink for older versions
-    return 0;
+    /* POSIX shared memory, unlinked at once so it is anonymous and dies with
+     * the last mapping. Darwin caps the name at 31 chars. Note a Darwin shm
+     * object accepts ftruncate only once -- CreateFileMappingA sizes it once. */
+    static volatile unsigned s_seq;
+    char path[32];
+    (void)name;
+    for (int tries = 0; tries < 16; tries++) {
+        snprintf(path, sizeof path, "/xbr.%d.%u", (int)getpid(),
+                 __sync_fetch_and_add(&s_seq, 1));
+        int fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) { shm_unlink(path); return fd; }
+        if (errno != EEXIST) break;
+    }
+    return -1;
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
@@ -1340,10 +1430,24 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     off_t  off = ((off_t)offHigh << 32) | offLow;
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED | (baseAddr ? MAP_FIXED : 0);
+    int flags  = MAP_SHARED;
+    if (baseAddr) {
+#if defined(__APPLE__)
+        /* Outside our reservation the address is a hint (see VirtualAlloc):
+         * plain MAP_FIXED could clobber a live mapping without a word. */
+        if (win32_compat_in_guest_space(baseAddr, len)) flags |= MAP_FIXED;
+#else
+        flags |= MAP_FIXED;
+#endif
+    }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
     if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (baseAddr && p != baseAddr) {
+        munmap(p, len);
+        SetLastError(487);      /* ERROR_INVALID_ADDRESS */
+        return NULL;
+    }
     view_register(p, len);
     return p;
 }
@@ -1380,8 +1484,20 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
 {
 #if defined(__APPLE__)
-    /* TODO: Darwin has no sysinfo(2): physical memory comes from sysctl, the free
-     * page count from the Mach VM statistics, swap from vm.swapusage. */
+    /* Darwin has no sysinfo(2): total from sysctl, free from Mach VM stats. */
+    if (!b) return FALSE;
+    uint64_t total = 0; size_t len = sizeof total;
+    if (sysctlbyname("hw.memsize", &total, &len, NULL, 0) != 0) return FALSE;
+    vm_statistics64_data_t vs;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    uint64_t avail = total / 2;   /* fallback if the host query fails */
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vs, &cnt) == KERN_SUCCESS)
+        avail = ((uint64_t)vs.free_count + vs.inactive_count) * (uint64_t)vm_page_size;
+    b->ullTotalPhys     = total;
+    b->ullAvailPhys     = avail;
+    b->ullTotalPageFile = total;
+    b->ullAvailPageFile = avail;
 #else
     struct sysinfo si;
     if (!b) return FALSE;

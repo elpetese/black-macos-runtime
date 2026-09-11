@@ -96,6 +96,26 @@ VOID LeaveCriticalSection(LPCRITICAL_SECTION cs);
 BOOL TryEnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID DeleteCriticalSection(LPCRITICAL_SECTION cs);
 
+/* ---- Slim reader/writer locks and one-time init -------------------- */
+/* pthread-backed: SRWLOCK is a rwlock, INIT_ONCE a mutex-guarded flag. */
+#include <pthread.h>
+typedef pthread_rwlock_t SRWLOCK, *PSRWLOCK;
+#define SRWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
+#define InitializeSRWLock(l)       pthread_rwlock_init((l), NULL)
+#define AcquireSRWLockShared(l)    pthread_rwlock_rdlock(l)
+#define ReleaseSRWLockShared(l)    pthread_rwlock_unlock(l)
+#define AcquireSRWLockExclusive(l) pthread_rwlock_wrlock(l)
+#define ReleaseSRWLockExclusive(l) pthread_rwlock_unlock(l)
+
+typedef struct { pthread_mutex_t lock; volatile int done; } INIT_ONCE, *PINIT_ONCE;
+#define INIT_ONCE_STATIC_INIT { PTHREAD_MUTEX_INITIALIZER, 0 }
+typedef BOOL (*PINIT_ONCE_FN)(PINIT_ONCE, PVOID, PVOID *);
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx);
+
+#ifndef MAXIMUM_WAIT_OBJECTS
+#define MAXIMUM_WAIT_OBJECTS 64
+#endif
+
 /* ---- Condition variables (paired with a CRITICAL_SECTION) ----------- */
 VOID InitializeConditionVariable(PCONDITION_VARIABLE cv);
 BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWORD ms);
@@ -185,6 +205,16 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 BOOL   VirtualFree(LPVOID address, SIZE_T size, DWORD freeType);
 BOOL   VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect);
 
+/* Host-side reservation of the whole 32-bit guest address space.
+ *
+ * Needed where the guest's addresses cannot be mapped at their real values
+ * (macOS/arm64: __PAGEZERO covers the low 4 GB). Once registered, VirtualAlloc
+ * and MapViewOfFileEx map *inside* the reservation with MAP_FIXED -- safe,
+ * because this process owns that range -- instead of treating the address as
+ * a hint the kernel is free to ignore. Returns the base, or NULL. */
+LPVOID win32_compat_reserve_guest_space(SIZE_T size);
+BOOL   win32_compat_in_guest_space(LPCVOID address, SIZE_T size);
+
 /* ---- Time ------------------------------------------------------------- */
 VOID  GetSystemTimeAsFileTime(LPFILETIME ft);
 VOID  GetSystemTime(LPSYSTEMTIME st);
@@ -238,6 +268,7 @@ HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share,
 BOOL   ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped);
 BOOL   WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlapped);
 DWORD  GetFileSize(HANDLE h, LPDWORD high);
+BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
 BOOL   FlushFileBuffers(HANDLE h);
 
 /* ---- Keyboard + window helpers (stubs on POSIX) --------------------- */
@@ -478,6 +509,8 @@ void  _aligned_free(void *ptr);
 
 /* ---- Case-insensitive string compare --------------------------------- */
 int _stricmp(const char *a, const char *b);
+/* MSVC strtok_s(str, delim, ctx) has strtok_r's signature. */
+#define strtok_s strtok_r
 int _strnicmp(const char *a, const char *b, SIZE_T n);
 
 /* ---- Wide-string helpers (operate on the 16-bit Xbox WCHAR) ----------

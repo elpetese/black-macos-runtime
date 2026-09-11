@@ -14,6 +14,8 @@
  *
  * Off unless RECOMP_FB_WINDOW is set.
  */
+#include <stdint.h>
+
 #if defined(_WIN32)
 #include <windows.h>
 #include <stdio.h>

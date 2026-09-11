@@ -1033,6 +1033,34 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Windows 11 where low addresses are often reserved), try page-aligned
      * addresses upward until we find a free region.
      */
+#if defined(__APPLE__) || defined(XBR_GUEST_RESERVE)
+    /*
+     * Reserve the entire 32-bit guest address space and lay everything out
+     * inside it: guest VA x lives at host (reserve + x).
+     *
+     * Required on macOS/arm64, where __PAGEZERO owns the low 4 GB and no
+     * address in the try_bases list below can ever be mapped. It also gives
+     * the regions mapped later (contiguous window, tiled aperture, NV2A,
+     * MCPX, flash -- all placed at VA + g_memory_offset) a range nothing
+     * else in the process can be occupying. XBR_GUEST_RESERVE forces the
+     * same path on Linux so it can be tested there.
+     */
+    {
+        uint8_t *guest = (uint8_t *)win32_compat_reserve_guest_space(
+            (SIZE_T)1 << 32);
+        if (guest) {
+            g_memory_base = MapViewOfFileEx(
+                g_mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0,
+                g_memory_size, guest + XBOX_MAP_START);
+            if (g_memory_base)
+                fprintf(stderr, "xbox_MemoryLayoutInit: guest space reserved"
+                                " at %p (4 GB)\n", (void *)guest);
+        } else {
+            fprintf(stderr, "xbox_MemoryLayoutInit: could not reserve 4 GB"
+                            " of address space for the guest\n");
+        }
+    }
+#else
     {
         static const uintptr_t try_bases[] = {
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
@@ -1063,6 +1091,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
         }
     }
+
+#endif
 
     if (!g_memory_base) {
         fprintf(stderr, "xbox_MemoryLayoutInit: failed to map base view (%zu KB)\n",

@@ -27,6 +27,13 @@
 #include <sys/statvfs.h>
 #include <dirent.h>
 #include <fnmatch.h>
+
+/* Xbox volume geometry (FATX: 512-byte sectors, 32 per cluster = 16 KB).
+ * Defined here, above the _WIN32 split, so both branches see it -- see the
+ * note at xbox_NtQueryVolumeInformationFile. */
+#define XBOX_BYTES_PER_SECTOR       512u
+#define XBOX_SECTORS_PER_CLUSTER    32u
+
 #endif
 
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
@@ -481,8 +488,6 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
  * which reads as a title that did nothing rather than one that failed.
  *
  * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
-#define XBOX_BYTES_PER_SECTOR       512u
-#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -688,6 +693,15 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 #else /* !_WIN32 */
 /* ====================  POSIX backend  =================================== */
 /* ======================================================================== */
+
+/* Last host-side file error, read by the bridge's diagnostics. The POSIX
+ * backend does not record one yet, so it reads as "no error". */
+uint32_t g_xbox_last_file_error;
+
+uint32_t xbox_LastFileError(void)
+{
+    return g_xbox_last_file_error;
+}
 
 /* Convert Xbox access mask + disposition to POSIX open() flags. */
 static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
