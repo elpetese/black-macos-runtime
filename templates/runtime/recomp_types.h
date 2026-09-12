@@ -325,13 +325,36 @@ void recomp_trace_esp(const char *name, const char *tag);
  * ================================================================ */
 
 /**
+ * Canonically resolve an Xbox VA to its low (RAM) form before adding the host
+ * offset. Defined in xbox_memory_layout.c; when RECOMP_LOG_CONTIG is set the
+ * real function also logs every contig-window access (budget-limited) so
+ * Parche 2/3 can identify the "venenosa" address behind the known
+ * KeWaitForSingleObject hang.
+ *
+ * Parche 3 (regional alias): only VAs in 0x800F0000-0x80100000 are folded.
+ * The rest of the contig-window is left alone because Black stores guest
+ * dispatcher objects there (with bit 31 set); fully stripping bit 31 turns
+ * those into low-RAM pointers that fall into unmapped gaps, which makes
+ * xbox_dispatcher_handle fail to find the object and KeWaitForSingleObject
+ * hangs forever.
+ *
+ * The fake kernel PE page at 0x80010000 is excluded from the alias so the
+ * RenderWare PE probe at MEM32(0x8001003C) reads the zero-section stub,
+ * not the loaded XBE header at 0x00010000.
+ */
+extern uint32_t xbox_canon_va(uint32_t va);
+
+/**
  * Translate an Xbox VA to an actual pointer.
  * Mask to 32-bit first: Xbox addresses are 32-bit and arithmetic
  * in the recompiled code can overflow. Without the mask, a 64-bit
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
- * our mapping and causing access violations.
+ * our mapping and causing access violations. Then fold the contiguous
+ * window so a bit-31 "physical" address reaches the RAM the title
+ * actually wrote at the low form.
  */
-#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#define XBOX_PTR(addr) \
+    ((uintptr_t)xbox_canon_va((uint32_t)(addr)) + g_xbox_mem_offset)
 
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))

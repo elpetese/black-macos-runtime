@@ -16,6 +16,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryBase, for guest dispatcher objects */
+#include <stdio.h>
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -169,6 +170,11 @@ static HANDLE guest_disp_handle(void *guest)
     }
     if (!h) {
         if (s_guest_disp_count < GUEST_DISP_MAX) {
+            unsigned char new_type = DISP_TYPE(guest);
+            LONG new_state = DISP_SIGNAL_STATE(guest);
+            fprintf(stderr, "[DISP] CREATE guest=%p type=%u state=%ld slot=%d\n",
+                    guest, (unsigned)new_type, (long)new_state, s_guest_disp_count);
+            fflush(stderr);
             h = guest_disp_create(guest);
             if (h) {
                 s_guest_disp[s_guest_disp_count].guest = guest;
@@ -180,6 +186,9 @@ static HANDLE guest_disp_handle(void *guest)
                 "guest dispatcher table full (%d); object at %p unbacked",
                 GUEST_DISP_MAX, guest);
         }
+    } else {
+        fprintf(stderr, "[DISP] HIT guest=%p host=%p slot=%d\n", guest, h, i);
+        fflush(stderr);
     }
 
     LeaveCriticalSection(&s_guest_disp_cs);
@@ -255,6 +264,11 @@ NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
     if (PreviousState)
         *PreviousState = 0; /* We don't track previous state */
 
+    unsigned token = (unsigned)(uintptr_t)EventHandle;
+    fprintf(stderr, "[SETEVENT] NtSetEvent handle=%p token=0x%08X\n",
+            EventHandle, token);
+    fflush(stderr);
+
     if (!SetEvent(EventHandle)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
             "NtSetEvent: SetEvent failed for handle %p (error %u)",
@@ -278,6 +292,10 @@ LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
 
     (void)Increment;
     (void)Wait;
+
+    fprintf(stderr, "[SETEVENT] KeSetEvent Event=%p guest=%d handle=%p inc=%ld wait=%d\n",
+            Event, is_guest_pointer(Event), hEvent, (long)Increment, (int)Wait);
+    fflush(stderr);
 
     if (!hEvent) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
@@ -427,21 +445,37 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
     (void)WaitReason;
     (void)WaitMode;
 
-    HANDLE hObject = xbox_dispatcher_handle(Object);
+    uintptr_t obj_u = (uintptr_t)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result;
+    int is_guest = is_guest_pointer(Object);
 
+    fprintf(stderr, "[WAIT] KeWaitForSingleObject Object=%p guest=%d alertable=%u ms=%lu\n",
+            Object, is_guest, (unsigned)Alertable, (unsigned long)ms);
+    fflush(stderr);
+
+    if (is_guest) {
+        unsigned char type = DISP_TYPE(Object);
+        LONG state = DISP_SIGNAL_STATE(Object);
+        fprintf(stderr, "[WAIT]  guest obj %p type=%u state=%ld\n",
+                Object, (unsigned)type, (long)state);
+        fflush(stderr);
+    }
+
+    HANDLE hObject = xbox_dispatcher_handle(Object);
     if (!hObject) {
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
-            "KeWaitForSingleObject: no object for %p", Object);
+        fprintf(stderr, "[WAIT]  NO HANDLE for Object=%p\n", Object);
+        fflush(stderr);
         return STATUS_INVALID_HANDLE;
     }
 
-    result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    fprintf(stderr, "[WAIT]  handle=%p -> Waiting...\n", hObject);
+    fflush(stderr);
 
-    /* A synchronization object is consumed by the wait that takes it; a
-     * notification object stays signalled until someone resets it. Publishing
-     * the difference keeps guest code that reads SignalState honest. */
+    DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+
+    fprintf(stderr, "[WAIT]  WaitForSingleObjectEx result=0x%lX\n", (unsigned long)result);
+    fflush(stderr);
+
     if (result == WAIT_OBJECT_0 && Object && is_guest_pointer(Object)) {
         unsigned char type = DISP_TYPE(Object);
         if (type == DISP_TYPE_SYNCHRONIZATION_EVENT ||

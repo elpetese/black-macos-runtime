@@ -412,6 +412,45 @@ extern RECOMP_TLS uint32_t g_fs_base;
 /** Number of 64 MB mirror views to pre-map (covers 1.75 GB of address space). */
 #define XBOX_NUM_MIRRORS    28
 
+/* ================================================================
+ * Contiguous / physical window canonicalisation
+ * ================================================================
+ *
+ * The Xbox exposes its 64 MB of unified RAM a second time in the
+ * "contiguous window": physical page P is visible at 0x80000000 + P.
+ * Titles set bit 31 on a RAM pointer to ride that view -- e.g.
+ * RenderWare builds an object at 0x000F9FB8 and reads it back through
+ * 0x800F9FB8.
+ *
+ * On the PC runtime that window lives in private storage (see
+ * xbox_MemoryLayoutInit: a dedicated VirtualAlloc, not a view of the RAM
+ * mapping), so a load at the bit-31 address returns bytes that were never
+ * written and the title follows a NULL out of 0x800F9FB8. xbox_canon_va()
+ * strips bit 31 in the regional alias so the bit-31 form resolves to the
+ * same host bytes as the low form, restoring the hardware round trip
+ * WITHOUT remapping 64 MB.
+ *
+ * Parche 3 (regional alias): only the range 0x800F0000-0x80100000 is
+ * canonicalised. The rest of the contig-window is left alone because
+ * Black stores guest dispatcher objects there (with bit 31 set); fully
+ * stripping bit 31 turns those into low-RAM pointers that point into
+ * unmapped gaps, which makes xbox_dispatcher_handle fail to find the
+ * object and KeWaitForSingleObject hangs forever.
+ *
+ * The fake kernel PE page at 0x80010000 is inside the alias range but
+ * has no RAM twin: it is excluded so the RenderWare PE probe at
+ * MEM32(0x8001003C) reads the zero-section stub, not the loaded XBE
+ * header at 0x00010000. */
+uint32_t xbox_canon_va(uint32_t va);
+
+#define XBOX_CONTIG_LO       0x80000000u
+#define XBOX_CONTIG_HI       0x84000000u
+#define XBOX_ALIAS_LO        0x800F0000u
+#define XBOX_ALIAS_HI        0x80100000u
+#define XBOX_FAKEKRN_LO      0x80010000u
+#define XBOX_FAKEKRN_HI      0x80011000u
+#define XBOX_PHYS_MASK       0x03FFFFFFu
+
 /* Tiled / write-combined aperture. The NV2A shows physical RAM again here, and
  * titles render through it: physical page P is at XBOX_TILED_BASE + P. Aliases
  * the RAM mapping rather than getting its own storage, because a title writes a

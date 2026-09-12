@@ -56,13 +56,18 @@ int  xbox_worker_stack_alloc(void);
 
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
-/* Memory access - same as recomp_types.h MEM32 but without the #define guard */
+/* Memory access. Same as recomp_types.h MEM* but routed through xbox_canon_va
+ * so a bit-31 "physical" pointer a title hands the kernel resolves to the same
+ * host bytes its own MEM* write laid down -- without collapsing the fake
+ * kernel PE page at 0x80010000. */
 uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 
-#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)xbox_canon_va((uint32_t)(addr)) + g_xbox_mem_offset))
 
-/* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
-#define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)(va) + g_xbox_mem_offset) : NULL)
+/* Translate Xbox VA to native pointer (NULL-safe: 0 -> NULL). Canonically
+ * resolves the contiguous window first, so a title's 0x800xxxxx pointer and
+ * the kernel's view of it agree on host storage. */
+#define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)xbox_canon_va((uint32_t)(va)) + g_xbox_mem_offset) : NULL)
 
 /* ── Synthetic VA range (for function exports) ─────────── */
 
@@ -80,8 +85,8 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
  * it with the expected structures.
  */
 
-#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
-#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)xbox_canon_va((uint32_t)(addr)) + g_xbox_mem_offset))
+#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)xbox_canon_va((uint32_t)(addr)) + g_xbox_mem_offset))
 
 /**
  * Get the Xbox VA of data for a kernel DATA export ordinal.
@@ -1312,6 +1317,10 @@ static void bridge_KeSetEvent(void)
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
 
+    fprintf(stderr, "[SETEVENT] bridge_KeSetEvent event_ptr=0x%08X increment=%u wait=%u\n",
+            event_ptr, increment, wait);
+    fflush(stderr);
+
     g_eax = (uint32_t)xbox_KeSetEvent(XBOX_TO_NATIVE(event_ptr), increment, (BOOLEAN)wait);
 }
 
@@ -1366,6 +1375,9 @@ static void bridge_NtSetEvent(void)
 {
     HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
     uint32_t prev   = STACK_ARG(1);
+    fprintf(stderr, "[SETEVENT] bridge_NtSetEvent handle_ptr=0x%08X handle=%p prev=0x%08X\n",
+            STACK_ARG(0), handle, prev);
+    fflush(stderr);
     g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
 }
 
@@ -2043,8 +2055,11 @@ static void bridge_KeInitializeInterrupt(void)
     uint32_t context      = STACK_ARG(2);
     uint32_t vector       = STACK_ARG(3);
 
-    /* Xbox KINTERRUPT is 44 bytes. */
-    memset(XBOX_TO_NATIVE(interrupt_va), 0, 44);
+    /* Only write the fields KeInitializeInterrupt sets; do NOT memset
+     * the whole object because the caller may be passing a device object
+     * whose next-pointer lives at offset 0. The original memset zeroed
+     * 44 bytes, which corrupted the device list and left the worker
+     * thread spinning forever on the same 3 devices. */
     BRIDGE_MEM32(interrupt_va + 0)  = routine;
     BRIDGE_MEM32(interrupt_va + 4)  = context;
     BRIDGE_MEM32(interrupt_va + 8)  = vector;

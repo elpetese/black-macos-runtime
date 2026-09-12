@@ -673,6 +673,61 @@ static void *g_kernel_memory = NULL;
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
 
+/* Budget for the contiguous-window access log (Parche 2). Negative means
+ * "not yet initialised"; first xbox_canon_va call reads RECOMP_LOG_CONTIG
+ * from the env. When >0, every canonicalisation of a contig-window VA is
+ * printed and the counter is decremented. Once it hits zero the log is
+ * silenced for the rest of the run. */
+static long s_contig_log_budget = -1;
+
+/* Canonicalise an Xbox VA by stripping bit 31 (the "physical/GPU" view)
+ * so that 0x800F9FB8 aliases 0x000F9FB8 on the host. The fake kernel PE
+ * page at 0x80010000 is excluded: it has no RAM twin and must stay in the
+ * window's private storage.
+ *
+ * When RECOMP_LOG_CONTIG is set, every canonicalisation of a contig-window
+ * VA is logged (budget-limited) so Parche 2/3 can identify the address
+ * whose zero-to-real-data transition turns a working boot into the known
+ * KeWaitForSingleObject hang. */
+#define XBOX_CONTIG_LO       0x80000000u
+#define XBOX_CONTIG_HI       0x84000000u
+#define XBOX_ALIAS_LO        0x800F0000u
+#define XBOX_ALIAS_HI        0x80100000u
+#define XBOX_FAKEKRN_LO      0x80010000u
+#define XBOX_FAKEKRN_HI      0x80011000u
+#define XBOX_PHYS_MASK       0x03FFFFFFu
+
+uint32_t xbox_canon_va(uint32_t va)
+{
+    if (va >= XBOX_CONTIG_LO && va < XBOX_CONTIG_HI) {
+        if (va >= XBOX_FAKEKRN_LO && va < XBOX_FAKEKRN_HI)
+            return va;                  /* fake kernel PE page: stays private */
+        if (va >= XBOX_ALIAS_LO && va < XBOX_ALIAS_HI) {
+            uint32_t canon = va & XBOX_PHYS_MASK;
+            if (s_contig_log_budget < 0) {
+                const char *env = getenv("RECOMP_LOG_CONTIG");
+                s_contig_log_budget = env ? strtol(env, NULL, 0) : 0;
+                if (s_contig_log_budget < 0) s_contig_log_budget = 0;
+            }
+            if (s_contig_log_budget > 0) {
+                s_contig_log_budget--;
+                fprintf(stderr, "CONTIG orig=0x%08X canon=0x%08X\n", va, canon);
+            }
+            return canon;
+        }
+        return va;  /* outside alias range: leave untouched */
+    }
+    return va;
+}
+
+#undef XBOX_CONTIG_LO
+#undef XBOX_CONTIG_HI
+#undef XBOX_ALIAS_LO
+#undef XBOX_ALIAS_HI
+#undef XBOX_FAKEKRN_LO
+#undef XBOX_FAKEKRN_HI
+#undef XBOX_PHYS_MASK
+
 /* Bounds of the title's executable sections, from its own XBE section table.
  *
  * RECOMP_ICALL uses these to decide whether an indirect-call target is code
@@ -980,6 +1035,7 @@ RECOMP_TLS int g_df = 0;
 volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
+volatile uint64_t g_iter = 0;
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {

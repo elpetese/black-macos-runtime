@@ -5,8 +5,10 @@
  * object, separate regions for the contiguous window and the MMIO apertures.
  *
  * Build and run (from the repo root, after building the `platform` target):
- *   cc -O1 -Isrc -Isrc/platform tests/guest_layout/test_guest_layout.c \
- *      build-macos/src/platform/libplatform.a -lpthread -lm -o /tmp/test_guest_layout
+ *   cc -O1 -Isrc -Isrc/platform -Isrc/kernel \
+ *      tests/guest_layout/test_guest_layout.c \
+ *      build-macos/src/platform/libplatform.a -lpthread -lm \
+ *      -o /tmp/test_guest_layout
  *   /tmp/test_guest_layout
  */
 #include "win32_compat.h"
@@ -18,8 +20,20 @@
 #define MB (1024u * 1024u)
 static int fails;
 #define CHECK(cond, ...) do { if (cond) printf("  OK    " __VA_ARGS__); \
-                              else { printf("  FAIL  " __VA_ARGS__); fails++; } \
-                              printf("\n"); } while (0)
+                               else { printf("  FAIL  " __VA_ARGS__); fails++; } \
+                               printf("\n"); } while (0)
+
+/* Local copy of the canonicaliser so the test stays independent of xbox_kernel.
+ * Must mirror src/kernel/xbox_memory_layout.c exactly. */
+static inline uint32_t test_canon_va(uint32_t va)
+{
+    if (va >= 0x80000000u && va < 0x84000000u) {
+        if (va >= 0x80010000u && va < 0x80011000u)
+            return va;
+        return va & 0x03FFFFFFu;
+    }
+    return va;
+}
 
 int main(void)
 {
@@ -63,6 +77,50 @@ int main(void)
         CHECK(p == want, "%s at guest 0x%08X", regions[i].name, regions[i].va);
         if (p) { memset(p, 0xA5, 64);
                  CHECK(((uint8_t *)p)[63] == 0xA5, "%s is writable", regions[i].name); }
+    }
+
+    /* ---- Contiguous-window canonicalisation contract (Phase 6) ----
+     *
+     * The contiguous window 0x80000000..0x84000000 must behave as an alias of
+     * RAM (bit 31 stripped) EXCEPT the fake kernel PE page at 0x80010000,
+     * which stays backed by the window's own storage. Host = g + va because, as
+     * above, the 4 GB reservation maps guest VA 0 onto host address g -- the
+     * same invariant xbox_MemoryLayoutInit establishes for g_xbox_mem_offset.
+     */
+    {
+        uint32_t va_low  = 0x000F9FB8u;
+        uint32_t va_phys = 0x800F9FB8u;   /* the bit-31 "physical" form */
+        uint32_t value   = 0xDEADBEEFu;
+
+        /* Pure canonicaliser: bit 31 stripped, fake page left alone. */
+        CHECK(test_canon_va(va_low)  == 0x000F9FB8u,
+              "canon(0x000F9FB8) == 0x000F9FB8 (low VA unchanged)");
+        CHECK(test_canon_va(va_phys) == 0x000F9FB8u,
+              "canon(0x800F9FB8) == 0x000F9FB8 (bit 31 stripped)");
+        CHECK(test_canon_va(0x829BA9B0u) == 0x029BA9B0u,
+              "canon(0x829BA9B0) == 0x029BA9B0 (RenderWare physical ptr)");
+        CHECK(test_canon_va(0x80010000u) == 0x80010000u,
+              "canon(0x80010000) == 0x80010000 (fake kernel PE page kept)");
+
+        /* Write the low form, read the bit-31 form: one object, two addresses. */
+        *(volatile uint32_t *)(g + test_canon_va(va_low))  = value;
+        CHECK(*(volatile uint32_t *)(g + test_canon_va(va_phys)) == value,
+              "write 0x000F9FB8 visible at 0x800F9FB8 (true alias)");
+        /* And the reverse direction. */
+        *(volatile uint32_t *)(g + test_canon_va(va_phys)) = ~value;
+        CHECK(*(volatile uint32_t *)(g + test_canon_va(va_low)) == ~value,
+              "write 0x800F9FB8 visible at 0x000F9FB8 (true alias)");
+        /* Restore RAM so it is not left holding test residue. */
+        *(volatile uint32_t *)(g + test_canon_va(va_low)) = 0;
+
+        /* Fake PE page isolated: a write at 0x8001003C must NOT land in RAM. */
+        CHECK(test_canon_va(0x8001003Cu) == 0x8001003Cu,
+              "canon(0x8001003C) == 0x8001003C (inside fake PE page)");
+        *(volatile uint32_t *)(g + test_canon_va(0x8001003Cu)) = value;
+        CHECK(*(volatile uint32_t *)(g + test_canon_va(0x8001003Cu)) == value,
+              "write 0x8001003C reads back same (fake page still writable)");
+        CHECK(*(volatile uint32_t *)(g + test_canon_va(0x0001003Cu)) != value,
+              "write 0x8001003C does NOT alter 0x0001003C (PE page isolated from XBE header)");
     }
 
     /* The guest thinks in 4 KB pages; protecting one must not fail on a
