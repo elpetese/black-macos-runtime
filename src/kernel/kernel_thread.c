@@ -330,6 +330,9 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(
     if (Options & 0x2)
         dwOptions |= DUPLICATE_SAME_ACCESS;
 
+    /* TargetHandle was rejected above, so DuplicateHandle cannot fail for a
+     * null destination here; a low source handle is already passed through by
+     * DuplicateHandle itself. Nothing left to special-case. */
     if (!DuplicateHandle(hProcess, SourceHandle, hProcess, TargetHandle,
                          0, FALSE, dwOptions)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,

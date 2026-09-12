@@ -43,6 +43,18 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* Partition 1 is E:, the writable half of the console: the game's own
+     * TDATA and UDATA trees live there, which is where a title saves and
+     * where it expects to create what it did not find. T:\ and U:\ are the
+     * drive letters for the same two trees and already go to the save dir, so
+     * the device spelling has to land in the same place -- pointing it at the
+     * game directory made those reads resolve into a read-only disc extract,
+     * and Black could neither find nor create TDATA\45410083\$u\contentmeta.xbx.
+     * Listed before the partition root so they win. */
+    { "\\Device\\Harddisk0\\Partition1\\TDATA", 1, "\\TitleData", "/TitleData" },
+    { "\\Device\\Harddisk0\\Partition1\\UDATA", 1, "\\UserData",  "/UserData"  },
+    /* Everything else on E: is the game's own content, which is what the
+     * game directory holds. */
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -374,6 +386,12 @@ const wchar_t *xbox_LastHostPath(void)
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
+    return xbox_translate_path_ex(xbox_path, host_path_buf, buf_size, FALSE);
+}
+
+BOOL xbox_translate_path_ex(const char* xbox_path, xbox_host_char* host_path_buf,
+                            DWORD buf_size, BOOL want_directory)
+{
     const char*  remainder = NULL;
     const WCHAR* base_dir  = NULL;
     const char*  sub_dir   = NULL;
@@ -388,10 +406,12 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     {
         char linked[512];
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
-            return xbox_translate_path(linked, host_path_buf, buf_size);
+            return xbox_translate_path_ex(linked, host_path_buf, buf_size,
+                                          want_directory);
     }
 
-    if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
+    if (!want_directory &&
+        xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
         fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
         fflush(stderr);
         return TRUE;
@@ -467,6 +487,8 @@ const wchar_t *xbox_LastHostPath(void)
 
 #include <unistd.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
@@ -504,6 +526,135 @@ static void mkdir_p(const char* path)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
 }
 
+/*
+ * The raw disk device, \Device\Harddisk0\Partition0 -- the POSIX half of
+ * the emulation the Win32 branch above already carries.
+ *
+ * A title opens it to read the Xbox partition table at sector 4 and find the
+ * cache partitions behind X:, Y: and Z:. XAPI's utility-drive mount does
+ * exactly that, and a title whose read fails calls HalReturnToFirmware: Black
+ * does, three calls after the failure. A directory cannot answer a 512-byte
+ * read at a file offset, so the device is backed by an image file.
+ *
+ * Refusing the probe instead looks to the title like a console with no hard
+ * disk, which is the one thing retail hardware never is.
+ */
+#define XBOX_DISK_IMAGE_NAME   "Partition0.img"
+#define XBOX_PART_TABLE_OFFSET 0x800
+#define XBOX_PART_IN_USE       0x80000000u
+
+static void xbox_write_partition_table(const char *path)
+{
+    /* name[16], flags, lba_start, lba_size, reserved -- 32 bytes each */
+    static const struct { const char *name; uint32_t start, size; } parts[] = {
+        { "XBOX_PART_X",  0x00000400, 0x00177000 },  /* X: cache      */
+        { "XBOX_PART_Y",  0x00177400, 0x00177000 },  /* Y: cache      */
+        { "XBOX_PART_Z",  0x002EE400, 0x00177000 },  /* Z: cache      */
+        { "XBOX_PART_C",  0x00465400, 0x000FA000 },  /* C: system     */
+        { "XBOX_PART_E",  0x0055F400, 0x00465400 },  /* E: game/save  */
+    };
+    unsigned char sector[512];
+    size_t i;
+    int fd;
+
+    fd = open(path, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "open %s: %s", path, strerror(errno));
+        return;
+    }
+
+    memset(sector, 0, sizeof(sector));
+    memcpy(sector, "****PARTINFO****", 16);
+    for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        unsigned char *e = sector + 48 + i * 32;   /* 16 magic + 32 reserved */
+        size_t n = strlen(parts[i].name);
+        memset(e, ' ', 16);
+        memcpy(e, parts[i].name, n < 16 ? n : 16);
+        /* The table is little-endian on the wire and so is every host this
+         * branch builds for; memcpy keeps it that way without assuming the
+         * offsets are aligned. */
+        { uint32_t v = XBOX_PART_IN_USE;   memcpy(e + 16, &v, 4); }
+        { uint32_t v = parts[i].start;     memcpy(e + 20, &v, 4); }
+        { uint32_t v = parts[i].size;      memcpy(e + 24, &v, 4); }
+        { uint32_t v = 0;                  memcpy(e + 28, &v, 4); }
+    }
+
+    if (pwrite(fd, sector, sizeof(sector), XBOX_PART_TABLE_OFFSET) != (ssize_t)sizeof(sector))
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "write %s: %s", path, strerror(errno));
+    close(fd);
+}
+
+/*
+ * The raw disk carries the partition table; the cache volumes get the geometry
+ * that table describes, so a title that asks a device how big it is gets an
+ * answer consistent with what it just read. ftruncate leaves them sparse: the
+ * three caches are 750 MB each and none of it is touched until something
+ * writes there.
+ */
+static void xbox_create_partition_images(void)
+{
+    static const unsigned long long cache_sectors = 0x00177000ull;
+    char image[MAX_PATH];
+    int p;
+
+    snprintf(image, sizeof(image), "%s/%s", s_save_dir, XBOX_DISK_IMAGE_NAME);
+    xbox_write_partition_table(image);
+
+    for (p = 3; p <= 5; p++) {
+        int fd;
+        snprintf(image, sizeof(image), "%s/Partition%d.img", s_save_dir, p);
+        fd = open(image, O_WRONLY | O_CREAT, 0644);
+        if (fd < 0) {
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "open %s: %s", image, strerror(errno));
+            continue;
+        }
+        if (ftruncate(fd, (off_t)(cache_sectors * 512ull)) != 0)
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "ftruncate %s: %s",
+                     image, strerror(errno));
+        close(fd);
+    }
+}
+
+/*
+ * Map a bare partition device onto an image file.
+ *
+ * Matches "\Device\Harddisk0\PartitionN" with nothing below it beyond a single
+ * trailing separator, which is how a device rather than a path is opened.
+ *
+ * Only the devices a title uses as raw volumes: partition 0 is the whole disk
+ * and carries the table written above, and 3-5 are the caches behind X:, Y:
+ * and Z:, which a title formats by writing to the volume. Black opens
+ * partition 5 for write and a directory answers that with EISDIR.
+ *
+ * Partitions 1 and 2 are left to the rules table. Black opens
+ * "\Device\Harddisk0\partition1\" and then browses TDATA and UDATA underneath
+ * it, so that one has to stay a directory. Paths *under* a cache partition
+ * (Z:\foo) likewise stay in the Cache directory: the volume device and the
+ * filesystem on it are different objects and a title uses both.
+ */
+static BOOL xbox_partition_device_path(const char *xbox_path, char *out, DWORD n)
+{
+    static const char *prefix = "\\Device\\Harddisk0\\Partition";
+    int len = match_prefix(xbox_path, prefix);
+    const char *rest;
+    int digit;
+
+    if (!len)
+        return FALSE;
+    digit = xbox_path[len];
+    if (digit != '0' && (digit < '3' || digit > '5'))
+        return FALSE;
+
+    rest = xbox_path + len + 1;
+    if (*rest == '\\' || *rest == '/')
+        rest++;
+    if (*rest != '\0')
+        return FALSE;
+
+    snprintf(out, n, "%s/Partition%c.img", s_save_dir, (char)digit);
+    return TRUE;
+}
+
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     if (game_dir) {
@@ -533,12 +684,35 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
 
+    /* T:/U:/Z: map into subdirectories of save_dir, and a title that opens a
+     * file there with a create disposition fails if the parent is missing --
+     * which reads as "cannot create save file" and sends the title down its
+     * init-failure path. Build them up front, then the disk images the raw
+     * partition devices are backed by. */
+    {
+        static const char *subs[] = { "TitleData", "UserData", "Cache",
+                                      "SystemData" };
+        char dir[MAX_PATH];
+        mkdir_p(s_save_dir);
+        for (int i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
+            snprintf(dir, sizeof(dir), "%s/%s", s_save_dir, subs[i]);
+            mkdir_p(dir);
+        }
+        xbox_create_partition_images();
+    }
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
              s_game_dir, s_save_dir);
 }
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
+{
+    return xbox_translate_path_ex(xbox_path, host_path_buf, buf_size, FALSE);
+}
+
+BOOL xbox_translate_path_ex(const char* xbox_path, xbox_host_char* host_path_buf,
+                            DWORD buf_size, BOOL want_directory)
 {
     const char* remainder = NULL;
     const char* base_dir  = NULL;
@@ -554,7 +728,17 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     {
         char linked[512];
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
-            return xbox_translate_path(linked, host_path_buf, buf_size);
+            return xbox_translate_path_ex(linked, host_path_buf, buf_size,
+                                          want_directory);
+    }
+
+    /* A bare partition device is a file, not a directory: check it before the
+     * rules table, which would otherwise map it to the game dir. A caller that
+     * asked for a directory wants the filesystem instead, and gets the rules. */
+    if (!want_directory &&
+        xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
+        XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s (device)", xbox_path, host_path_buf);
+        return TRUE;
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
@@ -584,8 +768,12 @@ translate:
             if (*p == '\\') *p = '/';
 
         if (sub_dir) {
+            /* A rule whose prefix carries no trailing separator leaves one at
+             * the head of the remainder; joining it produces "TitleData//x". */
+            const char *rp = remainder_posix;
+            while (*rp == '/') rp++;
             snprintf(host_path_buf, buf_size, "%s%s/%s",
-                     base_dir, sub_dir, remainder_posix);
+                     base_dir, sub_dir, rp);
 
             /* Ensure the save directory tree exists. */
             char dir_path[MAX_PATH];

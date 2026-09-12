@@ -427,14 +427,34 @@ void xbox_kernel_init(void)
      * bridge reads). That makes the table match any title's import order.
      * Without a mapped XBE, fall back to the static reference list below. */
     xbox_kernel_get_thunk_address(&thunk_base, &thunk_count);
-    for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
+
+    /* A title imports only the slots its own thunk table names -- Black names
+     * 115 of the kernel's 378 export slots. Walking the whole export space and
+     * falling back to the reference list past that point reported every slot
+     * the title never imports as a missing import, and filled slots 115..146
+     * with another title's import order. Size the walk to the title's table
+     * when we have one; the reference list is only for a title whose table we
+     * could not read. */
+    int have_table = (thunk_base != 0) && (thunk_count != 0) &&
+                     (xbox_GetMemoryBase() != NULL);
+    ULONG slots = have_table ? thunk_count : XBOX_KERNEL_THUNK_TABLE_SIZE;
+    if (slots > XBOX_KERNEL_THUNK_TABLE_SIZE)
+        slots = XBOX_KERNEL_THUNK_TABLE_SIZE;
+
+    /* Slots the title does not import must still trap rather than run into a
+     * null pointer if stray code dispatches through them. */
+    for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++)
+        xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
+
+    for (ULONG i = 0; i < slots; i++) {
         ULONG ordinal;
 
-        if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
+        if (have_table) {
             uint32_t entry = *(volatile uint32_t *)
                 ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
             if (entry == 0) {
-                break;  /* rest of the table is empty */
+                slots = i;   /* rest of the title's table is empty */
+                break;
             }
             ordinal = entry & 0x7FFFFFFF;
         } else {
@@ -447,15 +467,15 @@ void xbox_kernel_init(void)
             xbox_kernel_thunk_table[i] = ptr;
             resolved++;
         } else {
-            /* Point unresolved thunks to our error handler */
-            xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
+            /* Already points at the error handler; just count it. */
             unresolved++;
         }
     }
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
-        "Thunk table: %u/%u resolved, %u unresolved",
-        resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, unresolved);
+        "Thunk table: %u/%u imports resolved, %u unresolved (%s)",
+        resolved, slots, unresolved,
+        have_table ? "from the title's thunk table" : "from the reference list");
 
     if (unresolved > 0) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,

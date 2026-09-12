@@ -15,6 +15,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* xbox_GetMemoryBase, for guest dispatcher objects */
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -49,6 +50,163 @@ static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
     if (diff <= 0)
         return 0;
     return (DWORD)(diff / 10000);
+}
+
+/* ============================================================================
+ * Dispatcher objects that live in guest memory
+ *
+ * The Nt* calls hand a title a handle we minted, and it gives that handle back
+ * -- those need nothing here. The Ke* calls are different: they take a pointer
+ * to a dispatcher object sitting in the title's own memory, because the XDK
+ * inlines KeInitializeEvent rather than importing it. Black does exactly that,
+ * then waits on a KEVENT at 0x0027B90C in its D3D section. Casting that address
+ * to a host object and locking it faulted inside pthread_mutex_lock.
+ *
+ * So: a guest address gets a host object of its own, created the first time it
+ * is used and keyed by address, seeded from the header the title initialised.
+ * The signal state is mirrored back into that header, because guest code reads
+ * the field directly as often as it calls the kernel.
+ *
+ * DISPATCHER_HEADER, the first 16 bytes of every waitable object:
+ *   +0x00 UCHAR Type          KOBJECTS
+ *   +0x01 UCHAR Absolute
+ *   +0x02 UCHAR Size          in ULONGs
+ *   +0x03 UCHAR Inserted
+ *   +0x04 LONG  SignalState
+ *   +0x08 LIST_ENTRY WaitListHead
+ * ============================================================================ */
+
+#define DISP_TYPE_NOTIFICATION_EVENT      0
+#define DISP_TYPE_SYNCHRONIZATION_EVENT   1
+#define DISP_TYPE_SEMAPHORE               5
+#define DISP_TYPE_NOTIFICATION_TIMER      8
+#define DISP_TYPE_SYNCHRONIZATION_TIMER   9
+
+#define DISP_TYPE(p)         (((volatile unsigned char *)(p))[0])
+#define DISP_SIGNAL_STATE(p) (*(volatile LONG *)((unsigned char *)(p) + 4))
+
+/* A title allocates these statically and sparingly; Black uses a handful. */
+#define GUEST_DISP_MAX 512
+
+static struct {
+    void   *guest;   /* host address of the guest DISPATCHER_HEADER */
+    HANDLE  host;
+} s_guest_disp[GUEST_DISP_MAX];
+static int s_guest_disp_count;
+
+static CRITICAL_SECTION s_guest_disp_cs;
+static INIT_ONCE s_guest_disp_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK guest_disp_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&s_guest_disp_cs);
+    return TRUE;
+}
+
+/* True when the pointer lands in the 4 GB guest window rather than the host
+ * heap, which is what separates a title's own object from one of ours. */
+static int is_guest_pointer(const void *p)
+{
+    uintptr_t base = (uintptr_t)xbox_GetMemoryBase();
+    uintptr_t v = (uintptr_t)p;
+    if (!base || !v)
+        return 0;
+    return v >= base && (unsigned long long)(v - base) < (1ULL << 32);
+}
+
+/* Build the host object a guest dispatcher object stands for. */
+static HANDLE guest_disp_create(void *guest)
+{
+    unsigned char type = DISP_TYPE(guest);
+    LONG state = DISP_SIGNAL_STATE(guest);
+    HANDLE h;
+
+    switch (type) {
+    case DISP_TYPE_SEMAPHORE:
+        /* The header does not carry the limit, only the count. A ceiling high
+         * enough never to be the thing that fails is closer to the console
+         * than refusing the object outright. */
+        h = CreateSemaphoreW(NULL, state, 0x7FFFFFFF, NULL);
+        break;
+    case DISP_TYPE_SYNCHRONIZATION_EVENT:
+    case DISP_TYPE_SYNCHRONIZATION_TIMER:
+        h = CreateEventW(NULL, FALSE, state != 0, NULL);
+        break;
+    case DISP_TYPE_NOTIFICATION_EVENT:
+    case DISP_TYPE_NOTIFICATION_TIMER:
+    default:
+        /* An unknown type is treated as a notification event: a title that
+         * waits on it makes progress, where refusing would wedge it. */
+        h = CreateEventW(NULL, TRUE, state != 0, NULL);
+        break;
+    }
+
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_SYNC,
+        "guest dispatcher object at %p: type=%u state=%d -> handle=%p",
+        guest, (unsigned)type, (int)state, h);
+    return h;
+}
+
+/*
+ * Host object for a dispatcher object the title owns, created on first use.
+ * Returns NULL only when the table is full, which would mean a title with more
+ * than GUEST_DISP_MAX live objects.
+ */
+static HANDLE guest_disp_handle(void *guest)
+{
+    HANDLE h = NULL;
+    int i;
+
+    InitOnceExecuteOnce(&s_guest_disp_once, guest_disp_init, NULL, NULL);
+    EnterCriticalSection(&s_guest_disp_cs);
+
+    for (i = 0; i < s_guest_disp_count; i++) {
+        if (s_guest_disp[i].guest == guest) {
+            h = s_guest_disp[i].host;
+            break;
+        }
+    }
+    if (!h) {
+        if (s_guest_disp_count < GUEST_DISP_MAX) {
+            h = guest_disp_create(guest);
+            if (h) {
+                s_guest_disp[s_guest_disp_count].guest = guest;
+                s_guest_disp[s_guest_disp_count].host  = h;
+                s_guest_disp_count++;
+            }
+        } else {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
+                "guest dispatcher table full (%d); object at %p unbacked",
+                GUEST_DISP_MAX, guest);
+        }
+    }
+
+    LeaveCriticalSection(&s_guest_disp_cs);
+    return h;
+}
+
+/*
+ * The handle a Ke* call should act on.
+ *
+ * A pointer into guest memory is the title's own dispatcher object and gets
+ * the mapping above; anything else is already a handle we minted through the
+ * Nt* path and passes through untouched.
+ */
+static HANDLE xbox_dispatcher_handle(PVOID Object)
+{
+    if (!Object)
+        return NULL;
+    if (!is_guest_pointer(Object))
+        return (HANDLE)Object;
+    return guest_disp_handle(Object);
+}
+
+/* Keep the title's own view of the object in step with ours. */
+static void xbox_dispatcher_publish(PVOID Object, LONG state)
+{
+    if (Object && is_guest_pointer(Object))
+        DISP_SIGNAL_STATE(Object) = state;
 }
 
 /* ============================================================================
@@ -115,14 +273,26 @@ NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
  */
 LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
 {
-    HANDLE hEvent = (HANDLE)Event;
+    HANDLE hEvent = xbox_dispatcher_handle(Event);
+    LONG previous = 0;
 
     (void)Increment;
     (void)Wait;
 
-    /* We can't easily query previous state, so just set and return 0 */
+    if (!hEvent) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
+            "KeSetEvent: no object for %p", Event);
+        return 0;
+    }
+
+    /* For an object the title owns we can report the real previous state:
+     * it is the field the title itself initialised. */
+    if (Event && is_guest_pointer(Event))
+        previous = DISP_SIGNAL_STATE(Event);
+
     SetEvent(hEvent);
-    return 0;
+    xbox_dispatcher_publish(Event, 1);
+    return previous;
 }
 
 /* ============================================================================
@@ -257,9 +427,30 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
     (void)WaitReason;
     (void)WaitMode;
 
-    HANDLE hObject = (HANDLE)Object;
+    HANDLE hObject = xbox_dispatcher_handle(Object);
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    DWORD result;
+
+    if (!hObject) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
+            "KeWaitForSingleObject: no object for %p", Object);
+        return STATUS_INVALID_HANDLE;
+    }
+
+    result = WaitForSingleObjectEx(hObject, ms, Alertable);
+
+    /* A synchronization object is consumed by the wait that takes it; a
+     * notification object stays signalled until someone resets it. Publishing
+     * the difference keeps guest code that reads SignalState honest. */
+    if (result == WAIT_OBJECT_0 && Object && is_guest_pointer(Object)) {
+        unsigned char type = DISP_TYPE(Object);
+        if (type == DISP_TYPE_SYNCHRONIZATION_EVENT ||
+            type == DISP_TYPE_SYNCHRONIZATION_TIMER)
+            xbox_dispatcher_publish(Object, 0);
+        else if (type == DISP_TYPE_SEMAPHORE)
+            xbox_dispatcher_publish(Object, DISP_SIGNAL_STATE(Object) - 1);
+    }
+
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -279,10 +470,36 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
 
     BOOL bWaitAll = (WaitType == 0) ? TRUE : FALSE;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    HANDLE handles[MAXIMUM_WAIT_OBJECTS];
+    DWORD result;
+    ULONG i;
 
-    /* Objects[] is an array of PVOID which we treat as HANDLE[] */
-    DWORD result = WaitForMultipleObjectsEx(Count, (HANDLE*)Objects,
-                                            bWaitAll, ms, Alertable);
+    if (Count == 0 || Count > MAXIMUM_WAIT_OBJECTS)
+        return STATUS_INVALID_PARAMETER;
+
+    /* Each entry may be a title-owned dispatcher object or a handle of ours. */
+    for (i = 0; i < Count; i++) {
+        handles[i] = xbox_dispatcher_handle(Objects[i]);
+        if (!handles[i]) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
+                "KeWaitForMultipleObjects: no object for %p at index %u",
+                Objects[i], i);
+            return STATUS_INVALID_HANDLE;
+        }
+    }
+
+    result = WaitForMultipleObjectsEx(Count, handles, bWaitAll, ms, Alertable);
+
+    if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + Count) {
+        PVOID taken = Objects[result - WAIT_OBJECT_0];
+        if (taken && is_guest_pointer(taken)) {
+            unsigned char type = DISP_TYPE(taken);
+            if (type == DISP_TYPE_SYNCHRONIZATION_EVENT ||
+                type == DISP_TYPE_SYNCHRONIZATION_TIMER)
+                xbox_dispatcher_publish(taken, 0);
+        }
+    }
+
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 

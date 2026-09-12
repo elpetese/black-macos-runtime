@@ -56,6 +56,15 @@ add_subdirectory(src/input)
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
+# ── Tests ─────────────────────────────────────────────────────
+
+# Only when xboxrecomp is the project being configured: a game that pulls the
+# runtime in with add_subdirectory should not inherit its test targets.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    enable_testing()
+    add_subdirectory(tests/guest_layout)
+endif()
+
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries

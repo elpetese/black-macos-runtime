@@ -231,6 +231,66 @@ typedef struct w32_object {
 #define PSEUDO_CURRENT_THREAD  ((HANDLE)(LONG_PTR)-2)
 #define STILL_ACTIVE 259u
 
+/*
+ * A 32-bit guest stores a handle in 32 bits, so the pseudo handles reach us
+ * as 0xFFFFFFFF and 0xFFFFFFFE while the constants above sign-extend to the
+ * host's 64-bit width. Comparing the two directly never matched, and the
+ * value was then dereferenced as a w32_object: Black hands its own thread
+ * handle to DuplicateHandle and faulted reading 0xFFFFFFFE + 4.
+ *
+ * Match either width. The truncated forms cannot collide with a real object:
+ * that would need a heap allocation at exactly 0xFFFFFFFE.
+ */
+static int is_pseudo_process(HANDLE h)
+{
+    uintptr_t v = (uintptr_t)h;
+    return v == (uintptr_t)PSEUDO_CURRENT_PROCESS || v == 0xFFFFFFFFu;
+}
+static int is_pseudo_thread(HANDLE h)
+{
+    uintptr_t v = (uintptr_t)h;
+    return v == (uintptr_t)PSEUDO_CURRENT_THREAD || v == 0xFFFFFFFEu;
+}
+
+/* Report a handle that was never one of ours, once per distinct value: a
+ * title that gets this wrong does it in a loop, and the first few tell the
+ * whole story. */
+static void w32_report_bad_handle(const char *who, HANDLE h)
+{
+    static HANDLE seen[8];
+    static int seen_count;
+    for (int i = 0; i < seen_count; i++)
+        if (seen[i] == h) return;
+    if (seen_count < (int)(sizeof seen / sizeof seen[0]))
+        seen[seen_count++] = h;
+    fprintf(stderr, "  [W32] %s: %p is not a kernel object"
+                    " (guest address or stray value), failing the call\n", who, h);
+}
+
+/*
+ * Can this handle be one of our objects at all?
+ *
+ * The Xbox kernel's Ke* sync calls take a pointer to a dispatcher object that
+ * lives in guest memory, and the HLE answers them with a host w32_object. The
+ * two only line up when the guest is holding a handle we minted; a title that
+ * initialises a KEVENT inline, or that stores a failed call's NTSTATUS where a
+ * handle belongs, hands over something that was never an object. Black does
+ * the latter -- it waits on 0xC0000034, the status from a file open that found
+ * nothing -- and dereferencing it faulted inside pthread_mutex_lock.
+ *
+ * A guest address is the tell: the bridge widens one into the guest window, so
+ * anything landing there is guest memory, not an object of ours. Reject the
+ * low page too, the way the handle paths already do.
+ */
+static int w32_handle_is_object(HANDLE h)
+{
+    if (!h || h == INVALID_HANDLE_VALUE) return 0;
+    if ((uintptr_t)h < 0x10000) return 0;
+    if ((uintptr_t)h & (sizeof(void *) - 1)) return 0;   /* misaligned */
+    if (win32_compat_in_guest_space(h, 1)) return 0;
+    return 1;
+}
+
 static __thread w32_object *t_self_obj = NULL;
 static __thread DWORD       t_tid      = 0;
 static volatile LONG        s_next_tid = 1000;
@@ -296,8 +356,8 @@ const char *w32_handle_path(HANDLE h)
 
 BOOL CloseHandle(HANDLE h)
 {
-    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
-        h == INVALID_HANDLE_VALUE)
+    if (!h || is_pseudo_thread(h) || is_pseudo_process(h) ||
+        h == INVALID_HANDLE_VALUE || (uintptr_t)h < 0x10000)
         return TRUE;
     obj_release((w32_object *)h);
     return TRUE;
@@ -308,9 +368,12 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
 {
     (void)srcProc; (void)dstProc; (void)access; (void)inherit;
     if (!dst) return FALSE;
-    if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
-    if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
-    if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
+    if (is_pseudo_thread(src))  src = GetCurrentThread();
+    if (is_pseudo_process(src)) { *dst = src; return TRUE; }
+    if (is_pseudo_thread(src) || !src) { *dst = src; return TRUE; }
+    /* Kernel handles below the first mapped page are opaque small integers,
+     * not w32_object pointers: hand them back unchanged. */
+    if ((uintptr_t)src < 0x10000) { *dst = src; return TRUE; }
     w32_object *o = (w32_object *)src;
     InterlockedIncrement(&o->refcount);
     *dst = src;
@@ -395,8 +458,12 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
 DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
-    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+    if (!h || is_pseudo_thread(h) || is_pseudo_process(h))
         return WAIT_OBJECT_0;
+    if (!w32_handle_is_object(h)) {
+        w32_report_bad_handle("WaitForSingleObject", h);
+        return WAIT_FAILED;
+    }
     return wait_single((w32_object *)h, ms);
 }
 
@@ -470,6 +537,10 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 BOOL SetEvent(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
+    if (!w32_handle_is_object(h)) {
+        w32_report_bad_handle("SetEvent", h);
+        return FALSE;
+    }
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -696,14 +767,14 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = is_pseudo_thread(h) ? t_self_obj : (w32_object *)h;
     if (o && o->kind == K_THREAD) o->priority = priority;
     return TRUE;   /* real RT priorities need privileges; tracked only */
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = is_pseudo_thread(h) ? t_self_obj : (w32_object *)h;
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
@@ -711,7 +782,7 @@ VOID SwitchToThread(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
+    w32_object *o = is_pseudo_thread(thread) ? t_self_obj : (w32_object *)thread;
     if (!o || o->kind != K_THREAD) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
@@ -900,7 +971,7 @@ static int prot_from_page(DWORD protect)
 /* Host page size. 4 KB on x86 Linux, 16 KB on Apple Silicon -- the guest
  * always thinks in 4 KB pages, so anything handed to mprotect/mmap has to be
  * widened to host pages first. */
-static uintptr_t host_page_size(void)
+static uintptr_t xbr_host_page_size(void)
 {
     static uintptr_t ps;
     if (!ps) { long v = sysconf(_SC_PAGESIZE); ps = v > 0 ? (uintptr_t)v : 4096; }
@@ -908,11 +979,11 @@ static uintptr_t host_page_size(void)
 }
 static void *page_floor(const void *p)
 {
-    return (void *)((uintptr_t)p & ~(host_page_size() - 1));
+    return (void *)((uintptr_t)p & ~(xbr_host_page_size() - 1));
 }
 static SIZE_T page_span(const void *p, SIZE_T n)
 {
-    uintptr_t ps = host_page_size();
+    uintptr_t ps = xbr_host_page_size();
     uintptr_t lo = (uintptr_t)p & ~(ps - 1);
     uintptr_t hi = ((uintptr_t)p + n + ps - 1) & ~(ps - 1);
     return (SIZE_T)(hi - lo);
@@ -957,7 +1028,7 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 
     if (inside) {
         /* Our own reservation: replacing its PROT_NONE pages is the point. */
-        if ((uintptr_t)address & (host_page_size() - 1)) {
+        if ((uintptr_t)address & (xbr_host_page_size() - 1)) {
             SetLastError(87);   /* ERROR_INVALID_PARAMETER: not host-page aligned */
             return NULL;
         }

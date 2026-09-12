@@ -23,8 +23,13 @@ else()
     find_package(SDL2 REQUIRED)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(EPOXY REQUIRED epoxy)
+    # pkg-config reports epoxy as a bare -lepoxy, which the Apple linker cannot
+    # find outside its default search paths. Resolve it to an absolute path,
+    # taking the library directory pkg-config already reported rather than a
+    # pinned Homebrew formula version.
+    find_library(EPOXY_LIB epoxy HINTS ${EPOXY_LIBRARY_DIRS} REQUIRED)
     target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
-    target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LIBRARIES})
+    target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LIB})
 endif()
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

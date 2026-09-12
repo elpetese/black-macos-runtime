@@ -544,6 +544,13 @@ class FunctionTranslator:
                 cc = m[1:]
             elif m.startswith("set"):
                 cc = m[3:]
+            elif m.startswith("cmov"):
+                # cmovcc reads the same flags as the matching jcc -- the lifter
+                # builds its condition by rewriting the mnemonic to one. Black
+                # has three functions whose only CF reader is a cmovb after a
+                # sub, and missing them here emitted "if (_cf)" into a function
+                # that never declared _cf: the translation unit did not compile.
+                cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
                     and last_setter in CF_TRACKED):
                 return True

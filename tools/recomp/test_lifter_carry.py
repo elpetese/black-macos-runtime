@@ -246,3 +246,19 @@ class NeedsCarryTest(unittest.TestCase):
         self.assertTrue(FunctionTranslator._function_needs_cf(
             [self._insn("adc")]))
 
+    def test_carry_cmov_after_sub_needs_cf(self):
+        # Black's sub_00070CA0: "sub eax, [esp+4]" then "cmovb ebx, [esp+4]".
+        # The lifter emits "if (_cf) ..." for the cmov, so the function has to
+        # declare _cf -- without this the translation unit did not compile.
+        self.assertTrue(FunctionTranslator._function_needs_cf(
+            [self._insn("sub"), self._insn("cmovb")]))
+
+    def test_signed_cmov_after_sub_does_not(self):
+        self.assertFalse(FunctionTranslator._function_needs_cf(
+            [self._insn("sub"), self._insn("cmovge")]))
+
+    def test_carry_cmov_after_cmp_does_not(self):
+        # cmp lowers the cmov from its own operands, same as a jcc.
+        self.assertFalse(FunctionTranslator._function_needs_cf(
+            [self._insn("sub"), self._insn("cmp"), self._insn("cmovb")]))
+

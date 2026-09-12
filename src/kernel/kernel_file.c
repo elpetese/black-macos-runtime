@@ -773,13 +773,15 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_INVALID_PARAMETER;
 
     const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
+    BOOL want_directory = (CreateOptions & XBOX_FILE_DIRECTORY_FILE) != 0;
+    if (!xbox_path ||
+        !xbox_translate_path_ex(xbox_path, host_path, MAX_PATH, want_directory)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
     int fd;
-    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+    if (want_directory) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
@@ -824,13 +826,29 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
-    ssize_t n = read(fd, Buffer, Length);
-    if (n < 0) {
-        XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
-        IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
-        IoStatusBlock->Information = 0;
-        return STATUS_UNSUCCESSFUL;
+    /* read() is allowed to come back short, and on a large asset read it
+     * routinely does. The Xbox call does not: a title asks for a block and
+     * gets the whole block, so it never re-reads the tail. Black loaded every
+     * level file with the last few hundred bytes left as whatever the buffer
+     * held, and followed a pointer out of the garbage. Loop until the request
+     * is met or the file ends. */
+    size_t done = 0;
+    ssize_t n = 0;
+    while (done < (size_t)Length) {
+        ssize_t got = read(fd, (char *)Buffer + done, (size_t)Length - done);
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
+            IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Information = 0;
+            return STATUS_UNSUCCESSFUL;
+        }
+        if (got == 0)
+            break;                  /* end of file */
+        done += (size_t)got;
     }
+    n = (ssize_t)done;
 
     IoStatusBlock->Information = (ULONG_PTR)n;
     if (n == 0 && Length > 0) {
@@ -860,7 +878,23 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
-    ssize_t n = write(fd, Buffer, Length);
+    /* Same contract as the read above: a short write is the kernel's problem,
+     * not the title's. */
+    size_t wdone = 0;
+    ssize_t n;
+    while (wdone < (size_t)Length) {
+        ssize_t put = write(fd, (const char *)Buffer + wdone, (size_t)Length - wdone);
+        if (put < 0) {
+            if (errno == EINTR)
+                continue;
+            wdone = 0;
+            break;
+        }
+        if (put == 0)
+            break;
+        wdone += (size_t)put;
+    }
+    n = (wdone == 0 && Length > 0) ? -1 : (ssize_t)wdone;
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;

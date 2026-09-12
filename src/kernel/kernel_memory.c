@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdlib.h>
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -41,6 +42,9 @@ static DWORD xbox_protect_to_win32(ULONG xbox_protect)
 PVOID __stdcall xbox_MmAllocateContiguousMemory(ULONG NumberOfBytes)
 {
     PVOID p = VirtualAlloc(NULL, NumberOfBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!p) {
+        p = malloc(NumberOfBytes);
+    }
     XBOX_TRACE(XBOX_LOG_MEM, "MmAllocateContiguousMemory(%u) = %p", NumberOfBytes, p);
     return p;
 }

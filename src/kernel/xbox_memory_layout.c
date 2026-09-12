@@ -16,6 +16,8 @@
 #include "kernel.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <setjmp.h>
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
@@ -1330,6 +1332,32 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             XBOX_STACK_SIZE / 1024, XBOX_STACK_BASE, g_esp);
 
     /*
+     * Guard page below the stack.
+     *
+     * Guest RAM is one continuous mapping, so a stack that runs past its base
+     * keeps writing -- into .data, and eventually over the kernel thunk table,
+     * which turns a stack overflow into a wild indirect call thousands of
+     * instructions later. A console faults at the boundary; so should we.
+     *
+     * The 16 KB below the stack is free: the fake TIB structures sit at
+     * 0x00700000-0x00770000 and nothing else is placed between them and the
+     * stack base.
+     */
+    {
+        DWORD old_guard;
+        LPVOID guard = (LPVOID)((uintptr_t)(XBOX_STACK_BASE - 0x4000)
+                                + g_memory_offset);
+        if (VirtualProtect(guard, 0x4000, PAGE_NOACCESS, &old_guard)) {
+            fprintf(stderr, "  Stack guard: 16 KB at Xbox VA 0x%08X\n",
+                    XBOX_STACK_BASE - 0x4000);
+        } else {
+            fprintf(stderr, "  WARNING: stack guard page failed (error %lu);"
+                    " an overflow will scribble over .data instead\n",
+                    (unsigned long)GetLastError());
+        }
+    }
+
+    /*
      * Populate the fake Thread Information Block (TIB) at Xbox VA 0x0.
      *
      * The original Xbox code uses fs:[offset] to read per-thread data,
@@ -1468,11 +1496,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * with only the fake kernel page mapped here a write walked off the end of
      * it a few pages in.
      *
-     * Deliberately NOT a view of the 64 MB RAM mapping. On hardware this window
-     * aliases physical RAM, but we load the XBE image into the low addresses of
-     * that same region, so aliasing would put a title's pinned pools on top of
-     * its own code. Separate storage costs an extra mapping and behaves
-     * correctly; nothing here depends on the aliasing.
+     * NOT a view of the RAM mapping, though on hardware it aliases one. Making
+     * it a real alias was tried for Black, which passes 0x800F9FB8 for data at
+     * 0x000F9FB8 and so looks like it wants the alias. Three things had to
+     * come with it: the fake kernel PE header (below) needed its own page so
+     * it did not stomp the loaded image once the window was a real alias,
+     * MmAllocateContiguousMemory had to stop handing out physical page 0 for
+     * the same reason, and a guest-dispatcher-object pointer normalization
+     * pass made an event reached via either address form resolve to the same
+     * host object. None of it was enough: with all three in place the title
+     * still regressed from crashing after loading 9 front-end files to
+     * hanging forever after 1, spinning hundreds of millions of calls through
+     * KeWaitForSingleObject. Whatever the alias actually breaks is earlier and
+     * different from any of those three fixes, so separate storage stays
+     * until that cause is found.
      *
      * Reserved before the kernel page below, which lives inside it.
      */
@@ -1490,7 +1527,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
                     "(error %lu); pinned physical allocations will fault\n",
-                    XBOX_CONTIG_BASE, GetLastError());
+                    XBOX_CONTIG_BASE, (unsigned long)GetLastError());
         }
     }
 

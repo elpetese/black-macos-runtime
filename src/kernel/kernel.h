@@ -541,6 +541,18 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/*
+ * As above, but says whether the caller is opening a directory.
+ *
+ * A bare partition device is two things at once: a raw volume a title writes
+ * to in order to format it, and the filesystem mounted on it. Black opens
+ * "\Device\Harddisk0\Partition5\" both ways, one call after the other.
+ * Only the caller knows which it wants, so the file layer passes on what the
+ * title asked for and the device mapping stands aside for a directory open.
+ */
+BOOL xbox_translate_path_ex(const char* xbox_path, xbox_host_char* host_path_buf,
+                            DWORD buf_size, BOOL want_directory);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */
