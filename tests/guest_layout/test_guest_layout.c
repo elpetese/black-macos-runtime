@@ -23,17 +23,6 @@ static int fails;
                                else { printf("  FAIL  " __VA_ARGS__); fails++; } \
                                printf("\n"); } while (0)
 
-/* Local copy of the canonicaliser so the test stays independent of xbox_kernel.
- * Must mirror src/kernel/xbox_memory_layout.c exactly. */
-static inline uint32_t test_canon_va(uint32_t va)
-{
-    if (va >= 0x80000000u && va < 0x84000000u) {
-        if (va >= 0x80010000u && va < 0x80011000u)
-            return va;
-        return va & 0x03FFFFFFu;
-    }
-    return va;
-}
 
 int main(void)
 {
@@ -79,47 +68,31 @@ int main(void)
                  CHECK(((uint8_t *)p)[63] == 0xA5, "%s is writable", regions[i].name); }
     }
 
-    /* ---- Contiguous-window canonicalisation contract (Phase 6) ----
+    /* ---- Contiguous window is private storage, NOT an alias (Phase 6) ----
      *
-     * The contiguous window 0x80000000..0x84000000 must behave as an alias of
-     * RAM (bit 31 stripped) EXCEPT the fake kernel PE page at 0x80010000,
-     * which stays backed by the window's own storage. Host = g + va because, as
-     * above, the 4 GB reservation maps guest VA 0 onto host address g -- the
-     * same invariant xbox_MemoryLayoutInit establishes for g_xbox_mem_offset.
+     * Guest VAs are identity-mapped here, so guest 0x000F4000 is the title's
+     * own .text. If the window folded bit 31 onto low RAM, a title clearing
+     * its contiguous block through 0x800F4000 would erase its own code -- which
+     * is exactly what happened to Black before this contract was pinned down.
+     * A bit-31 read that returns zeros means nothing filled that block, not
+     * that the mapping is missing.
      */
     {
         uint32_t va_low  = 0x000F9FB8u;
         uint32_t va_phys = 0x800F9FB8u;   /* the bit-31 "physical" form */
         uint32_t value   = 0xDEADBEEFu;
 
-        /* Pure canonicaliser: bit 31 stripped, fake page left alone. */
-        CHECK(test_canon_va(va_low)  == 0x000F9FB8u,
-              "canon(0x000F9FB8) == 0x000F9FB8 (low VA unchanged)");
-        CHECK(test_canon_va(va_phys) == 0x000F9FB8u,
-              "canon(0x800F9FB8) == 0x000F9FB8 (bit 31 stripped)");
-        CHECK(test_canon_va(0x829BA9B0u) == 0x029BA9B0u,
-              "canon(0x829BA9B0) == 0x029BA9B0 (RenderWare physical ptr)");
-        CHECK(test_canon_va(0x80010000u) == 0x80010000u,
-              "canon(0x80010000) == 0x80010000 (fake kernel PE page kept)");
+        *(volatile uint32_t *)(g + va_low)  = value;
+        *(volatile uint32_t *)(g + va_phys) = ~value;
+        CHECK(*(volatile uint32_t *)(g + va_low) == value,
+              "write 0x800F9FB8 does NOT disturb 0x000F9FB8 (window is private)");
+        CHECK(*(volatile uint32_t *)(g + va_phys) == ~value,
+              "the window keeps its own bytes at 0x800F9FB8");
+        *(volatile uint32_t *)(g + va_low) = 0;
 
-        /* Write the low form, read the bit-31 form: one object, two addresses. */
-        *(volatile uint32_t *)(g + test_canon_va(va_low))  = value;
-        CHECK(*(volatile uint32_t *)(g + test_canon_va(va_phys)) == value,
-              "write 0x000F9FB8 visible at 0x800F9FB8 (true alias)");
-        /* And the reverse direction. */
-        *(volatile uint32_t *)(g + test_canon_va(va_phys)) = ~value;
-        CHECK(*(volatile uint32_t *)(g + test_canon_va(va_low)) == ~value,
-              "write 0x800F9FB8 visible at 0x000F9FB8 (true alias)");
-        /* Restore RAM so it is not left holding test residue. */
-        *(volatile uint32_t *)(g + test_canon_va(va_low)) = 0;
-
-        /* Fake PE page isolated: a write at 0x8001003C must NOT land in RAM. */
-        CHECK(test_canon_va(0x8001003Cu) == 0x8001003Cu,
-              "canon(0x8001003C) == 0x8001003C (inside fake PE page)");
-        *(volatile uint32_t *)(g + test_canon_va(0x8001003Cu)) = value;
-        CHECK(*(volatile uint32_t *)(g + test_canon_va(0x8001003Cu)) == value,
-              "write 0x8001003C reads back same (fake page still writable)");
-        CHECK(*(volatile uint32_t *)(g + test_canon_va(0x0001003Cu)) != value,
+        /* The fake kernel PE page must likewise stay off the XBE header. */
+        *(volatile uint32_t *)(g + 0x8001003Cu) = value;
+        CHECK(*(volatile uint32_t *)(g + 0x0001003Cu) != value,
               "write 0x8001003C does NOT alter 0x0001003C (PE page isolated from XBE header)");
     }
 

@@ -56,18 +56,13 @@ int  xbox_worker_stack_alloc(void);
 
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
-/* Memory access. Same as recomp_types.h MEM* but routed through xbox_canon_va
- * so a bit-31 "physical" pointer a title hands the kernel resolves to the same
- * host bytes its own MEM* write laid down -- without collapsing the fake
- * kernel PE page at 0x80010000. */
+/* Memory access - same as recomp_types.h MEM32 but without the #define guard */
 uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 
-#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)xbox_canon_va((uint32_t)(addr)) + g_xbox_mem_offset))
+#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
 
-/* Translate Xbox VA to native pointer (NULL-safe: 0 -> NULL). Canonically
- * resolves the contiguous window first, so a title's 0x800xxxxx pointer and
- * the kernel's view of it agree on host storage. */
-#define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)xbox_canon_va((uint32_t)(va)) + g_xbox_mem_offset) : NULL)
+/* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
+#define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)(va) + g_xbox_mem_offset) : NULL)
 
 /* ── Synthetic VA range (for function exports) ─────────── */
 
@@ -85,8 +80,8 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
  * it with the expected structures.
  */
 
-#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)xbox_canon_va((uint32_t)(addr)) + g_xbox_mem_offset))
-#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)xbox_canon_va((uint32_t)(addr)) + g_xbox_mem_offset))
+#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)(addr) + g_xbox_mem_offset))
 
 /**
  * Get the Xbox VA of data for a kernel DATA export ordinal.
