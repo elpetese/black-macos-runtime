@@ -143,6 +143,34 @@ static void prof_count(const char *name, uint32_t va)
     g_prof_full = 1;
 }
 
+/* Whether `a` looks like a pointer into guest-backed memory worth
+ * dereferencing for a trace dump, rather than a small integer, a flag word,
+ * or noise.
+ *
+ * Low RAM/heap/stack is the obvious case. The contiguous window
+ * (0x80000000-0x84000000) belongs here too: since the bit-31 fold was
+ * reverted (it corrupted the title's own .text -- see project memory
+ * black-port-text-corruption-root-cause), that window is real, private
+ * backing storage in its own right, not an alias needing translation, so a
+ * title's "physical" object pointers live there and are just as
+ * dereferenceable as any other guest pointer. Missing this range is what
+ * left a DirectSound object's fields invisible to this exact trace for an
+ * entire investigation. The tiled aperture (0xF0000000-0xF4000000) is a
+ * true alias of RAM and included for the same reason.
+ *
+ * Deliberately excluded: the first 64 KB (near-null noise), and the
+ * hardware-register apertures (NV2A/MCPX/flash, and the synthetic kernel
+ * thunk range at 0xFE000000+) -- those hold register/thunk state, not
+ * general data, and dumping them as if they were an object is misleading
+ * rather than useful. */
+static int looks_like_guest_data_ptr(uint32_t a)
+{
+    if (a >= 0x00010000u && a < 0x04000000u) return 1;  /* low RAM/heap/stack */
+    if (a >= 0x80000000u && a < 0x84000000u) return 1;  /* contiguous window */
+    if (a >= 0xF0000000u && a < 0xF4000000u) return 1;  /* tiled aperture */
+    return 0;
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
     if (prof_enabled()) { prof_count(name, va); return; }
@@ -172,9 +200,12 @@ void recomp_trace_enter(const char *name, uint32_t va)
             fprintf(stderr, " %d=%08X", i,
                     *(const uint32_t *)(mem + g_esp + i * 4));
         fprintf(stderr, "\n");
-        /* And the object eax points at. A matrix of NaNs says the maths went
-         * wrong; whether its inputs were already zero says whether the maths
-         * is at fault or the data behind it was never built. */
+        /* And the object eax/ecx point at. A matrix of NaNs says the maths
+         * went wrong; whether its inputs were already zero says whether the
+         * maths is at fault or the data behind it was never built. ecx is
+         * included because a thiscall's real "this" arrives there, not on
+         * the stack -- a field read off an invisible ecx is exactly the gap
+         * that blocked the DirectSound investigation this was added for. */
         /* Follow the pointer arguments one level. A matrix that arrives as
          * NaN was copied from somewhere, and the object it came from is what
          * needs looking at -- the value alone says only that it is wrong. */
@@ -182,7 +213,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
             for (i = 1; i <= n; i++) {
                 uint32_t a = *(const uint32_t *)(mem + g_esp + i * 4);
                 int k;
-                if (a < 0x00010000u || a >= 0x04000000u)
+                if (!looks_like_guest_data_ptr(a))
                     continue;
                 fprintf(stderr, "         arg%d -> [%08X]:", i, a);
                 for (k = 0; k < 12; k++)
@@ -190,8 +221,15 @@ void recomp_trace_enter(const char *name, uint32_t va)
                             *(const uint32_t *)(mem + a + k * 4));
                 fprintf(stderr, "\n");
             }
+            if (looks_like_guest_data_ptr(g_ecx)) {
+                fprintf(stderr, "         ecx  -> [%08X]:", g_ecx);
+                for (i = 0; i < 12; i++)
+                    fprintf(stderr, " %08X",
+                            *(const uint32_t *)(mem + g_ecx + i * 4));
+                fprintf(stderr, "\n");
+            }
         }
-        if (g_eax > 0x00010000u && g_eax < 0x04000000u) {
+        if (looks_like_guest_data_ptr(g_eax)) {
             fprintf(stderr, "         [eax=%08X]:", g_eax);
             for (i = 0; i < 24; i++)
                 fprintf(stderr, " %08X",
