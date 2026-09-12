@@ -1317,10 +1317,6 @@ static void bridge_KeSetEvent(void)
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
 
-    fprintf(stderr, "[SETEVENT] bridge_KeSetEvent event_ptr=0x%08X increment=%u wait=%u\n",
-            event_ptr, increment, wait);
-    fflush(stderr);
-
     g_eax = (uint32_t)xbox_KeSetEvent(XBOX_TO_NATIVE(event_ptr), increment, (BOOLEAN)wait);
 }
 
@@ -1375,9 +1371,6 @@ static void bridge_NtSetEvent(void)
 {
     HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
     uint32_t prev   = STACK_ARG(1);
-    fprintf(stderr, "[SETEVENT] bridge_NtSetEvent handle_ptr=0x%08X handle=%p prev=0x%08X\n",
-            STACK_ARG(0), handle, prev);
-    fflush(stderr);
     g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
 }
 
