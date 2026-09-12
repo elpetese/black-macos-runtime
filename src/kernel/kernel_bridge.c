@@ -2502,6 +2502,11 @@ static NTSTATUS bridge_create_file_impl(
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
+        /* The requested name, before translation: a failure that never
+         * reaches path translation prints no [PATH] line, so this is the
+         * only place the title's own spelling survives. */
+        fprintf(stderr, "  [FILE] open failed 0x%08X for \"%.*s\"\n",
+                (unsigned)st, (int)name.Length, name.Buffer);
     }
     return st;
 }
@@ -2643,12 +2648,22 @@ static void bridge_NtCreateFile(void)
     {
         extern uint32_t xbox_LastFileError(void);
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
-        if (g_eax)
-            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s)\n",
+        if (g_eax) {
+            /* Name the file. "A failed open is not itself a bug" only holds
+             * if you can tell a probe from a real miss, and the status alone
+             * cannot: both are 0xC0000034. */
+            char _p[MAX_PATH * 2];
+            const wchar_t *_w = xbox_LastHostPath();
+            size_t _n = 0;
+            while (_w && _n < sizeof(_p) - 1 && _w[_n]) { _p[_n] = (char)_w[_n]; _n++; }
+            _p[_n] = 0;
+            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s) %s\n",
                     g_eax, _e,
                     _e == 32u ? " ERROR_SHARING_VIOLATION"
                   : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
-                  : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
+                  : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "",
+                    _p);
+        }
         else
             fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
     }
