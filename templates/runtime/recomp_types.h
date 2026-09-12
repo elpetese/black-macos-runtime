@@ -846,6 +846,20 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * No return address is pushed - reuses the current frame's return addr.
  * Used for tail-call optimization where the original code uses
  * jmp [reg] instead of call [reg].
+ *
+ * Known limitation on failure: an unresolved target logs (with a host
+ * backtrace, via recomp_icall_fail_log) and falls through to the enclosing
+ * generated function's `return;`, which does none of that function's own
+ * register restores or stack cleanup -- the caller resumes with whatever
+ * ebx/esi/edi/ebp this function had reached by that point, not what a real
+ * jmp would have handed over. Reconstructing the true per-function epilogue
+ * here would need the lifter to track and re-emit each function's specific
+ * pop/esp sequence at an arbitrary mid-function point, which is a real
+ * change, not a one-line fix; not attempted here. Traced end to end for one
+ * real failure in the Black port (see project memory
+ * black-port-text-corruption-root-cause): the frame corruption from this
+ * fallback is what turned one bad jump-table entry into a crash thousands
+ * of calls away, in an unrelated function.
  */
 #define RECOMP_ITAIL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
@@ -855,7 +869,11 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+           /* No PUSH32 preceded this, unlike RECOMP_ICALL -- a real jmp \
+            * touches no stack, so there is nothing here to pop back off. \
+            * The old `g_esp += 4;` was copied from RECOMP_ICALL's failure \
+            * path and drifted esp by 4 bytes that were never pushed. */ \
+           recomp_icall_fail_log(_va); g_eax = 0; } \
 } while(0)
 
 /* ================================================================
