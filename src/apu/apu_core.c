@@ -461,6 +461,15 @@ static void *mcpx_apu_frame_thread(void *arg)
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
+            /* Voice notifications and idle traps only mark ISTS and set_irq;
+             * GINTSTS, the bit a host polls to raise the APU interrupt, is
+             * computed by update_irq. xemu does this after every frame; the
+             * standalone extraction dropped it, so DirectSound never saw a
+             * packet complete. */
+            if (d->set_irq) {
+                d->set_irq = false;
+                update_irq(d);
+            }
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);

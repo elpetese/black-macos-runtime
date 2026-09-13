@@ -393,7 +393,16 @@ static void dsp_ack_tick(void)
         if ((*ep_reset & 3u) == 3u && *heartbeat != DSP_HEARTBEAT)
             *heartbeat = DSP_HEARTBEAT;
     }
-    sg = *(volatile uint32_t *)((char *)g_mcpx_regs + APU_GPSADDR);
+    {
+        /* GPSADDR sits in the voice-processor block a host may have handed to
+         * an APU model; read it through the model instead of faulting on
+         * every poll. */
+        uint64_t v;
+        if (xbox_mmio_read(XBOX_MCPX_BASE + APU_GPSADDR, 4, &v))
+            sg = (uint32_t)v;
+        else
+            sg = *(volatile uint32_t *)((char *)g_mcpx_regs + APU_GPSADDR);
+    }
     if (!sg || !fence_readable(sg, 4))
         return;
     page0 = *(volatile uint32_t *)((uintptr_t)sg + g_memory_offset);
@@ -702,6 +711,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++) {
                 volatile uint32_t *c =
                     (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
+                uint64_t owned;
+                /* A register a host has given to a device model is that
+                 * model's to answer (the APU's VP answers PIO_FREE here). */
+                if (xbox_mmio_read(XBOX_MCPX_BASE + MCPX_COUNTERS[i], 4, &owned))
+                    continue;
                 *c += 1;
             }
         }

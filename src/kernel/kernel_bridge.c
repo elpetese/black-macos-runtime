@@ -2022,6 +2022,47 @@ static void kernel_vblank_tick(void)
  * line. Vector 6 is what Black's DirectSound connected (measured). */
 #define AC97_VECTOR            6u
 
+/* Level-triggered device interrupts registered by a host's device models
+ * (the APU's voice processor, for one): polled on every timer tick. */
+#define XBOX_MAX_IRQ_SOURCES 8
+static struct {
+    uint32_t vector;
+    int    (*pending)(void *ctx);
+    void    *ctx;
+} g_irq_sources[XBOX_MAX_IRQ_SOURCES];
+static int g_irq_source_count;
+
+int xbox_RegisterInterruptSource(uint32_t vector, int (*pending)(void *ctx),
+                                 void *ctx)
+{
+    if (g_irq_source_count >= XBOX_MAX_IRQ_SOURCES || !pending)
+        return -1;
+    g_irq_sources[g_irq_source_count].vector  = vector;
+    g_irq_sources[g_irq_source_count].pending = pending;
+    g_irq_sources[g_irq_source_count].ctx     = ctx;
+    g_irq_source_count++;
+    return 0;
+}
+
+static void kernel_irq_sources_tick(void)
+{
+    for (int i = 0; i < g_irq_source_count; i++) {
+        static unsigned logged[XBOX_MAX_IRQ_SOURCES];
+        int claimed;
+
+        if (!xbox_GetConnectedInterrupt(g_irq_sources[i].vector) ||
+            !g_irq_sources[i].pending(g_irq_sources[i].ctx))
+            continue;
+        claimed = kernel_raise_interrupt(g_irq_sources[i].vector);
+        if (logged[i]++ < 3) {
+            fprintf(stderr, "  [IRQ] vector %u -> ISR %s\n", g_irq_sources[i].vector,
+                    claimed < 0 ? "not callable" :
+                    claimed ? "claimed it" : "declined it");
+            fflush(stderr);
+        }
+    }
+}
+
 static void kernel_ac97_tick(void)
 {
     if (!xbox_mcpx_ac97_tick() || !xbox_GetConnectedInterrupt(AC97_VECTOR))
@@ -2280,6 +2321,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         Sleep(10);
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_ac97_tick();    /* the audio clock */
+        kernel_irq_sources_tick();
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 

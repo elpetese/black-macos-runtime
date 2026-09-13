@@ -67,9 +67,22 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static uint8_t   g_ac97[AC97_SHADOW];
 static uintptr_t g_ac97_host = 0;
-static size_t    g_ac97_len  = 0;
 static int       g_trace     = -1;
 static unsigned  g_trace_n   = 0;
+
+/* Intercepted register blocks. Each is a run of host pages made PROT_NONE
+ * whose accesses are decoded and handed to a device model. */
+#define MMIO_MAX_REGIONS 8
+static struct {
+    uintptr_t          host_base;   /* host address of guest_va */
+    size_t             len;         /* whole host pages */
+    uint32_t           guest_va;
+    xbox_mmio_read_fn  read;
+    xbox_mmio_write_fn write;
+    void              *ctx;
+    const char        *name;
+} g_regions[MMIO_MAX_REGIONS];
+static int g_region_count;
 
 /* The shadow is touched from the fault handler on any guest thread and from
  * the playback tick on the timer thread. Never held while guest code runs:
@@ -176,24 +189,81 @@ static void ac97_write(uint32_t off, uint64_t v, unsigned n)
         ac97_write_byte(off + i, (uint8_t)(v >> (8 * i)));
 }
 
+int xbox_mmio_read(uint32_t guest_va, unsigned size, uint64_t *value)
+{
+    for (int r = 0; r < g_region_count; r++) {
+        uint32_t base = g_regions[r].guest_va;
+        if (guest_va >= base && guest_va - base + size <= g_regions[r].len) {
+            *value = g_regions[r].read(g_regions[r].ctx, guest_va - base, size);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint64_t ac97_region_read(void *ctx, uint32_t off, unsigned n)
+{
+    uint64_t v;
+    (void)ctx;
+    ac97_lock();
+    v = ac97_read(off, n);
+    ac97_unlock();
+    return v;
+}
+
+static void ac97_region_write(void *ctx, uint32_t off, uint64_t v, unsigned n)
+{
+    (void)ctx;
+    ac97_lock();
+    ac97_write(off, v, n);
+    ac97_unlock();
+}
+
 int xbox_mcpx_mmio_arm_ac97(void *ac97_host_base)
 {
     long ps = sysconf(_SC_PAGESIZE);
 
     if (ps <= 0 || (size_t)ps > AC97_SHADOW)
         return 0;
-    g_ac97_host = (uintptr_t)ac97_host_base;
-    g_ac97_len  = (size_t)ps;
-    memcpy(g_ac97, ac97_host_base, g_ac97_len);
-    g_ac97[AC97_GLOB_STA] |= (uint8_t)AC97_GLOB_STA_CODEC_RDY;
+    memcpy(g_ac97, ac97_host_base, (size_t)ps);
     g_ac97[AC97_GLOB_STA + 1] |= (uint8_t)(AC97_GLOB_STA_CODEC_RDY >> 8);
-    if (mprotect(ac97_host_base, g_ac97_len, PROT_NONE) != 0) {
-        perror("[MCPX] mprotect AC'97");
-        g_ac97_host = 0;
+    if (!xbox_mmio_intercept(AC97_VA, (uint32_t)ps, ac97_region_read,
+                             ac97_region_write, NULL, "AC97"))
+        return 0;
+    g_ac97_host = (uintptr_t)ac97_host_base;
+    return 1;
+}
+
+int xbox_mmio_intercept(uint32_t guest_va, uint32_t size,
+                        xbox_mmio_read_fn read, xbox_mmio_write_fn write,
+                        void *ctx, const char *name)
+{
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t host;
+    size_t len;
+
+    if (ps <= 0 || g_region_count >= MMIO_MAX_REGIONS || !read || !write)
+        return 0;
+    if (guest_va & (uint32_t)(ps - 1)) {
+        fprintf(stderr, "[MMIO] %s at 0x%08X is not page aligned\n", name, guest_va);
         return 0;
     }
-    fprintf(stderr, "  AC97: 0x%08X..0x%08X intercepted (%zu-byte host page)\n",
-            AC97_VA, AC97_VA + (uint32_t)g_ac97_len, g_ac97_len);
+    host = (uintptr_t)xbox_GetMemoryOffset() + guest_va;
+    len = ((size_t)size + (size_t)ps - 1) & ~((size_t)ps - 1);
+    if (mprotect((void *)host, len, PROT_NONE) != 0) {
+        perror("[MMIO] mprotect");
+        return 0;
+    }
+    g_regions[g_region_count].host_base = host;
+    g_regions[g_region_count].len       = len;
+    g_regions[g_region_count].guest_va  = guest_va;
+    g_regions[g_region_count].read      = read;
+    g_regions[g_region_count].write     = write;
+    g_regions[g_region_count].ctx       = ctx;
+    g_regions[g_region_count].name      = name;
+    g_region_count++;
+    fprintf(stderr, "  %s: 0x%08X..0x%08X intercepted\n", name, guest_va,
+            guest_va + (uint32_t)len);
     return 1;
 }
 
@@ -333,8 +403,13 @@ int xbox_mcpx_mmio_fault(void *ucontext, uintptr_t fault_addr)
     int size, opc, rt, rn, writeback = 0;
     unsigned nbytes;
 
-    if (!g_ac97_host || fault_addr < g_ac97_host ||
-        fault_addr >= g_ac97_host + g_ac97_len)
+    int r;
+
+    for (r = 0; r < g_region_count; r++)
+        if (fault_addr >= g_regions[r].host_base &&
+            fault_addr < g_regions[r].host_base + g_regions[r].len)
+            break;
+    if (r == g_region_count)
         return 0;
 
     pc   = UC_PC(uc);
@@ -372,14 +447,15 @@ int xbox_mcpx_mmio_fault(void *ucontext, uintptr_t fault_addr)
         goto undecoded;
     }
 
-    if (fault_addr < ea || fault_addr >= ea + nbytes) {
+    if (fault_addr < ea || fault_addr >= ea + nbytes
+            || ea + nbytes > g_regions[r].host_base + g_regions[r].len) {
         fprintf(stderr, "[MCPX] decoded ea %p does not cover fault %p (insn %08X)\n",
                 (void *)(uintptr_t)ea, (void *)fault_addr, insn);
         return 0;
     }
 
     {
-        uint32_t off = (uint32_t)(ea - g_ac97_host);
+        uint32_t off = (uint32_t)(ea - g_regions[r].host_base);
         int is_write = (opc == 0);
         uint64_t v = 0;
 
@@ -387,13 +463,9 @@ int xbox_mcpx_mmio_fault(void *ucontext, uintptr_t fault_addr)
             v = reg_get(uc, rt, 0);
             if (nbytes < 8)
                 v &= (1ull << (8 * nbytes)) - 1;
-            ac97_lock();
-            ac97_write(off, v, nbytes);
-            ac97_unlock();
+            g_regions[r].write(g_regions[r].ctx, off, v, nbytes);
         } else {
-            ac97_lock();
-            v = ac97_read(off, nbytes);
-            ac97_unlock();
+            v = g_regions[r].read(g_regions[r].ctx, off, nbytes);
             if (opc == 2 && size < 3) {             /* sign-extend to 64 */
                 unsigned bits = 8 * nbytes;
                 v = (uint64_t)((int64_t)(v << (64 - bits)) >> (64 - bits));
@@ -413,8 +485,8 @@ int xbox_mcpx_mmio_fault(void *ucontext, uintptr_t fault_addr)
             g_trace = t ? (atoi(t) > 1 ? atoi(t) : 400) : 0;
         }
         if (g_trace && g_trace_n++ < (unsigned)g_trace)
-            fprintf(stderr, "  [AC97] %s 0x%08X/%u = %0*llX\n",
-                    is_write ? "write" : "read ", AC97_VA + off, nbytes,
+            fprintf(stderr, "  [%s] %s 0x%08X/%u = %0*llX\n", g_regions[r].name,
+                    is_write ? "write" : "read ", g_regions[r].guest_va + off, nbytes,
                     (int)(nbytes * 2), (unsigned long long)v);
     }
 
@@ -431,6 +503,18 @@ undecoded:
 
 int xbox_mcpx_mmio_arm_ac97(void *ac97_host_base) { (void)ac97_host_base; return 0; }
 int xbox_mcpx_ac97_tick(void) { return 0; }
+int xbox_mmio_read(uint32_t guest_va, unsigned size, uint64_t *value)
+{
+    (void)guest_va; (void)size; (void)value;
+    return 0;
+}
+int xbox_mmio_intercept(uint32_t guest_va, uint32_t size,
+                        xbox_mmio_read_fn read, xbox_mmio_write_fn write,
+                        void *ctx, const char *name)
+{
+    (void)guest_va; (void)size; (void)read; (void)write; (void)ctx; (void)name;
+    return 0;
+}
 int xbox_mcpx_mmio_fault(void *ucontext, uintptr_t fault_addr)
 {
     (void)ucontext; (void)fault_addr;

@@ -95,32 +95,41 @@ static inline void qemu_thread_join(QemuThread *t) {
 
 extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
 
+/* The address a title hands the APU (scatter-gather tables, voice buffers).
+ * Below 64 MB it is physical RAM. In the recompiler runtime the contiguous
+ * window (0x80000000+) is private storage, not an alias of low RAM, and
+ * MmGetPhysicalAddress returns those addresses unchanged -- so masking them to
+ * 26 bits reads the wrong memory. Keep them whole. */
+static inline uint32_t apu_guest_addr(uint64_t addr) {
+    return (addr & 0x80000000u) ? (uint32_t)addr : (uint32_t)(addr & 0x03FFFFFF);
+}
+
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint32_t *)(g_apu_ram_ptr + apu_guest_addr(addr));
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint16_t *)(g_apu_ram_ptr + apu_guest_addr(addr));
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint8_t *)(g_apu_ram_ptr + apu_guest_addr(addr));
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint32_t *)(g_apu_ram_ptr + apu_guest_addr(addr)) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint16_t *)(g_apu_ram_ptr + apu_guest_addr(addr)) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint8_t *)(g_apu_ram_ptr + apu_guest_addr(addr)) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */
