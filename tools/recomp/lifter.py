@@ -3018,6 +3018,79 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
+# ── Flag state across basic blocks ────────────────────────────
+#
+# A flag state is (setter_mnemonic, operands) or None (unknown). Where control
+# flow joins, predecessors can leave different setters that nonetheless define
+# the same condition: `sub eax, x` falling into a loop head and `dec eax; jmp`
+# coming back to it both make `je` mean `eax == 0`. Such a join carries
+# (FLAG_MERGE, [states]) and a condition is accepted only when every
+# alternative produces the identical expression -- otherwise it stays unknown,
+# which costs a fallback and never a wrong branch.
+
+FLAG_MERGE = "__merge__"
+_FLAG_MERGE_LIMIT = 4
+
+
+def next_flag_state(insn, state):
+    """Flag state after `insn`, given the state before it."""
+    m = insn.mnemonic
+    if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
+        return (m, list(insn.operands))
+    if m in _FLAGS_UNDEFINED:
+        return None
+    if m in _EFLAGS_PRESERVE:
+        return state
+    if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi", "sahf"):
+        return (m, list(insn.operands))
+    if m.startswith("f") or m.startswith("cmov") or m.startswith("j") \
+            or m.startswith("set"):
+        return state
+    if m.startswith("rep"):
+        rest = insn.op_str.strip() if hasattr(insn, "op_str") else ""
+        if "cmpsb" in m or "scasb" in m or "cmpsb" in rest or "scasb" in rest:
+            return (m, list(insn.operands))
+        return state
+    return None
+
+
+def block_flag_transfer(bb, state):
+    """Flag state at the end of a basic block entered with `state`."""
+    for insn in bb.instructions:
+        state = next_flag_state(insn, state)
+    return state
+
+
+def merge_flag_states(states):
+    """Meet of predecessor flag states; None if any is unknown."""
+    alts = []
+    for st in states:
+        if st is None:
+            return None
+        for alt in (st[1] if st[0] == FLAG_MERGE else [st]):
+            if alt not in alts:
+                alts.append(alt)
+    if len(alts) == 1:
+        return alts[0]
+    if len(alts) > _FLAG_MERGE_LIMIT:
+        return None
+    return (FLAG_MERGE, alts)
+
+
+def _resolve_flag_condition(make, mnemonic, setter, ops):
+    """Apply a condition builder to a possibly merged flag state."""
+    if setter != FLAG_MERGE:
+        return make(mnemonic, setter, ops)
+    results = [make(mnemonic, s, o) for s, o in ops]
+    if any(r is None for r in results):
+        return None
+    first = results[0]
+    key = (lambda r: r[0]) if isinstance(first, tuple) else (lambda r: r)
+    if any(key(r) != key(first) for r in results[1:]):
+        return None
+    return first
+
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -3074,8 +3147,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         # Check if this instruction uses flags (jcc, setcc, cmovcc)
         if curr.is_cond_jump and last_flag_setter:
-            result = _make_condition(
-                curr.mnemonic, last_flag_setter, last_flag_ops)
+            result = _resolve_flag_condition(
+                _make_condition, curr.mnemonic, last_flag_setter, last_flag_ops)
             if result:
                 cond_expr, desc = result
                 target = curr.jump_target
@@ -3089,8 +3162,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                               "seta", "setl", "setge", "setle", "setg",
                               "sets", "setns")
                 and last_flag_setter and len(curr.operands) >= 1):
-            cond = _make_setcc_value(
-                curr.mnemonic, last_flag_setter, last_flag_ops)
+            cond = _resolve_flag_condition(
+                _make_setcc_value, curr.mnemonic, last_flag_setter, last_flag_ops)
             if cond:
                 stmts.append(
                     _fmt_operand_write(curr.operands[0],
@@ -3103,8 +3176,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                               "cmovbe", "cmova", "cmovl", "cmovge",
                               "cmovle", "cmovg", "cmovs", "cmovns")
                 and last_flag_setter and len(curr.operands) >= 2):
-            cond = _make_cmovcc_cond(
-                curr.mnemonic, last_flag_setter, last_flag_ops)
+            cond = _resolve_flag_condition(
+                _make_cmovcc_cond, curr.mnemonic, last_flag_setter, last_flag_ops)
             if cond:
                 src = _fmt_operand_read(curr.operands[1])
                 stmts.append(
@@ -3135,50 +3208,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
         stmts.extend(results)
 
         # Track flag-setting instructions
-        if curr.mnemonic in FLAG_SETTERS:
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic in _FLAGS_UNDEFINED:
-            # Flags are undefined after these - clear tracking
-            last_flag_setter = None
-            last_flag_ops = []
-        elif curr.mnemonic in _EFLAGS_SETTERS:
-            # Additional flag-setting instructions
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic in _EFLAGS_PRESERVE:
-            pass  # These don't affect EFLAGS
-        elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
-                                "fucomip", "fcomi"):
-            # FPU compare-to-EFLAGS: sets CF, ZF, PF directly
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic == "sahf":
-            # sahf loads AH into flags - typically after fnstsw ax
-            # in the fcomp/fnstsw/sahf pattern for FPU comparisons
-            last_flag_setter = "sahf"
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic.startswith("f") or curr.mnemonic.startswith("cmov"):
-            pass  # FPU and already-handled CMOVcc
-        elif curr.mnemonic.startswith("j"):
-            pass  # Jumps don't set flags
-        elif curr.mnemonic.startswith("set"):
-            pass  # SETcc doesn't set flags
-        elif curr.mnemonic.startswith("rep"):
-            # rep movsb/movsd = data copy, preserves flags
-            # repe cmpsb/repne scasb = comparison, sets flags
-            rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
-            raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            else:
-                pass  # rep movs/stos = data movement, flags preserved
+        state = next_flag_state(
+            curr, (last_flag_setter, last_flag_ops) if last_flag_setter else None)
+        if state:
+            last_flag_setter, last_flag_ops = state
         else:
-            # Unknown instruction - conservatively clear flag state
             last_flag_setter = None
             last_flag_ops = []
 

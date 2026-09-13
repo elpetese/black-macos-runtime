@@ -22,7 +22,8 @@ import struct
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
-from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+from .lifter import (Lifter, lift_basic_block, block_flag_transfer,
+                     merge_flag_states, detect_seh_helpers,
                      detect_setjmp_helpers)
 
 
@@ -933,7 +934,38 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
-        out_state = {}
+        # Flag state entering each block, solved to a fixed point before any
+        # code is emitted. Walking blocks once in address order leaves every
+        # back edge unknown, so a loop whose head tests the flags its own tail
+        # left (`L: je done; ...; dec eax; jmp L`) got the never-assigned
+        # _flags fallback and could not exit. The XMV decoder in Black ran
+        # its edi off the end of the mapped heap that way (sub_00240F38).
+        # Predecessors not solved yet are left out of the meet (optimistic);
+        # anything still unsolved at the end is unreachable and gets None.
+        _unsolved = object()
+        flow_out = {bb.start: _unsolved for bb in blocks}
+
+        def _incoming(bb):
+            sources = preds[bb.start]
+            if bb.start == start or not sources:
+                return None
+            known = [flow_out[p] for p in sources if flow_out[p] is not _unsolved]
+            if not known:
+                return _unsolved
+            return merge_flag_states(known)
+
+        for _ in range(4 * len(blocks) + 4):
+            changed = False
+            for bb in blocks:
+                # An unsolved entry threads through unchanged until the block
+                # sets or clears flags itself.
+                out = block_flag_transfer(bb, _incoming(bb))
+                if out != flow_out[bb.start]:
+                    flow_out[bb.start] = out
+                    changed = True
+            if not changed:
+                break
+
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -944,24 +976,16 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
+            # Inherit the flag state the dataflow above settled on. A
+            # predecessor still unsolved here counts as unknown, not absent.
             sources = preds[bb.start]
-            if bb.start == start or not sources:
+            if (bb.start == start or not sources
+                    or any(flow_out[p] is _unsolved for p in sources)):
                 incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
             else:
-                incoming = None
+                incoming = merge_flag_states([flow_out[p] for p in sources])
 
-            stmts, out_state[bb.start] = lift_basic_block(
+            stmts, _ = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
