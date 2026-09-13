@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "mcpx_mmio.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -349,6 +350,50 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
     return 0;
 }
 
+/* GP DSP command acknowledgement.
+ *
+ * The XDK downloads an effects image into GP scratch memory, writes a command
+ * into the image header (scratch page 0 + 0x810) and spins until it reads 0:
+ * the DSP firmware, running on its own, picks the command up and clears it.
+ * There is no DSP here, so the clear is done on its behalf. The page is found
+ * the way the DSP finds it -- GPSADDR holds the scatter-gather table, whose
+ * first entry is page 0 -- so nothing depends on where a title allocates.
+ * Measured on Black: GPSADDR=0x83224000, entry 0=0x83218000, command 3.
+ *
+ * Only small values are cleared: the word is a command, and anything larger
+ * would be image data this must not touch. */
+#define APU_GPSADDR          0x2040u
+#define DSP_IMAGE_CMD_OFFSET 0x810u
+
+static int g_dsp_ack_enabled = 0;
+
+static void dsp_ack_tick(void)
+{
+    uint32_t sg, page0, cmd;
+    volatile uint32_t *cmdp;
+
+    if (!g_dsp_ack_enabled || !g_mcpx_regs || g_apu_mmio_trapped)
+        return;
+    sg = *(volatile uint32_t *)((char *)g_mcpx_regs + APU_GPSADDR);
+    if (!sg || !fence_readable(sg, 4))
+        return;
+    page0 = *(volatile uint32_t *)((uintptr_t)sg + g_memory_offset);
+    if (!page0 || !fence_readable(page0 + DSP_IMAGE_CMD_OFFSET, 4))
+        return;
+    cmdp = (volatile uint32_t *)((uintptr_t)(page0 + DSP_IMAGE_CMD_OFFSET)
+                                 + g_memory_offset);
+    cmd = *cmdp;
+    if (cmd == 0 || cmd > 0xFFu)
+        return;
+    *cmdp = 0;
+    {
+        static unsigned logged;
+        if (logged++ < 16)
+            fprintf(stderr, "  [DSP] command %u at 0x%08X acknowledged\n",
+                    cmd, page0 + DSP_IMAGE_CMD_OFFSET);
+    }
+}
+
 static void counter_mirrors_tick(void)
 {
     for (int i = 0; i < g_counter_mirror_count; i++) {
@@ -553,6 +598,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         }
         fence_mirrors_tick();
         counter_mirrors_tick();
+        dsp_ack_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
 
@@ -1647,10 +1693,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  *
                  * Enabled by the same variable, because neither half is any
                  * use without the other. */
+#if defined(_WIN32)
+                /* Only Windows has a handler that routes the fault
+                 * (apu_mmio_hook.c); anywhere else a trapped APU register is
+                 * an unhandled SIGBUS on the first access. */
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
+#endif
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
@@ -1660,6 +1711,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                 " (DirectSound will initialise)\n",
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
+#if !defined(_WIN32)
+                /* Codec ready is not enough on its own: the channel reset
+                 * that follows needs its Reset Registers bit to clear on
+                 * write, which only an intercepted register can do. */
+                xbox_mcpx_mmio_arm_ac97((char *)g_mcpx_memory + 0x00400000u);
+                g_dsp_ack_enabled = 1;
+#endif
             }
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
                     "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
