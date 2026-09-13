@@ -901,6 +901,28 @@ class FunctionTranslator:
         # Generate code for each basic block
         # Create a set of addresses that need labels
         label_addrs = set()
+        # Targets of `jmp reg` that stay inside this function: the constants
+        # the same register is loaded with that land on one of its instruction
+        # starts. Conservative -- no data flow -- and anything else still falls
+        # back to RECOMP_ITAIL.
+        insn_starts = {insn.address for insn in instructions}
+        local_jumps = {}
+        for insn in instructions:
+            if (insn.mnemonic == "jmp" and not insn.jump_target
+                    and insn.operands and insn.operands[0].type == "reg"):
+                reg = str(insn.operands[0].reg).lower()
+                targets = sorted({
+                    other.operands[1].imm & 0xFFFFFFFF
+                    for other in instructions
+                    if other.mnemonic == "mov" and len(other.operands) == 2
+                    and other.operands[0].type == "reg"
+                    and str(other.operands[0].reg).lower() == reg
+                    and other.operands[1].type == "imm"
+                    and (other.operands[1].imm & 0xFFFFFFFF) in insn_starts})
+                if targets:
+                    local_jumps[insn.address] = targets
+                    label_addrs.update(targets)
+        self.lifter.local_jump_targets = local_jumps
         for bb in blocks:
             for succ in bb.successors:
                 label_addrs.add(succ)

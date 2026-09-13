@@ -74,6 +74,9 @@
  * emits nothing for it; lifting it to __debugbreak() terminated the process
  * with STATUS_BREAKPOINT the first time a title tried to print. */
 void recomp_debug_service(uint32_t service, uint32_t arg_va);
+/* x86 port I/O (in/out): size is the byte width, 1, 2 or 4. */
+uint32_t recomp_port_in(uint32_t port, uint32_t size);
+void recomp_port_out(uint32_t port, uint32_t size, uint32_t value);
 
 /* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
  * The auto-generated code emits __debugbreak for x86 INT 3 instructions. */

@@ -282,6 +282,7 @@ _EFLAGS_PRESERVE = frozenset({
     "not",  # NOT does not modify flags
     "call",
     "int3", "int", "wait",
+    "in", "out",
     "cld", "std", "cli", "sti",
     "pushfd", "popfd", "pushal",
     "sgdt", "ljmp", "sfence",
@@ -941,6 +942,9 @@ class Lifter:
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
+        # Per function: indirect `jmp reg` address -> intra-function labels the
+        # register can hold. Set by the translator; see _lift_jmp.
+        self.local_jump_targets = {}
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
@@ -1154,6 +1158,26 @@ class Lifter:
         # first time it tried to print a debug line, after a full boot.
         if m == "int" and ops and ops[0].type == "imm" and ops[0].imm == 0x2D:
             return ["recomp_debug_service(eax, ecx); /* int 0x2d */"]
+
+        # Port I/O. Some southbridge state is only reachable through ports:
+        # the D3D vblank ISR reads which interlaced field is scanning from
+        # 0x80C0 bit 5. Emitting nothing left al holding whatever it held, so
+        # the field never changed and Black's XMV player waited forever for
+        # the other one. String I/O (insb/outsd) is not handled here.
+        if m in ("in", "out") and len(ops) == 2:
+            value, port = (ops[0], ops[1]) if m == "in" else (ops[1], ops[0])
+            width = _operand_width(value)
+            if (value.type == "reg" and width in (1, 2, 4)
+                    and ((port.type == "reg" and str(port.reg).lower() == "dx")
+                         or port.type == "imm")):
+                port_expr = ("LO16(edx)" if port.type == "reg"
+                             else f"0x{port.imm & 0xFFFF:04X}u")
+                if m == "in":
+                    return [_fmt_operand_write(
+                        value, f"recomp_port_in({port_expr}, {width})")
+                        + f" /* in {insn.op_str} */"]
+                return [f"recomp_port_out({port_expr}, {width}, "
+                        f"{_fmt_operand_read(value)}); /* out {insn.op_str} */"]
         if m == "int3":
             return ["/* int3: debug-trap slide byte, stepped over */"]
         if m in ("leave",):
@@ -1991,6 +2015,19 @@ class Lifter:
                 for t in unique_targets:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
                 lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
+                return lines
+            # A register jump back into this function: hand-written asm calls
+            # a shared block with `mov ebx, ret_label; jmp block` and the block
+            # returns with `jmp ebx`. As a tail call that target is not a
+            # function, the call fails and the frame is abandoned -- Black's
+            # XMV colour converter (sub_002401D2) smashed its stack that way.
+            local = self.local_jump_targets.get(insn.address)
+            if local and ops[0].type == "reg":
+                reg = _fmt_operand_read(ops[0])
+                lines = [f"{{ uint32_t _jt = {reg}; /* local jmp {insn.op_str}: {len(local)} targets */"]
+                for t in local:
+                    lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
+                lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
                 return lines
             target = _fmt_operand_read(ops[0])
             return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
