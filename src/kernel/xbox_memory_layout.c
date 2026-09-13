@@ -365,6 +365,17 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
 #define APU_GPSADDR          0x2040u
 #define DSP_IMAGE_CMD_OFFSET 0x810u
 
+/* EP DSP heartbeat.
+ *
+ * DirectSoundDoWork, which a title calls every frame, reads a word the running
+ * EP DSP firmware keeps at 0xCCCCCC and resets the whole audio subsystem when
+ * it is anything else -- a 10 ms stall, both AC'97 channels and both DSPs, every
+ * frame. Black's XDK (5849) points it at EP memory 0xFE85A018 ([0x224C40]).
+ * Kept while the EP reset register says the DSP is running (bits 0 and 1). */
+#define APU_EP_RESET         0x5FFFCu
+#define APU_EP_HEARTBEAT     0x5A018u
+#define DSP_HEARTBEAT        0x00CCCCCCu
+
 static int g_dsp_ack_enabled = 0;
 
 static void dsp_ack_tick(void)
@@ -374,6 +385,14 @@ static void dsp_ack_tick(void)
 
     if (!g_dsp_ack_enabled || !g_mcpx_regs || g_apu_mmio_trapped)
         return;
+    {
+        volatile uint32_t *ep_reset =
+            (volatile uint32_t *)((char *)g_mcpx_regs + APU_EP_RESET);
+        volatile uint32_t *heartbeat =
+            (volatile uint32_t *)((char *)g_mcpx_regs + APU_EP_HEARTBEAT);
+        if ((*ep_reset & 3u) == 3u && *heartbeat != DSP_HEARTBEAT)
+            *heartbeat = DSP_HEARTBEAT;
+    }
     sg = *(volatile uint32_t *)((char *)g_mcpx_regs + APU_GPSADDR);
     if (!sg || !fence_readable(sg, 4))
         return;

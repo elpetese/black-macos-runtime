@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "mcpx_mmio.h"
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -1971,6 +1972,14 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* Vblanks delivered so far. Port 0x80C0's field bit alternates with it. */
+static volatile uint32_t g_vblank_count;
+
+uint32_t xbox_VblankCount(void)
+{
+    return g_vblank_count;
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
@@ -1990,6 +1999,7 @@ static void kernel_vblank_tick(void)
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
+    g_vblank_count++;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
@@ -2001,6 +2011,30 @@ static void kernel_vblank_tick(void)
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
+    }
+}
+
+/* AC'97 buffer completion, delivered.
+ *
+ * DirectSound connects its AC'97 ISR through HalGetInterruptVector and then
+ * refills its output buffers from the DPC that ISR queues. The controller model
+ * in mcpx_mmio_posix.c says when a buffer has played; this is the interrupt
+ * line. Vector 6 is what Black's DirectSound connected (measured). */
+#define AC97_VECTOR            6u
+
+static void kernel_ac97_tick(void)
+{
+    if (!xbox_mcpx_ac97_tick() || !xbox_GetConnectedInterrupt(AC97_VECTOR))
+        return;
+    {
+        static unsigned n;
+        int claimed = kernel_raise_interrupt(AC97_VECTOR);
+        if (n++ < 3) {
+            fprintf(stderr, "  [AC97] interrupt -> ISR %s\n",
+                    claimed < 0 ? "not callable" :
+                    claimed ? "claimed it" : "declined it");
+            fflush(stderr);
+        }
     }
 }
 
@@ -2245,6 +2279,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
         Sleep(10);
         kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_ac97_tick();    /* the audio clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 

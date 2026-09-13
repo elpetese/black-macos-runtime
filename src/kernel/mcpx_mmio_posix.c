@@ -24,11 +24,15 @@
 
 #if !defined(_WIN32) && defined(__aarch64__)
 
+#include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <sys/ucontext.h>
@@ -47,14 +51,62 @@
  * SR +6 (2 bytes), PICB +8 (2 bytes), PIV +0xA, CR +0xB. */
 #define AC97_CR_RPBM            0x01u
 #define AC97_CR_RESET_REGS      0x02u
+#define AC97_CR_LVBIE           0x04u
+#define AC97_CR_FEIE            0x08u
+#define AC97_CR_IOCE            0x10u
 #define AC97_SR_DCH             0x01u
+#define AC97_SR_CELV            0x02u
+#define AC97_SR_LVBCI           0x04u
+#define AC97_SR_BCIS            0x08u
+#define AC97_SR_FIFOE           0x10u
 #define AC97_SR_W1C             0x1Cu   /* LVBCI | BCIS | FIFOE */
+#define AC97_BDL_IOC            0x80000000u
+#define AC97_RATE_HZ            48000u
+
+extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static uint8_t   g_ac97[AC97_SHADOW];
 static uintptr_t g_ac97_host = 0;
 static size_t    g_ac97_len  = 0;
 static int       g_trace     = -1;
 static unsigned  g_trace_n   = 0;
+
+/* The shadow is touched from the fault handler on any guest thread and from
+ * the playback tick on the timer thread. Never held while guest code runs:
+ * the ISR the tick asks for faults straight back in here. */
+static atomic_flag g_ac97_lock = ATOMIC_FLAG_INIT;
+static void ac97_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&g_ac97_lock, memory_order_acquire))
+        sched_yield();
+}
+static void ac97_unlock(void)
+{
+    atomic_flag_clear_explicit(&g_ac97_lock, memory_order_release);
+}
+
+/* Bus-master output channels, and the GLOB_STA bit each one raises. The bits
+ * are the XDK's own table at 0x2245F4 (0x40, 0x10), which its ISR tests before
+ * reading the channel's SR. */
+static struct {
+    uint32_t base;
+    uint8_t  glob_bit;
+    uint64_t next_due_ns;       /* 0: not playing a buffer */
+} g_chan[2] = { { 0x110u, 0x40u, 0 }, { 0x170u, 0x10u, 0 } };
+
+static uint16_t sh16(uint32_t off) { return (uint16_t)(g_ac97[off] | (g_ac97[off + 1] << 8)); }
+static void set16(uint32_t off, uint16_t v) { g_ac97[off] = (uint8_t)v; g_ac97[off + 1] = (uint8_t)(v >> 8); }
+static uint32_t sh32(uint32_t off) { return (uint32_t)sh16(off) | ((uint32_t)sh16(off + 2) << 16); }
+
+/* A channel whose SR holds a status its CR enables is interrupting. */
+static int ac97_channel_irq(uint32_t base)
+{
+    uint8_t cr = g_ac97[base + 0xB];
+    uint8_t sr = g_ac97[base + 0x6];
+    return ((sr & AC97_SR_BCIS) && (cr & AC97_CR_IOCE))
+        || ((sr & AC97_SR_LVBCI) && (cr & AC97_CR_LVBIE))
+        || ((sr & AC97_SR_FIFOE) && (cr & AC97_CR_FEIE));
+}
 
 static int ac97_channel_base(uint32_t off, uint32_t *base)
 {
@@ -76,13 +128,13 @@ static void ac97_write_byte(uint32_t off, uint8_t v)
              * value, and RR itself reads back clear. */
             memset(g_ac97 + base, 0, 0xC);
             g_ac97[base + 6] = AC97_SR_DCH;
+            g_chan[base == 0x110u ? 0 : 1].next_due_ns = 0;
             return;
         }
         if (reg == 0xB) {
             /* Run/Pause Bus Master: the controller leaves the halted state as
-             * soon as it is told to run, and halts when told to pause. With
-             * DCH stuck at 1 DirectSound saw every started channel as dead and
-             * reset it again, hundreds of times. */
+             * soon as it is told to run, and halts when told to pause. The
+             * playback tick only consumes buffers on a running channel. */
             if (v & AC97_CR_RPBM)
                 g_ac97[base + 6] &= (uint8_t)~AC97_SR_DCH;
             else
@@ -105,6 +157,14 @@ static uint64_t ac97_read(uint32_t off, unsigned n)
         uint8_t b = o < AC97_SHADOW ? g_ac97[o] : 0;
         if (o == AC97_GLOB_STA + 1)
             b |= (uint8_t)(AC97_GLOB_STA_CODEC_RDY >> 8);
+        if (o == AC97_GLOB_STA) {
+            /* Channel interrupt bits mirror their SR, as on hardware: the ISR
+             * clears SR, never these, and writes GLOB_STA back unchanged. */
+            b &= (uint8_t)~(g_chan[0].glob_bit | g_chan[1].glob_bit);
+            for (int c = 0; c < 2; c++)
+                if (ac97_channel_irq(g_chan[c].base))
+                    b |= g_chan[c].glob_bit;
+        }
         v |= (uint64_t)b << (8 * i);
     }
     return v;
@@ -135,6 +195,101 @@ int xbox_mcpx_mmio_arm_ac97(void *ac97_host_base)
     fprintf(stderr, "  AC97: 0x%08X..0x%08X intercepted (%zu-byte host page)\n",
             AC97_VA, AC97_VA + (uint32_t)g_ac97_len, g_ac97_len);
     return 1;
+}
+
+/* ── Playback ──────────────────────────────────────────────────
+ *
+ * DirectSound drives AC'97 output entirely by interrupt: it programs a buffer
+ * descriptor list, sets Run, and refills from its DPC each time the ISR sees
+ * Buffer Completion. Without a controller consuming buffers the audio clock
+ * never moves -- and Black's intro video, which paces itself by audio, never
+ * produces a frame.
+ *
+ * Buffers are consumed in real time. A BDL entry is { address, control },
+ * control = IOC (bit 31) | BUP (bit 30) | length in 16-bit samples; measured on
+ * Black: 0x1000 samples over an 8192-byte buffer. At 48 kHz stereo one sample
+ * pair is a frame. When the last valid buffer completes the controller keeps
+ * replaying it (the underrun policy the entries ask for) and reports LVBCI and
+ * CELV rather than halting, so a driver that loops one buffer keeps getting
+ * completions. Nothing is mixed to the host yet. */
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int bdl_entry(uint32_t base, uint32_t idx, uint32_t *ctl)
+{
+    uint32_t va = sh32(base) + idx * 8u;
+    if (!(va >= 0x80000000u && va < 0x84000000u - 8u) &&
+        !(va >= 0x00010000u && va < 0x04000000u - 8u))
+        return 0;
+    *ctl = *(const uint32_t *)((uintptr_t)xbox_GetMemoryOffset() + va + 4u);
+    return 1;
+}
+
+static uint64_t buffer_ns(uint32_t ctl)
+{
+    uint64_t samples = ctl & 0xFFFFu;
+    if (samples < 2)
+        samples = 2;
+    return (samples / 2u) * 1000000000ull / AC97_RATE_HZ;
+}
+
+int xbox_mcpx_ac97_tick(void)
+{
+    uint64_t now;
+    int raise = 0;
+
+    if (!g_ac97_host)
+        return 0;
+    now = now_ns();
+    ac97_lock();
+    for (int c = 0; c < 2; c++) {
+        uint32_t base = g_chan[c].base, ctl, civ;
+        int steps = 0;
+
+        if (!(g_ac97[base + 0xB] & AC97_CR_RPBM) || (g_ac97[base + 6] & AC97_SR_DCH)) {
+            g_chan[c].next_due_ns = 0;
+            continue;
+        }
+        civ = g_ac97[base + 4] & 0x1Fu;
+        if (!bdl_entry(base, civ, &ctl))
+            continue;
+        if (!g_chan[c].next_due_ns) {
+            set16(base + 8, (uint16_t)ctl);
+            g_ac97[base + 0xA] = (uint8_t)((civ + 1) & 0x1Fu);
+            g_chan[c].next_due_ns = now + buffer_ns(ctl);
+            continue;
+        }
+        while (now >= g_chan[c].next_due_ns && steps++ < 8) {
+            uint8_t sr = g_ac97[base + 6];
+            if (ctl & AC97_BDL_IOC)
+                sr |= AC97_SR_BCIS;
+            if (civ == (g_ac97[base + 5] & 0x1Fu)) {
+                sr |= AC97_SR_LVBCI | AC97_SR_CELV;
+            } else {
+                civ = (civ + 1) & 0x1Fu;
+                sr &= (uint8_t)~AC97_SR_CELV;
+            }
+            g_ac97[base + 6] = sr;
+            g_ac97[base + 4] = (uint8_t)civ;
+            g_ac97[base + 0xA] = (uint8_t)((civ + 1) & 0x1Fu);
+            if (!bdl_entry(base, civ, &ctl))
+                break;
+            set16(base + 8, (uint16_t)ctl);
+            g_chan[c].next_due_ns += buffer_ns(ctl);
+        }
+        /* A stalled host thread must not come back to a backlog of seconds. */
+        if (now > g_chan[c].next_due_ns + 1000000000ull)
+            g_chan[c].next_due_ns = now + buffer_ns(ctl);
+        if (ac97_channel_irq(base))
+            raise = 1;
+    }
+    ac97_unlock();
+    return raise;
 }
 
 /* ── ARM64 register access ─────────────────────────────────── */
@@ -232,9 +387,13 @@ int xbox_mcpx_mmio_fault(void *ucontext, uintptr_t fault_addr)
             v = reg_get(uc, rt, 0);
             if (nbytes < 8)
                 v &= (1ull << (8 * nbytes)) - 1;
+            ac97_lock();
             ac97_write(off, v, nbytes);
+            ac97_unlock();
         } else {
+            ac97_lock();
             v = ac97_read(off, nbytes);
+            ac97_unlock();
             if (opc == 2 && size < 3) {             /* sign-extend to 64 */
                 unsigned bits = 8 * nbytes;
                 v = (uint64_t)((int64_t)(v << (64 - bits)) >> (64 - bits));
@@ -271,6 +430,7 @@ undecoded:
 #else
 
 int xbox_mcpx_mmio_arm_ac97(void *ac97_host_base) { (void)ac97_host_base; return 0; }
+int xbox_mcpx_ac97_tick(void) { return 0; }
 int xbox_mcpx_mmio_fault(void *ucontext, uintptr_t fault_addr)
 {
     (void)ucontext; (void)fault_addr;

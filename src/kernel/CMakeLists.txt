@@ -21,6 +21,7 @@ set(KERNEL_SOURCES
     kernel_bridge.c
     xbox_memory_layout.c
     mcpx_mmio_posix.c
+    port_io.c
     icall_feedback.c
     recomp_trace.c
     nv2a_pb_scan.c

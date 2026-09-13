@@ -16,6 +16,10 @@ extern "C" {
 int xbox_mcpx_mmio_arm_ac97(void *ac97_host_base);
 int xbox_mcpx_mmio_fault(void *ucontext, uintptr_t fault_addr);
 
+/* Advance AC'97 playback in real time. Returns nonzero when a channel is
+ * interrupting, so the caller should raise the AC'97 interrupt. */
+int xbox_mcpx_ac97_tick(void);
+
 #ifdef __cplusplus
 }
 #endif
