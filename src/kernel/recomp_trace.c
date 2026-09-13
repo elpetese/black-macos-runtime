@@ -62,14 +62,28 @@ static unsigned long long g_prof_calls;
 
 static void prof_report(void)
 {
-    int taken[40], ntaken = 0;
+    /* RECOMP_TRACE_PROFILE_TOP widens the report: a function that is never
+     * entered only shows as absent when the list is long enough to hold every
+     * one that was. Printing tracing is not a substitute -- it changes timing
+     * enough to send a title down different paths. */
+    static int top = -1;
+    static int *taken;
+    int ntaken = 0;
     int i, j, shown;
 
     if (!g_prof_used)
         return;
+    if (top < 0) {
+        const char *v = getenv("RECOMP_TRACE_PROFILE_TOP");
+        top = v ? atoi(v) : 40;
+        if (top < 1) top = 40;
+        if (top > PROF_SLOTS) top = PROF_SLOTS;
+        taken = (int *)calloc((size_t)top, sizeof *taken);
+        if (!taken) top = 0;
+    }
     fprintf(stderr, "\n[PROFILE] %d functions entered%s, hottest first:\n",
             g_prof_used, g_prof_full ? " (table full, some dropped)" : "");
-    for (shown = 0; shown < 40; shown++) {
+    for (shown = 0; shown < top; shown++) {
         int best = -1;
         for (i = 0; i < PROF_SLOTS; i++) {
             if (!g_prof[i].hits)
