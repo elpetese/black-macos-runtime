@@ -319,6 +319,44 @@ Then add a stub in `recomp_manual.c` that returns immediately.
 
 **Fix**: ensure all ICALL failure paths clean up the stack. Use `RECOMP_ICALL_SAFE` for stdcall callsites. Monitor `g_esp` trend.
 
+## Hardware Waits (MCPX Audio, D3D) on macOS
+
+A title that stops without crashing is usually spinning on a hardware
+handshake. The XDK libraries linked into the XBE (DirectSound, D3D) talk to
+MCPX and NV2A registers directly, and on macOS those apertures are plain
+memory unless the runtime answers for the hardware. Black needed each of the
+following, in this order; they are generic XDK behaviour, not Black-specific.
+
+| Symptom | Cause | Runtime answer |
+|---|---|---|
+| `DirectSoundCreate` returns `DSERR_NODRIVER` (0x88780078); `KeStallExecutionProcessor` called 1000 times | AC'97 GLOB_STA (0xFEC00130) bit 8, codec ready, never set | `RECOMP_AC97_READY=1` reports it |
+| Spin right after codec detect | channel reset writes Reset Registers, reads once, `test cl,cl; jne self` | AC'97 page 0xFEC00000 intercepted on ARM64: `src/kernel/mcpx_mmio_posix.c` decodes the faulting LDR/STR and emulates the register |
+| Spin on `[image+0x810]` after downloading a DSP effects image | GP DSP firmware never clears the command | `dsp_ack_tick` (`xbox_memory_layout.c`) follows GPSADDR to scratch page 0 and clears it |
+| Audio subsystem reset every frame (10 ms stall each) | `DirectSoundDoWork` checks the EP DSP heartbeat `0x00CCCCCC` (Black: 0xFE85A018) | heartbeat kept while the EP reset register reads 3 |
+| DirectSound never refills; stream-paced code waits | no AC'97 buffer-completion interrupts | AC'97 playback model consumes the BDL in real time (48 kHz, length in 16-bit samples) and the timer thread raises vector 6 |
+| D3D waits for push-buffer space | GPU completion fence never advances | `xbox_Nv2aMirrorFence(device_ptr_va, put_off, get_ptr_off)` from the host (Black: 0x27BFF8, 0x2C, 0x30) |
+| Video waits for "the other field" | interlaced field comes from port 0x80C0 bit 5 | `src/kernel/port_io.c` alternates it per vblank |
+
+The Win32 VEH APU hook (`src/apu/apu_mmio_hook.c`) is Windows-only; on other
+hosts the APU aperture stays plain memory, and the game host's SIGSEGV/SIGBUS
+handler must call `xbox_mcpx_mmio_fault()` first (see
+`black-recomp/src/main_posix.c`).
+
+### Tools that find these quickly
+
+- `sample <pid> 3` (macOS): host stack of every thread with the generated
+  `sub_XXXXXXXX` names -- a hang is located in seconds.
+- `lldb -p <pid> --batch -o "memory read -s4 -fx -c<N> <addr>"`: guest memory
+  of a running title, at host address `guest VA + xbox_GetMemoryOffset()`.
+- `RECOMP_MCPX_TRACE=1` (or `=N`): every intercepted AC'97 register access.
+- `[FILE] open ok "name"` / `open failed`: compare two boots file by file.
+- `RECOMP_WATCH_FIELD=1` with `--trace-functions`: poll one object field at
+  traced call boundaries. Prefer this over page protection on macOS, where a
+  host page is 16 KB and a `mprotect` watch catches unrelated neighbours;
+  `RECOMP_WATCH_ALLOC=<size>,<tag>` exists for the idle-page case.
+- `capstone` over the original XBE bytes: before blaming guest code for an
+  infinite loop, confirm the loop is really in the original instructions.
+
 ## Debugging Workflow
 
 1. **Run the game**. It crashes.

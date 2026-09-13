@@ -343,6 +343,73 @@ C:    if (eax > 12) goto loc_default;
 
 This is more readable and compiles more efficiently than the original indirect jump.
 
+## Flag State Across Blocks
+
+A `jcc` often reads flags set in a different basic block. The translator
+solves the flag state entering every block to a fixed point before it emits
+any code (`block_flag_transfer`, `merge_flag_states` in `lifter.py`), so a
+loop head that tests flags its own tail set sees the back edge:
+
+```asm
+    mov eax, 0xB
+    sub eax, [ebp+0x20]
+L:  je  done          ; ZF from `sub` on entry, from `dec` afterwards
+    ...
+    dec eax
+    jmp L
+```
+
+Where predecessors leave different flag setters, the condition is accepted
+only if every one of them yields the identical C expression (`sub eax, x` and
+`dec eax` both give `je` = `eax == 0`). Anything else stays unresolved and
+falls back to `_flags`, which is always false -- a fallback never picks a
+wrong branch, but it is worth grepping for (`if (_flags /*`).
+
+Walking blocks once in address order left every back edge unknown; Black's XMV
+decoder loop above could not exit and ran its destination pointer off the
+heap. Test: `tools/recomp/test_flag_dataflow.py`.
+
+## Register Jumps Back Into the Function
+
+Hand-written assembly sometimes calls a shared block without `call`:
+
+```asm
+    mov ebx, ret1
+    jmp shared
+ret1:
+    ...
+shared:
+    ...
+    jmp ebx
+```
+
+An indirect `jmp reg` is normally a tail call (`RECOMP_ITAIL`). When the same
+register is loaded, anywhere in the function, with constants that are
+instruction starts of that function, the translator emits a local dispatch
+instead (`if (_jt == ret1) goto loc_ret1;`), keeping `RECOMP_ITAIL` as the
+fallback. No data flow is attempted: other values still tail-call. Without
+this the target is not a function, the call fails and the frame is abandoned
+(Black's XMV colour converter, `sub_002401D2`, smashed its stack).
+Test: `tools/recomp/test_local_register_jump.py`.
+
+## Port I/O
+
+`in` and `out` with a register-sized value and a `dx` or immediate port are
+lifted to runtime calls declared in `templates/runtime/recomp_types.h`:
+
+```c
+SET_LO8(eax, recomp_port_in(LO16(edx), 1));      /* in al, dx  */
+recomp_port_out(LO16(edx), 4, eax);              /* out dx, eax */
+```
+
+They do not touch flags. The runtime models the ports a title needs in
+`src/kernel/port_io.c`; anything unmodelled reads 0 and is reported once as
+`[PORT]`. String I/O (`insb`, `outsd`) is not lifted -- in practice those are
+data mis-disassembled as code. Emitting nothing used to leave `al` holding its
+previous value: D3D's vblank ISR reads the interlaced field from port 0x80C0,
+the field never changed, and an XMV player waiting for the other field never
+started. Test: `tools/recomp/test_lifter_port_io.py`.
+
 ## Output Files
 
 ### Generated Code Structure
@@ -450,6 +517,6 @@ Maintain a checklist of required patches and re-apply them after every regenerat
 
 2. **FS segment**: x86 `fs:` segment overrides (used for Thread Information Block access) are dropped. The lifter translates `mov eax, fs:[0x28]` as `MEM32(0x28)`, which reads from the wrong memory. This affects ~35 instructions in Burnout 3.
 
-3. **Precise flag behavior**: the `CMP_*` macros handle common flag patterns, but exotic sequences (e.g., using carry flag from arithmetic to feed into a conditional branch 10 instructions later) may require manual intervention.
+3. **Precise flag behavior**: flag state is solved across blocks (see *Flag State Across Blocks*), but a condition that no setter model covers, or that predecessors disagree on, still becomes the always-false `_flags` fallback. Grep generated code for `if (_flags /*` when a loop never exits.
 
 4. **Exception handling**: the original code uses SEH for error recovery (e.g., catching access violations from bad pointers). The translated code cannot use SEH in the same way because it's not real x86 code. A Vectored Exception Handler (VEH) partially bridges this gap.
