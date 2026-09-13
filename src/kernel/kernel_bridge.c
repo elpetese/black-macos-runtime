@@ -28,6 +28,8 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include <sys/mman.h>
+#include <unistd.h>
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -1201,6 +1203,38 @@ static void bridge_ExAllocatePoolWithTag(void)
                 (char)((tag >> 16) & 0xFF), (char)((tag >> 24) & 0xFF),
                 xbox_va);
         fflush(stderr);
+    }
+
+    /* RECOMP_WATCH_ALLOC=<size>,<tag> arms a write-protect on this exact
+     * allocation right after it returns, instead of at boot (when the page
+     * is shared with unrelated earlier allocations and their own zero-fill
+     * writes trip it too early). Black's DirectSound object was the case:
+     * RECOMP_WATCH_ALLOC=1348,DSob. On macOS a host page is 16KB, so the
+     * guard also covers neighbouring objects; it only isolates an idle page. */
+    if (xbox_va) {
+        const char *spec = getenv("RECOMP_WATCH_ALLOC");
+        if (spec) {
+            unsigned long want_size = strtoul(spec, (char **)&spec, 0);
+            uint32_t want_tag = 0;
+            if (*spec == ',') {
+                spec++;
+                for (int i = 0; i < 4 && spec[i]; i++)
+                    want_tag |= ((uint32_t)(unsigned char)spec[i]) << (8 * i);
+            }
+            if (size == want_size && (!want_tag || tag == want_tag)) {
+                long ps = sysconf(_SC_PAGESIZE);
+                uintptr_t page = (uintptr_t)(g_xbox_mem_offset + xbox_va) & ~(uintptr_t)(ps - 1);
+                if (mprotect((void *)page, (size_t)ps, PROT_READ) != 0)
+                    perror("[WATCH-ALLOC] mprotect");
+                else
+                    fprintf(stderr, "[WATCH-ALLOC] size=%u tag='%c%c%c%c' -> Xbox VA 0x%08X: "
+                                    "host page %p now read-only\n",
+                            size, (char)(tag & 0xFF), (char)((tag >> 8) & 0xFF),
+                            (char)((tag >> 16) & 0xFF), (char)((tag >> 24) & 0xFF),
+                            xbox_va, (void *)page);
+                fflush(stderr);
+            }
+        }
     }
 
     g_eax = xbox_va;
@@ -2500,6 +2534,7 @@ static NTSTATUS bridge_create_file_impl(
     if (NT_SUCCESS(st)) {
         bridge_write_handle(handle_va, h);
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
+        fprintf(stderr, "  [FILE] open ok \"%.*s\"\n", (int)name.Length, name.Buffer);
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
         /* The requested name, before translation: a failure that never

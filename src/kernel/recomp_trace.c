@@ -171,8 +171,44 @@ static int looks_like_guest_data_ptr(uint32_t a)
     return 0;
 }
 
+/* RECOMP_WATCH_FIELD=1 polls [[[0x224cd0]+0xc]+0x14] -- Black's DirectSound
+ * effects manager pointer -- on every traced call
+ * boundary (both entry and exit) and prints it only when it changes. A
+ * page-granularity mprotect watch was tried first and abandoned: macOS
+ * ARM64 uses 16KB pages, so protecting "the page" containing this field
+ * silently covers a 16KB range that other, unrelated heap/thread activity
+ * also touches -- it caught an incidental unrelated __bzero fault a page
+ * away instead of a real write to our field. Polling at each traced call
+ * boundary needs no protection at all and cannot produce a false fault; it
+ * can only miss a write that happens strictly between two traced calls, so
+ * trace as many functions along the crash chain as practical. */
+static void watch_field_poll(const char *name, uint32_t va, const char *when)
+{
+    static uint32_t last_val = 0xFFFFFFFFu;
+    static int have_last = 0;
+    uint8_t *mem;
+    uint32_t singleton, obj7, target_va, cur;
+
+    if (!getenv("RECOMP_WATCH_FIELD")) return;
+    mem = (uint8_t *)xbox_GetMemoryOffset();
+    singleton = *(const uint32_t *)(mem + 0x224cd0);
+    obj7 = singleton ? *(const uint32_t *)(mem + singleton + 0xc) : 0;
+    if (!obj7) return;
+    target_va = obj7 + 0x14;
+    cur = *(const uint32_t *)(mem + target_va);
+    if (!have_last || cur != last_val) {
+        fprintf(stderr, "[WATCH-FIELD] %s %s (0x%08X): [0x%08X] = 0x%08X"
+                        " (was 0x%08X)\n",
+                when, name, va, target_va, cur, last_val);
+        fflush(stderr);
+        last_val = cur;
+        have_last = 1;
+    }
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
+    watch_field_poll(name, va, "before");
     if (prof_enabled()) { prof_count(name, va); return; }
     if (!trace_budget()) return;
     /* The return address as well as the registers: at entry it is still at
@@ -245,6 +281,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
  * comes back wrong. */
 void recomp_trace_exit(const char *name, uint32_t va)
 {
+    watch_field_poll(name, va, "after");
     if (prof_enabled()) return;     /* entries alone carry the count */
     if (!trace_budget()) return;
     fprintf(stderr, "[TRACE] <- %s (0x%08X)  esp=%08X eax=%08X ecx=%08X "
