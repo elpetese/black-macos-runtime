@@ -336,6 +336,7 @@ following, in this order; they are generic XDK behaviour, not Black-specific.
 | DirectSound never refills; stream-paced code waits | no AC'97 buffer-completion interrupts | AC'97 playback model consumes the BDL in real time (48 kHz, length in 16-bit samples) and the timer thread raises vector 6 |
 | D3D waits for push-buffer space | GPU completion fence never advances | `xbox_Nv2aMirrorFence(device_ptr_va, put_off, get_ptr_off)` from the host (Black: 0x27BFF8, 0x2C, 0x30) |
 | Video waits for "the other field" | interlaced field comes from port 0x80C0 bit 5 | `src/kernel/port_io.c` alternates it per vblank |
+| Streams "play" but never advance; a video paced by its soundtrack freezes | DirectSound's Play writes voice methods to the VP PIO space (0xFE820000+) and completes packets from the APU interrupt; plain memory does neither | host hands 0xFE800000-0xFE830000 (core + VP) to `src/apu` with `xbox_mmio_intercept` and registers the APU vector (Black: 5) with `xbox_RegisterInterruptSource` -- see `black-recomp/src/main_posix.c` `apu_init` |
 
 The Win32 VEH APU hook (`src/apu/apu_mmio_hook.c`) is Windows-only; on other
 hosts the APU aperture stays plain memory, and the game host's SIGSEGV/SIGBUS
@@ -356,6 +357,15 @@ handler must call `xbox_mcpx_mmio_fault()` first (see
   `RECOMP_WATCH_ALLOC=<size>,<tag>` exists for the idle-page case.
 - `capstone` over the original XBE bytes: before blaming guest code for an
   infinite loop, confirm the loop is really in the original instructions.
+- `RECOMP_TRACE_PROFILE=N RECOMP_TRACE_PROFILE_TOP=M` with `--trace-functions`
+  over a whole library's address range: call counts only, so a function that
+  is never entered shows by its absence. Prefer it to printing traces inside
+  interrupt-driven code (DirectSound, D3D): the extra stderr traffic changed
+  Black's timing enough to take a relaunch path.
+- `lldb -O "settings set platform.plugin.darwin.ignored-exceptions EXC_BAD_ACCESS"`
+  before attaching, then `watchpoint set expression -w write -s 4 -- <host addr>`:
+  a hardware write watchpoint names the function that sets a guest field.
+  Without the setting lldb stops on every intercepted register fault.
 
 ## Debugging Workflow
 
