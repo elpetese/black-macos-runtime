@@ -1720,17 +1720,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     default:
         if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
             record_tex_reg(method, param);
-        if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
+        else if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
                 && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
-            /* Resolved here, once, so every consumer -- the rasteriser's
-             * attribute reads and the diagnostics alike -- sees the same
-             * address. A vertex array offset is a DMA-object offset exactly
-             * like a surface offset: physical, and addressable only through
-             * the window when it names contiguous memory. */
             uint32_t attr_idx = (method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4;
             s_gpu.attr[attr_idx].offset = dma_resolve(param);
             if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
-                static int shown[16];
+                static int shown[32];
                 if (shown[attr_idx]++ < 4)
                     fprintf(stderr, "  [GPU] attr[%u] offset: 0x%08X\n", attr_idx, s_gpu.attr[attr_idx].offset);
             }
@@ -1742,11 +1737,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             a->size   = (param >> 4)  & 0x0F;
             a->stride = (param >> 8)  & 0xFF;
             if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
-                static int shown[16];
+                static int shown[32];
                 if (shown[attr_idx]++ < 4)
                     fprintf(stderr, "  [GPU] attr[%u] format: type=%u size=%u stride=%u\n",
                             attr_idx, a->type, a->size, a->stride);
             }
+        } else if ((method >= 0x0100 && method < 0x0200) ||  /* NOP, SET_OBJECT, etc. */
+                   (method >= 0x0200 && method < 0x0300) ||  /* Surface/clear state */
+                   (method >= 0x0300 && method < 0x0440) ||  /* Alpha/blend/cull/alpha test + nearby */
+                   (method >= 0x0A00 && method < 0x0C00) ||  /* Transform/vertex state */
+                   (method >= 0x0E00 && method < 0x1000) ||  /* Transform constants */
+                   (method >= 0x1680 && method < 0x1780) ||  /* More vertex arrays */
+                   (method >= 0x1900 && method < 0x1A00) ||  /* Fog, point params, etc. */
+                   (method >= 0x1D60 && method < 0x1EA8)) {  /* Combiners + nearby */
+            s_gpu.unhandled_total++;
         } else {
             note_unhandled(method);
         }
