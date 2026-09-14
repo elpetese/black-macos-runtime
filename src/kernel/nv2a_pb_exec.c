@@ -248,6 +248,7 @@ static struct {
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
+    uint32_t tex_invalid_enabled, tex_invalid_offset, tex_invalid_size, tex_invalid_format;
     Texture  tex;
 } s_gpu;
 
@@ -305,6 +306,12 @@ static void record_tex_reg(uint32_t method, uint32_t param)
                    && s_gpu.tex.width && s_gpu.tex.height
                    && (tex_size_from_format(s_gpu.tex.color)
                        || s_gpu.tex.pitch);
+    if (!s_gpu.tex.valid) {
+        if (!s_gpu.tex.enabled) s_gpu.tex_invalid_enabled++;
+        else if (!s_gpu.tex.offset) s_gpu.tex_invalid_offset++;
+        else if (!s_gpu.tex.width || !s_gpu.tex.height) s_gpu.tex_invalid_size++;
+        else s_gpu.tex_invalid_format++;
+    }
 }
 
 /* Every distinct texture a batch was drawn with, and how many batches used it.
@@ -1968,8 +1975,11 @@ void nv2a_pb_exec_report(void)
      * shows both as flat colour if either half is missing, so the split is
      * what says which half. */
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
-                    " %u with texcoords but no usable stage\n",
-            s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
+                    " %u with texcoords but no usable stage"
+                    " (disabled=%u no_offset=%u no_size=%u bad_fmt=%u)\n",
+            s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex,
+            s_gpu.tex_invalid_enabled, s_gpu.tex_invalid_offset,
+            s_gpu.tex_invalid_size, s_gpu.tex_invalid_format);
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
