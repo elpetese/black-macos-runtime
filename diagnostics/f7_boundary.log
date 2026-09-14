@@ -1,0 +1,57 @@
+# F7.0 Boundary Instrumentation Log
+# Fecha: 14 de septiembre de 2026
+# Modo: RECOMP_VBLANK=1 RECOMP_AC97_READY=1 RECOMP_PB_EXEC=1 RECOMP_FB_WINDOW=1
+# Duración: 30s, proceso terminado con SIGKILL (no retornó de xbe_entry_point)
+#
+# Cada frontera debe tener un resultado explícito:
+#   CONFIRMADO, DESCARTADO, NO DETERMINADO
+#
+# NO convertir NO DETERMINADO en parche.
+
+## Audio
+
+# Preguntas:
+# - VP produce samples?
+# - mixbins contienen samples no nulos?
+# - apu_dsp_frame() recibe/procesa samples?
+# - monitor.frame_buf contiene audio real?
+# - el host recibe frames?
+# - el backend macOS los reproduce?
+#
+# Resultado: DESCARTADO (sin flujo)
+# Evidencia: xa2_submit_samples no se llamó en 30s. g_f7_apu_frames_submitted=0.
+# El pipeline SDL2 está inicializado pero no recibe frames. GP/EP siguen en stubs.
+
+## Gráficos
+
+# Preguntas:
+# - Black llama xbox_Direct3DCreate8?
+# - Black llama CreateDevice?
+# - Black obtiene un IDirect3DDevice8 valido?
+# - Black llama CreateTexture?
+# - Black llama DrawPrimitive/DrawIndexedPrimitive?
+# - Black llama Present/Swap?
+# - Black escribe DMA_PUT?
+# - DMA_GET avanza?
+# - pgraph_method recibe metodos?
+#
+# Resultado: NO DETERMINADO (D3D8 API probable)
+# Ruta identificada: PROBABLEMENTE D3D8 (no push buffer directo)
+# Evidencia: DMA_PUT/GET cambian constantemente (log visible). FBWIN se actualiza cada frame.
+# Sin embargo, clear_surface/draw_primitive NO se llaman en 30s con RECOMP_PB_EXEC=1.
+# Esto sugiere que Black usa D3D8 API en lugar de escribir comandos NV2A directamente.
+# Los stubs D3D8 no están instrumentados aún; se requiere modificación del código generado
+# o interceptación de vtables para confirmar.
+
+## Input
+
+# Preguntas:
+# - Existe una abstraccion de estado del mando?
+# - el juego la consulta?
+# - se puede inyectar un estado de mando sin USB?
+#
+# Resultado: NO DETERMINADO
+# Método de inyección disponible: SDL_GameController + INPUT_SCRIPT (ambos implementados)
+# Evidencia: no se detectaron polls de input en 30s. El juego está en loop de título
+# (pantalla de título + modo demo). El input puede no consultarse hasta que el usuario
+# presione Start o hasta que el demo requiera input.

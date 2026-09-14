@@ -23,6 +23,7 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+#include "../kernel/f7_instrumentation.h"
 
 /* ============================================================
  * Globals
@@ -826,6 +827,10 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
     if (!g_mixer_initialized) return;
     EnterCriticalSection(&g_mixer_cs);
 
+    uint64_t nonzero = 0;
+    uint64_t rms_acc = 0;
+    const int rms_stride = 8;
+
     for (int v = 0; v < APU_MIXER_MAX_VOICES; v++) {
         APUMixerVoice *voice = &g_mixer_voices[v];
         if (!voice->active || !voice->pcm_data || voice->pcm_bytes == 0)
@@ -874,6 +879,11 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
             frame_buf[i][0] = (int16_t)mixed_l;
             frame_buf[i][1] = (int16_t)mixed_r;
 
+            if ((i % rms_stride) == 0) {
+                if (mixed_l || mixed_r) nonzero++;
+                rms_acc += (uint64_t)mixed_l * mixed_l + (uint64_t)mixed_r * mixed_r;
+            }
+
             pos += inc;
         }
 
@@ -888,6 +898,10 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
                 InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
             }
         }
+    }
+    if (nonzero) {
+        g_f7_apu_mixbin_nonzero_samples += nonzero;
+        g_f7_apu_framebuf_rms_samples += rms_acc;
     }
     LeaveCriticalSection(&g_mixer_cs);
 }

@@ -16,6 +16,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "../kernel/f7_instrumentation.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -125,6 +126,8 @@ static void up_ring_shutdown(void);
  * ================================================================ */
 void d3d8_PresentFrame(void)
 {
+    g_f7_d3d8_present++;
+
     /* Pump Windows messages */
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {

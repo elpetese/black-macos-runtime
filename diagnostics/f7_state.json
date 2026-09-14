@@ -1,0 +1,15 @@
+{
+  "audio_host": "pending",
+  "graphics_path": "likely_d3d8",
+  "first_draw": "pending",
+  "present": "pending",
+  "input_host": "partial",
+  "first_level": "pending",
+  "playable": false,
+  "f7_0_completed": true,
+  "f7_0_results": {
+    "audio": "DESCARTADO - sin flujo de samples al host",
+    "graphics": "NO_DETERMINADO - DMA activo pero push buffer executor no se ejecuta; probable D3D8 API",
+    "input": "NO_DETERMINADO - sin polls en 30s de loop de título"
+  }
+}

@@ -1,0 +1,319 @@
+/**
+ * keyboard_input.c -- the keyboard as controller port 0. See keyboard_input.h.
+ */
+#include "keyboard_input.h"
+#include "../kernel/f7_instrumentation.h"
+
+#if defined(_WIN32)
+
+void xbox_KeyboardInit(void) {}
+int  xbox_KeyboardMergeState(XBOX_GAMEPAD *pad) { (void)pad; return 0; }
+void xbox_KeyboardRestoreTerminal(void) {}
+
+#else
+
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+
+/* One slot per thing a key can press. */
+enum {
+    K_UP, K_DOWN, K_LEFT, K_RIGHT, K_START, K_BACK, K_LTHUMB, K_RTHUMB,
+    K_A, K_B, K_X, K_Y, K_BLACK, K_WHITE, K_LT, K_RT,
+    K_LS_UP, K_LS_DOWN, K_LS_LEFT, K_LS_RIGHT,
+    K_RS_UP, K_RS_DOWN, K_RS_LEFT, K_RS_RIGHT,
+    K_COUNT
+};
+
+static const struct { const char *name; int slot; } k_names[] = {
+    {"up", K_UP}, {"down", K_DOWN}, {"left", K_LEFT}, {"right", K_RIGHT},
+    {"start", K_START}, {"back", K_BACK},
+    {"lthumb", K_LTHUMB}, {"rthumb", K_RTHUMB},
+    {"a", K_A}, {"b", K_B}, {"x", K_X}, {"y", K_Y},
+    {"black", K_BLACK}, {"white", K_WHITE}, {"lt", K_LT}, {"rt", K_RT},
+    {"lsup", K_LS_UP}, {"lsdown", K_LS_DOWN},
+    {"lsleft", K_LS_LEFT}, {"lsright", K_LS_RIGHT},
+    {"rsup", K_RS_UP}, {"rsdown", K_RS_DOWN},
+    {"rsleft", K_RS_LEFT}, {"rsright", K_RS_RIGHT},
+};
+
+/* A press from the terminal lasts this long unless auto-repeat renews it. Long
+ * enough that a tap survives a 60 Hz poll several times over, short enough that
+ * releasing a held key does not feel stuck. */
+#define TAP_MS 150u
+
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t s_until[K_COUNT];      /* monotonic ms the slot is down until */
+static int      s_active;
+static uint64_t s_epoch;
+
+#define MAX_SCRIPT 64
+static struct { uint64_t at, until; int slot; } s_script[MAX_SCRIPT];
+static int s_script_len;
+
+static struct termios s_saved;
+static volatile sig_atomic_t s_tty_raw;
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void press(int slot, unsigned ms)
+{
+    uint64_t until = now_ms() + ms;
+    pthread_mutex_lock(&s_lock);
+    if (s_until[slot] < until)
+        s_until[slot] = until;
+    pthread_mutex_unlock(&s_lock);
+}
+
+void xbox_KeyboardRestoreTerminal(void)
+{
+    if (s_tty_raw) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &s_saved);
+        s_tty_raw = 0;
+    }
+}
+
+static void on_terminate(int sig)
+{
+    xbox_KeyboardRestoreTerminal();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* ESC [ A..D are the arrows. A bare ESC is ignored rather than guessed at. */
+static int escape_slot(void)
+{
+    unsigned char seq[2];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1 || seq[0] != '[')
+        return -1;
+    if (read(STDIN_FILENO, &seq[1], 1) != 1)
+        return -1;
+    switch (seq[1]) {
+    case 'A': return K_UP;
+    case 'B': return K_DOWN;
+    case 'C': return K_RIGHT;
+    case 'D': return K_LEFT;
+    default:  return -1;
+    }
+}
+
+static int key_slot(unsigned char c)
+{
+    switch (c) {
+    case '\r': case '\n':      return K_START;
+    case '\t': case 0x7F: case 0x08: return K_BACK;
+    case ' ': case 'z': case 'Z': return K_A;
+    case 'x': case 'X':        return K_B;
+    case 'c': case 'C':        return K_X;
+    case 'v': case 'V':        return K_Y;
+    case 'q': case 'Q':        return K_LT;
+    case 'e': case 'E':        return K_RT;
+    case '1':                  return K_WHITE;
+    case '2':                  return K_BLACK;
+    case 'w': case 'W':        return K_LS_UP;
+    case 's': case 'S':        return K_LS_DOWN;
+    case 'a': case 'A':        return K_LS_LEFT;
+    case 'd': case 'D':        return K_LS_RIGHT;
+    case 'i': case 'I':        return K_RS_UP;
+    case 'k': case 'K':        return K_RS_DOWN;
+    case 'j': case 'J':        return K_RS_LEFT;
+    case 'l': case 'L':        return K_RS_RIGHT;
+    case 'f': case 'F':        return K_LTHUMB;
+    case 'h': case 'H':        return K_RTHUMB;
+    default:                   return -1;
+    }
+}
+
+static void *tty_thread(void *unused)
+{
+    unsigned char c;
+    (void)unused;
+    while (read(STDIN_FILENO, &c, 1) == 1) {
+        int slot = (c == 0x1B) ? escape_slot() : key_slot(c);
+        if (slot >= 0)
+            press(slot, TAP_MS);
+    }
+    return NULL;
+}
+
+static void start_tty(void)
+{
+    const char *opt = getenv("RECOMP_KEYBOARD");
+    struct termios raw;
+    pthread_t th;
+
+    if ((opt && strcmp(opt, "0") == 0) || !isatty(STDIN_FILENO))
+        return;
+    if (tcgetattr(STDIN_FILENO, &s_saved) != 0)
+        return;
+
+    /* Non-canonical and no echo, but ISIG stays on: Ctrl+C still stops the
+     * process, and the handler below puts the terminal back first. */
+    raw = s_saved;
+    raw.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    raw.c_iflag &= ~(tcflag_t)(ICRNL | IXON);
+    raw.c_cc[VMIN]  = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0)
+        return;
+    s_tty_raw = 1;
+    atexit(xbox_KeyboardRestoreTerminal);
+    signal(SIGINT, on_terminate);
+    signal(SIGTERM, on_terminate);
+    signal(SIGHUP, on_terminate);
+
+    if (pthread_create(&th, NULL, tty_thread, NULL) != 0) {
+        xbox_KeyboardRestoreTerminal();
+        return;
+    }
+    pthread_detach(th);
+    s_active = 1;
+    fprintf(stderr, "  Keyboard: controller port 0 (arrows d-pad, Enter start, "
+                    "Space/z A, x B, c X, v Y, Tab back, wasd stick)\n");
+}
+
+static int slot_named(const char *name, size_t len)
+{
+    size_t i;
+    for (i = 0; i < sizeof k_names / sizeof k_names[0]; i++)
+        if (strlen(k_names[i].name) == len
+         && strncmp(k_names[i].name, name, len) == 0)
+            return k_names[i].slot;
+    return -1;
+}
+
+/* "ms:button[+button...][:hold_ms]" entries, comma separated. */
+static void load_script(void)
+{
+    const char *p = getenv("RECOMP_INPUT_SCRIPT");
+
+    while (p && *p) {
+        char *end;
+        unsigned long at = strtoul(p, &end, 10);
+        unsigned long hold = TAP_MS;
+        const char *names, *names_end, *q;
+
+        if (end == p || *end != ':')
+            break;
+        names = end + 1;
+        names_end = names + strcspn(names, ":,");
+        if (*names_end == ':')
+            hold = strtoul(names_end + 1, NULL, 10);
+
+        for (q = names; q < names_end; ) {
+            size_t len = strcspn(q, "+:,");
+            int slot = slot_named(q, len);
+            if (slot < 0) {
+                fprintf(stderr, "  Keyboard: unknown button \"%.*s\" in "
+                                "RECOMP_INPUT_SCRIPT\n", (int)len, q);
+            } else if (s_script_len < MAX_SCRIPT) {
+                s_script[s_script_len].at    = s_epoch + at;
+                s_script[s_script_len].until = s_epoch + at + hold;
+                s_script[s_script_len].slot  = slot;
+                s_script_len++;
+            }
+            q += len;
+            if (*q == '+')
+                q++;
+        }
+        p = strchr(names_end, ',');
+        if (p)
+            p++;
+    }
+    if (s_script_len) {
+        s_active = 1;
+        fprintf(stderr, "  Keyboard: %d scripted press(es) loaded\n",
+                s_script_len);
+    }
+}
+
+void xbox_KeyboardInit(void)
+{
+    static int done;
+    if (done)
+        return;
+    done = 1;
+    s_epoch = now_ms();
+    load_script();
+    start_tty();
+}
+
+int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
+{
+    static const WORD digital[] = {
+        [K_UP] = XBOX_GAMEPAD_DPAD_UP, [K_DOWN] = XBOX_GAMEPAD_DPAD_DOWN,
+        [K_LEFT] = XBOX_GAMEPAD_DPAD_LEFT, [K_RIGHT] = XBOX_GAMEPAD_DPAD_RIGHT,
+        [K_START] = XBOX_GAMEPAD_START, [K_BACK] = XBOX_GAMEPAD_BACK,
+        [K_LTHUMB] = XBOX_GAMEPAD_LEFT_THUMB,
+        [K_RTHUMB] = XBOX_GAMEPAD_RIGHT_THUMB,
+    };
+    static const int analog[] = {
+        [K_A] = XBOX_BUTTON_A, [K_B] = XBOX_BUTTON_B,
+        [K_X] = XBOX_BUTTON_X, [K_Y] = XBOX_BUTTON_Y,
+        [K_BLACK] = XBOX_BUTTON_BLACK, [K_WHITE] = XBOX_BUTTON_WHITE,
+        [K_LT] = XBOX_BUTTON_LTRIGGER, [K_RT] = XBOX_BUTTON_RTRIGGER,
+    };
+    uint64_t t;
+    int down[K_COUNT] = {0};
+    int i;
+
+    if (!s_active || !pad)
+        return 0;
+
+    t = now_ms();
+    pthread_mutex_lock(&s_lock);
+    for (i = 0; i < K_COUNT; i++)
+        down[i] = s_until[i] > t;
+    pthread_mutex_unlock(&s_lock);
+
+    for (i = 0; i < s_script_len; i++) {
+        if (s_script[i].at <= t && t < s_script[i].until) {
+            if (!down[s_script[i].slot]) {
+                static unsigned announced[MAX_SCRIPT];
+                if (!announced[i]++) {
+                    fprintf(stderr, "  Keyboard: script press %s at +%llu ms\n",
+                            k_names[s_script[i].slot].name,
+                            (unsigned long long)(t - s_epoch));
+                    fflush(stderr);
+                }
+            }
+            down[s_script[i].slot] = 1;
+        }
+    }
+
+    for (i = K_UP; i <= K_RTHUMB; i++)
+        if (down[i])
+            pad->wButtons |= digital[i];
+    for (i = K_A; i <= K_RT; i++)
+        if (down[i])
+            pad->bAnalogButtons[analog[i]] = 255;
+
+    g_f7_input_poll_count++;
+    if (pad->wButtons || pad->bAnalogButtons[0] || pad->bAnalogButtons[1] ||
+        pad->bAnalogButtons[2] || pad->bAnalogButtons[3] ||
+        pad->sThumbLX || pad->sThumbLY || pad->sThumbRX || pad->sThumbRY) {
+        g_f7_input_nonzero_buttons++;
+    }
+
+    if (down[K_LS_UP])    pad->sThumbLY = 32767;
+    if (down[K_LS_DOWN])  pad->sThumbLY = -32768;
+    if (down[K_LS_LEFT])  pad->sThumbLX = -32768;
+    if (down[K_LS_RIGHT]) pad->sThumbLX = 32767;
+    if (down[K_RS_UP])    pad->sThumbRY = 32767;
+    if (down[K_RS_DOWN])  pad->sThumbRY = -32768;
+    if (down[K_RS_LEFT])  pad->sThumbRX = -32768;
+    if (down[K_RS_RIGHT]) pad->sThumbRX = 32767;
+    return 1;
+}
+
+#endif

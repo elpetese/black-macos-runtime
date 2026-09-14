@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include "../kernel/f7_instrumentation.h"
 #include <string.h>
 
 /* ======================================================================== */
@@ -119,6 +120,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ======================================================================== */
 
 #include <SDL.h>
+#include "keyboard_input.h"
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
@@ -144,6 +146,7 @@ void xbox_InputInit(void)
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     open_controllers();
+    xbox_KeyboardInit();
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
@@ -154,6 +157,14 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
+        /* No pad: the keyboard, when it is on, is port 0 by itself. */
+        if (dwPort == 0) {
+            memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+            if (xbox_KeyboardMergeState(&pState->Gamepad)) {
+                pState->dwPacketNumber = ++g_packet[dwPort];
+                return ERROR_SUCCESS;
+            }
+        }
         return ERROR_DEVICE_NOT_CONNECTED;
     }
 
@@ -162,6 +173,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
     pState->dwPacketNumber = ++g_packet[dwPort];
+
+    g_f7_input_poll_count++;
 
     WORD btn = 0;
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_UP))    btn |= XBOX_GAMEPAD_DPAD_UP;
@@ -173,6 +186,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSTICK))  btn |= XBOX_GAMEPAD_LEFT_THUMB;
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) btn |= XBOX_GAMEPAD_RIGHT_THUMB;
     pState->Gamepad.wButtons = btn;
+
+    if (btn) g_f7_input_nonzero_buttons++;
 
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_A) ? 255 : 0;
@@ -201,6 +216,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+
+    /* A pad and the keyboard together: either one presses the button. */
+    if (dwPort == 0)
+        xbox_KeyboardMergeState(&pState->Gamepad);
 
     return ERROR_SUCCESS;
 }

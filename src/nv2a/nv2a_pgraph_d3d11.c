@@ -13,6 +13,7 @@
 
 #include "nv2a_pgraph_d3d11.h"
 #include "nv2a_regs.h"
+#include "../kernel/f7_instrumentation.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -443,6 +444,7 @@ static void submit_draw(void)
 
     g_pg.stats.draw_calls++;
     g_pg.stats.vertices_submitted += num_verts;
+    g_f7_nv2a_pgraph_draw_count++;
 
     if (g_pg.stats.draw_calls <= 5 || (g_pg.stats.draw_calls % 1000) == 0) {
         fprintf(stderr, "[PGRAPH-D3D11] Draw #%u: %u verts, prim=%d, prims=%u\n",
@@ -460,6 +462,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         return 0;
 
     g_pg.stats.methods_handled++;
+    g_f7_nv2a_pgraph_method_count++;
 
     switch (method) {
 

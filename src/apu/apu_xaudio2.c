@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "apu_xaudio2.h"
+#include "../kernel/f7_instrumentation.h"
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
  * stubbed to report inactive; real audio output via SDL2 comes later. */
@@ -153,6 +154,11 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;
+    g_f7_apu_frames_submitted++;
+    if (g_f7_apu_frames_submitted % 60 == 0) {
+        extern void f7_print_counts(void);
+        f7_print_counts();
+    }
     return 1;
 }
 
@@ -161,12 +167,114 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+#else /* !_WIN32 -- SDL2 queued-audio backend */
 
-int  xa2_init(void)                                   { return 0; }
-void xa2_shutdown(void)                               {}
-int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
-int  xa2_get_buffer_size(void)                        { return 0; }
+#include <SDL.h>
+
+#define SDL_AUDIO_RATE        48000
+#define SDL_AUDIO_CHANNELS    2
+#define SDL_AUDIO_BUF_SAMPLES 256
+#define SDL_AUDIO_MAX_QUEUED  (SDL_AUDIO_BUF_SAMPLES * SDL_AUDIO_CHANNELS * \
+                               (int)sizeof(int16_t) * 4)
+
+static SDL_AudioDeviceID g_audio_device;
+static int g_audio_initialized;
+static unsigned g_audio_submissions;
+static int g_audio_nonzero_announced;
+
+int xa2_init(void)
+{
+    SDL_AudioSpec wanted, obtained;
+
+    if (g_audio_initialized)
+        return 1;
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+        fprintf(stderr, "[SDL-AUDIO] init failed: %s\n", SDL_GetError());
+        return 0;
+    }
+    SDL_zero(wanted);
+    wanted.freq = SDL_AUDIO_RATE;
+    wanted.format = AUDIO_S16SYS;
+    wanted.channels = SDL_AUDIO_CHANNELS;
+    wanted.samples = SDL_AUDIO_BUF_SAMPLES;
+    wanted.callback = NULL;
+    g_audio_device = SDL_OpenAudioDevice(NULL, 0, &wanted, &obtained, 0);
+    if (!g_audio_device) {
+        fprintf(stderr, "[SDL-AUDIO] open failed: %s\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        return 0;
+    }
+    if (obtained.freq != wanted.freq || obtained.format != wanted.format ||
+        obtained.channels != wanted.channels) {
+        fprintf(stderr, "[SDL-AUDIO] unsupported device format: %d Hz, 0x%X, %u channels\n",
+                obtained.freq, obtained.format, obtained.channels);
+        SDL_CloseAudioDevice(g_audio_device);
+        g_audio_device = 0;
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        return 0;
+    }
+    SDL_PauseAudioDevice(g_audio_device, 0);
+    g_audio_submissions = 0;
+    g_audio_nonzero_announced = 0;
+    g_audio_initialized = 1;
+    fprintf(stderr, "[SDL-AUDIO] initialized (%d Hz stereo 16-bit, %u samples)\n",
+            obtained.freq, obtained.samples);
+    return 1;
+}
+
+void xa2_shutdown(void)
+{
+    if (!g_audio_initialized)
+        return;
+    SDL_ClearQueuedAudio(g_audio_device);
+    SDL_CloseAudioDevice(g_audio_device);
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    fprintf(stderr, "[SDL-AUDIO] shut down (%u submissions)\n", g_audio_submissions);
+    g_audio_device = 0;
+    g_audio_initialized = 0;
+}
+
+int xa2_is_active(void)
+{
+    return g_audio_initialized;
+}
+
+int xa2_submit_samples(const int16_t *samples, int num_samples)
+{
+    uint32_t bytes;
+    int peak = 0;
+
+    if (!g_audio_initialized || !samples || num_samples <= 0)
+        return 0;
+    bytes = (uint32_t)num_samples * SDL_AUDIO_CHANNELS * sizeof(int16_t);
+    if (SDL_GetQueuedAudioSize(g_audio_device) > SDL_AUDIO_MAX_QUEUED)
+        return 0;
+    if (SDL_QueueAudio(g_audio_device, samples, bytes) != 0) {
+        fprintf(stderr, "[SDL-AUDIO] queue failed: %s\n", SDL_GetError());
+        return 0;
+    }
+    g_audio_submissions++;
+    g_f7_apu_frames_submitted++;
+    if (!g_audio_nonzero_announced) {
+        for (int i = 0; i < num_samples * SDL_AUDIO_CHANNELS; i++) {
+            int v = samples[i] < 0 ? -(int)samples[i] : (int)samples[i];
+            if (v > peak) peak = v;
+        }
+        if (peak) {
+            g_audio_nonzero_announced = 1;
+            fprintf(stderr, "[SDL-AUDIO] first non-silent PCM buffer (peak=%d)\n", peak);
+        }
+    }
+    if (g_f7_apu_frames_submitted % 60 == 0) {
+        extern void f7_print_counts(void);
+        f7_print_counts();
+    }
+    return 1;
+}
+
+int xa2_get_buffer_size(void)
+{
+    return SDL_AUDIO_BUF_SAMPLES;
+}
 
 #endif /* _WIN32 */
