@@ -255,15 +255,17 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     }
     g_audio_submissions++;
     g_f7_apu_frames_submitted++;
-    if (!g_audio_nonzero_announced) {
-        for (int i = 0; i < num_samples * SDL_AUDIO_CHANNELS; i++) {
-            int v = samples[i] < 0 ? -(int)samples[i] : (int)samples[i];
-            if (v > peak) peak = v;
-        }
-        if (peak) {
-            g_audio_nonzero_announced = 1;
-            fprintf(stderr, "[SDL-AUDIO] first non-silent PCM buffer (peak=%d)\n", peak);
-        }
+    for (int i = 0; i < num_samples * SDL_AUDIO_CHANNELS; i++) {
+        int v = samples[i] < 0 ? -(int)samples[i] : (int)samples[i];
+        if (v > peak) peak = v;
+    }
+    if (peak > 0 && !g_audio_nonzero_announced) {
+        g_audio_nonzero_announced = 1;
+        fprintf(stderr, "[SDL-AUDIO] first non-silent PCM buffer (peak=%d)\n", peak);
+    }
+    if (g_f7_apu_frames_submitted % 120 == 0 && peak == 0) {
+        fprintf(stderr, "[SDL-AUDIO] silent buffer submitted (frames=%llu)\n",
+            (unsigned long long)g_f7_apu_frames_submitted);
     }
     if (g_f7_apu_frames_submitted % 60 == 0) {
         extern void f7_print_counts(void);

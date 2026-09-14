@@ -129,31 +129,14 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 {
     g_f7_apu_dsp_frames_processed++;
 
-    /* Bypass DSP: take mixbin 0 (front-left) and mixbin 1 (front-right)
-     * and write them directly to the monitor frame buffer as the final
-     * EP output.
-     *
-     * The Xbox DirectSound typically routes:
-     *   Mixbin 0 = Front Left
-     *   Mixbin 1 = Front Right
-     *   Mixbin 2 = Center (often unused in stereo)
-     *   Mixbin 3 = LFE
-     *   Mixbin 4-5 = Rear L/R
-     *
-     * For stereo output, bins 0 and 1 are what we want.
-     */
-
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
     dsp_ack_frame(d);
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
-        float peak_l = 0.0f, peak_r = 0.0f;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             float left = mixbins[0][i];
             float right = mixbins[1][i];
-            if (fabsf(left) > peak_l) peak_l = fabsf(left);
-            if (fabsf(right) > peak_r) peak_r = fabsf(right);
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;
@@ -161,9 +144,6 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
-        }
-        if (peak_l > 0.01f || peak_r > 0.01f) {
-            fprintf(stderr, "[DSP] peak left=%f right=%f\n", peak_l, peak_r);
         }
         d->monitor.dsp_wrote_frame = true;
     }
