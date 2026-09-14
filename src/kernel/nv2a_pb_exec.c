@@ -276,6 +276,15 @@ static int tex_size_from_format(uint32_t fmt)
     return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
 }
 
+static int tex_bytes_per_pixel(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x10: case 0x11: case 0x1C: case 0x1D: return 2;
+    case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
+    default: return 0;
+    }
+}
+
 static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
@@ -285,6 +294,13 @@ static void record_tex_reg(uint32_t method, uint32_t param)
      * which is nearly all of them, since swizzled is the Xbox default. That
      * left the title's own textures unsampled and every textured quad drawn in
      * flat vertex colour. */
+    if (method == NV097_SET_TEXTURE_CONTROL1)
+        s_gpu.tex.pitch = param >> 16;
+    if (!s_gpu.tex.pitch && !tex_size_from_format(s_gpu.tex.color)) {
+        uint32_t bpp = tex_bytes_per_pixel(s_gpu.tex.color);
+        if (bpp && s_gpu.tex.width)
+            s_gpu.tex.pitch = s_gpu.tex.width * bpp;
+    }
     s_gpu.tex.valid = s_gpu.tex.enabled && s_gpu.tex.offset
                    && s_gpu.tex.width && s_gpu.tex.height
                    && (tex_size_from_format(s_gpu.tex.color)
