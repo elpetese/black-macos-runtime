@@ -23,6 +23,7 @@ extern uint64_t g_f7_apu_mixbin_nonzero_samples;
 extern uint64_t g_f7_apu_framebuf_rms_samples;
 extern uint64_t g_f7_apu_vp_voices_processed;
 extern uint64_t g_f7_apu_vp_nonzero_voices;
+extern uint64_t g_f7_apu_vp_nonzero_samples_read;
 extern uint64_t g_f7_apu_dsp_frames_processed;
 
 /* Graphics */

@@ -902,6 +902,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     fval = 0.0f;
                     break;
                 }
+                if (fval != 0.0f) g_f7_apu_vp_nonzero_samples_read++;
                 samples[sample_count][channel] = fval;
                 addr += container_size;
             }
