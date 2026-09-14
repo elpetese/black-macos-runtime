@@ -23,6 +23,7 @@
  */
 
 #include "apu_state.h"
+#include "../kernel/f7_instrumentation.h"
 #include "fpconv.h"
 
 #include <stdlib.h>
@@ -124,8 +125,10 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 }
 
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
-                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    g_f7_apu_dsp_frames_processed++;
+
     /* Bypass DSP: take mixbin 0 (front-left) and mixbin 1 (front-right)
      * and write them directly to the monitor frame buffer as the final
      * EP output.
@@ -145,20 +148,24 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
     dsp_ack_frame(d);
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        float peak_l = 0.0f, peak_r = 0.0f;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            /* Clamp to [-1, 1] range */
             float left = mixbins[0][i];
             float right = mixbins[1][i];
+            if (fabsf(left) > peak_l) peak_l = fabsf(left);
+            if (fabsf(right) > peak_r) peak_r = fabsf(right);
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;
             if (right < -1.0f) right = -1.0f;
 
-            /* Convert to 16-bit and write (not accumulate) into frame buffer.
-             * Each of the 8 sub-frames writes its own 32-sample slice. */
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
         }
+        if (peak_l > 0.01f || peak_r > 0.01f) {
+            fprintf(stderr, "[DSP] peak left=%f right=%f\n", peak_l, peak_r);
+        }
+        d->monitor.dsp_wrote_frame = true;
     }
 
     g_dbg.gp.cycles = 0;

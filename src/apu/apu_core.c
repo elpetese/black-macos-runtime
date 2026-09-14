@@ -269,7 +269,8 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
-void mcpx_apu_monitor_frame(MCPXAPUState *d)
+void mcpx_apu_monitor_frame(MCPXAPUState *d,
+    float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     if ((d->ep_frame_div + 1) % 8) {
         return;
@@ -284,21 +285,42 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
         while (remaining > 0) {
             int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
+            if (!d->monitor.dsp_wrote_frame) {
+                memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+
+                if (g_test_tone.active && !g_audio_muted) {
+                    for (int i = 0; i < chunk; i++) {
+                        int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                        d->monitor.frame_buf[i][0] = s;
+                        d->monitor.frame_buf[i][1] = s;
+                        g_test_tone.phase += g_test_tone.phase_inc;
+                        if (g_test_tone.phase >= 2.0 * M_PI)
+                            g_test_tone.phase -= 2.0 * M_PI;
+                    }
                 }
+
+                if (!g_audio_muted)
+                    mixer_render(d->monitor.frame_buf, chunk);
             }
 
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
+            if (!d->monitor.dsp_wrote_frame && mixbins) {
+                for (int bin = 0; bin < NUM_MIXBINS; bin++) {
+                    for (int i = 0; i < chunk && i < NUM_SAMPLES_PER_FRAME; i++) {
+                        int32_t s = (int32_t)(mixbins[bin][i] * 32767.0f);
+                        if (s > 32767) s = 32767;
+                        if (s < -32768) s = -32768;
+                        int32_t mixed_l = (int32_t)d->monitor.frame_buf[i][0] + s;
+                        int32_t mixed_r = (int32_t)d->monitor.frame_buf[i][1] + s;
+                        if (mixed_l > 32767) mixed_l = 32767;
+                        if (mixed_l < -32768) mixed_l = -32768;
+                        if (mixed_r > 32767) mixed_r = 32767;
+                        if (mixed_r < -32768) mixed_r = -32768;
+                        d->monitor.frame_buf[i][0] = (int16_t)mixed_l;
+                        d->monitor.frame_buf[i][1] = (int16_t)mixed_r;
+                    }
+                }
+            }
 
             memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
             out_offset += chunk;
@@ -331,7 +353,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     while (remaining > 0) {
         int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
 
-        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        if (!d->monitor.dsp_wrote_frame)
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
         /* Test tone (skip if muted) */
         if (g_test_tone.active && !g_audio_muted) {
@@ -346,8 +369,26 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
 
         /* Mix software voices (skip if muted) */
-        if (!g_audio_muted)
+        if (!g_audio_muted && !d->monitor.dsp_wrote_frame)
             mixer_render(d->monitor.frame_buf, chunk);
+
+        if (!d->monitor.dsp_wrote_frame && mixbins) {
+            for (int bin = 0; bin < NUM_MIXBINS; bin++) {
+                for (int i = 0; i < chunk && i < NUM_SAMPLES_PER_FRAME; i++) {
+                    int32_t s = (int32_t)(mixbins[bin][i] * 32767.0f);
+                    if (s > 32767) s = 32767;
+                    if (s < -32768) s = -32768;
+                    int32_t mixed_l = (int32_t)d->monitor.frame_buf[i][0] + s;
+                    int32_t mixed_r = (int32_t)d->monitor.frame_buf[i][1] + s;
+                    if (mixed_l > 32767) mixed_l = 32767;
+                    if (mixed_l < -32768) mixed_l = -32768;
+                    if (mixed_r > 32767) mixed_r = 32767;
+                    if (mixed_r < -32768) mixed_r = -32768;
+                    d->monitor.frame_buf[i][0] = (int16_t)mixed_l;
+                    d->monitor.frame_buf[i][1] = (int16_t)mixed_r;
+                }
+            }
+        }
 
         /* Copy to waveOut buffer */
         memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
@@ -419,10 +460,11 @@ static void se_frame(MCPXAPUState *d)
     /* Buffer for all mixbins for this frame */
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
+    d->monitor.dsp_wrote_frame = 0;
 
     mcpx_apu_vp_frame(d, mixbins);
     mcpx_apu_dsp_frame(d, mixbins);
-    mcpx_apu_monitor_frame(d);
+    mcpx_apu_monitor_frame(d, mixbins);
 
     d->ep_frame_div++;
 
@@ -473,7 +515,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             }
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
-            mcpx_apu_monitor_frame(d);
+            mcpx_apu_monitor_frame(d, NULL);
             d->ep_frame_div++;
         }
     }

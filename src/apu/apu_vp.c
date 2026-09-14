@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include "../kernel/f7_instrumentation.h"
 
 /* #define DEBUG_MCPX */
 
@@ -1131,6 +1132,8 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* Mix into bins */
+    int nonzero_count = 0;
+    int total_samples = 0;
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -1141,8 +1144,14 @@ static void voice_process(MCPXAPUState *d,
         }
         g *= attenuate(vol[b]) / hr;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += g * samples[i][b % channels];
+            float s = g * samples[i][b % channels];
+            if (s != 0.0f) nonzero_count++;
+            total_samples++;
+            mixbins[bin[b]][i] += s;
         }
+    }
+    if (nonzero_count > 0) {
+        g_f7_apu_vp_nonzero_voices++;
     }
 
     /* VP monitor mix */
@@ -1198,6 +1207,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                g_f7_apu_vp_voices_processed++;
             }
             d->regs[current] = d->regs[next];
         }
