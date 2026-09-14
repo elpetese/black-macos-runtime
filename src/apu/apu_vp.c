@@ -1133,7 +1133,6 @@ static void voice_process(MCPXAPUState *d,
 
     /* Mix into bins */
     int nonzero_count = 0;
-    int total_samples = 0;
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -1146,7 +1145,6 @@ static void voice_process(MCPXAPUState *d,
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             float s = g * samples[i][b % channels];
             if (s != 0.0f) nonzero_count++;
-            total_samples++;
             mixbins[bin[b]][i] += s;
         }
     }
