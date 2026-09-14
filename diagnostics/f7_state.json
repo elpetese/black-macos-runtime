@@ -1,15 +1,32 @@
 {
-  "audio_host": "pending",
-  "graphics_path": "likely_d3d8",
-  "first_draw": "pending",
-  "present": "pending",
+  "audio_host": "active",
+  "graphics_path": "push_buffer",
+  "first_draw": "confirmed",
+  "present": "n/a",
   "input_host": "partial",
   "first_level": "pending",
   "playable": false,
   "f7_0_completed": true,
   "f7_0_results": {
-    "audio": "DESCARTADO - sin flujo de samples al host",
-    "graphics": "NO_DETERMINADO - DMA activo pero push buffer executor no se ejecuta; probable D3D8 API",
-    "input": "NO_DETERMINADO - sin polls en 30s de loop de título"
+    "audio": "PARTIAL - frames_submitted=5400 en 30s, pero frames_played=0 y mixbin_nonzero_samples=0. El pipeline SDL2 recibe frames pero el mix está silencioso. Requiere investigación VP/DSP.",
+    "graphics": "CONFIRMADO_PUSH_BUFFER - D3D8 API no se usa (todos los contadores D3D8=0). Black escribe comandos NV2A directamente en guest RAM. nv2a_pb_exec consume el push buffer: 172 clears, 941 draws en 30s.",
+    "input": "NO_DETERMINADO - polls=0, nonzero_buttons=0 en 30s de loop de título"
+  },
+  "f7_0_measurements": {
+    "audio_frames_submitted": 5400,
+    "audio_frames_played": 0,
+    "audio_mixbin_nonzero": 0,
+    "audio_framebuf_rms": 0,
+    "graphics_d3d8_create_device": 0,
+    "graphics_d3d8_draw_primitive": 0,
+    "graphics_d3d8_draw_indexed_primitive": 0,
+    "graphics_d3d8_present": 0,
+    "graphics_nv2a_clears": 172,
+    "graphics_nv2a_dma_put_changes": 0,
+    "graphics_nv2a_dma_get_changes": 0,
+    "graphics_nv2a_pgraph_methods": 0,
+    "graphics_nv2a_draws": 941,
+    "input_polls": 0,
+    "input_nonzero_buttons": 0
   }
 }

@@ -23,6 +23,7 @@
 
 #include "d3d8_xbox.h"
 #include "d3d8_fvf.h"
+#include "../kernel/f7_instrumentation.h"
 
 #include <SDL.h>
 #include <epoxy/gl.h>
@@ -548,6 +549,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
                                      HWND hwnd, void *dirty)
 {
     (void)s;(void)src;(void)dst;(void)hwnd;(void)dirty;
+    g_f7_d3d8_present++;
     SDL_GL_SwapWindow(g.window);
     /* Pump events so the window stays responsive. Quit closes the window
      * but leaves the process running until the game's loop notices. */
@@ -782,6 +784,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *s, D3DPRIMITIVETYPE
                                             UINT start, UINT prim_count)
 {
     (void)s;
+    g_f7_d3d8_draw_primitive++;
     GLVertexBuffer *vb = (GLVertexBuffer *)g.vb;
     if (!vb || !vb->sys_mem) return D3D_OK;
     UINT vcount = 0;
@@ -795,6 +798,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *s, D3DPRIMIT
         UINT min_vi, UINT nv, UINT start_idx, UINT prim_count)
 {
     (void)s;
+    g_f7_d3d8_draw_indexed_primitive++;
     GLVertexBuffer *vb = (GLVertexBuffer *)g.vb;
     GLIndexBuffer  *ib = (GLIndexBuffer  *)g.ib;
     if (!vb || !ib || !vb->sys_mem || !ib->sys_mem) return D3D_OK;
@@ -974,6 +978,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
 {
     (void)s; (void)adapter; (void)devtype; (void)hwnd; (void)flags;
     if (!pp || !pPP) return D3DERR_INVALIDCALL;
+    g_f7_d3d8_create_device++;
 
     /* Initialise SDL video + GL 3.3 core context. */
     if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_InitSubSystem(SDL_INIT_VIDEO);
