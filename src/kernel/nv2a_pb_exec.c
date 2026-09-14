@@ -1556,7 +1556,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
-        note_unhandled(method);
+        s_gpu.unhandled_total++;
         return;
     }
     switch (method) {
@@ -1742,7 +1742,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     fprintf(stderr, "  [GPU] attr[%u] format: type=%u size=%u stride=%u\n",
                             attr_idx, a->type, a->size, a->stride);
             }
-        } else if ((method >= 0x0100 && method < 0x0200) ||  /* NOP, SET_OBJECT, etc. */
+        } else if ((method >= 0x0000 && method < 0x0200) ||  /* NOP, SET_OBJECT, etc. */
                    (method >= 0x0200 && method < 0x0300) ||  /* Surface/clear state */
                    (method >= 0x0300 && method < 0x0440) ||  /* Alpha/blend/cull/alpha test + nearby */
                    (method >= 0x0A00 && method < 0x0C00) ||  /* Transform/vertex state */
