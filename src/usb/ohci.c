@@ -137,6 +137,7 @@ typedef struct {
 static OhciController s_hc[2];
 static int s_enabled;
 static int s_trace;
+static unsigned s_reports_total;        /* pad reports handed to the driver */
 
 static uint32_t *reg_of(OhciController *hc, uint32_t off)
 {
@@ -457,6 +458,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             /* The pad's report, on its interrupt endpoint. */
             uint8_t rep[32];
             int n = usb_gamepad_report(rep, (int)sizeof rep);
+            s_reports_total++;
             if (n > len) n = len;
             if (s_trace) {
                 static unsigned reports;
@@ -556,6 +558,34 @@ static int ohci_run_control_list(OhciController *hc)
 /* Walk the whole periodic tree once: every interrupt endpoint the driver has
  * scheduled, whatever its polling interval. One pass per tick polls the pad
  * at the tick rate, which is slower than it asked for and never faster. */
+/* RECOMP_USB_TRACE: every 5 s, the state a stalled pad would show -- whether
+ * reports are still being taken, and if not, what the interrupt endpoint and
+ * the done queue look like. */
+static void ohci_status_line(OhciController *hc)
+{
+    static unsigned tick, last_reports;
+    uint32_t hcca = hc->reg[HcHCCA / 4], ed;
+    int k;
+
+    if (!s_trace || (++tick % 250u) != 0)
+        return;
+    fprintf(stderr, "  [OHCI0] +%us reports %u (+%u) control %08X enable %08X status %08X"
+            " acks %u pending_done %08X hcca_done %08X\n", tick / 50u, s_reports_total,
+            s_reports_total - last_reports, hc->reg[HcControl / 4],
+            hc->reg[HcInterruptEnable / 4], hc->reg[HcInterruptStatus / 4],
+            hc->status_acks, hc->done_head,
+            guest_ok(hcca, 0x100) ? rd32(hcca + HCCA_DONE_HEAD) : 0);
+    last_reports = s_reports_total;
+    if (!guest_ok(hcca, 0x100))
+        return;
+    ed = rd32(hcca) & ED_PTR_MASK;
+    for (k = 0; k < 4 && ed && guest_ok(ed, 16); k++) {
+        fprintf(stderr, "  [OHCI0]   int ED %08X: flags %08X tail %08X head %08X next %08X\n",
+                ed, rd32(ed), rd32(ed + 4), rd32(ed + 8), rd32(ed + 12));
+        ed = rd32(ed + 12) & ED_PTR_MASK;
+    }
+}
+
 static int ohci_run_periodic_list(OhciController *hc)
 {
     uint32_t hcca = hc->reg[HcHCCA / 4];
@@ -766,6 +796,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
 #endif
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
+        ohci_status_line(hc);
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
