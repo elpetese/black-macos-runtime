@@ -231,3 +231,33 @@ Antes de ejecutar, comprobar las opciones exactas con `python3 -m tools.recomp.i
 - **`icall_feedback --db … merge` / `seeds --out … --align 16`:** la herramienta documenta `merge <fichero>` y escribe `tools/recomp/output/icall_targets.json`, que se pasa a `tools.disasm --seed-functions`. Confirmar con `--help` antes de usarlo.
 - **`timeout 120`** no existe en macOS por defecto (`gtimeout` de coreutils, o un bucle con `kill`, como en los scripts de prueba usados el 19/09).
 - **`SDL_Init(SDL_INIT_VIDEO | …)`:** no conviene, porque la ventana es Cocoa propia. Basta con `SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER)` más los hints y el bombeo de eventos (P0.2).
+
+---
+
+## 6. Hallazgos de las mediciones m1–m2 (19/09, noche)
+
+Dos ejecuciones largas (`black-recomp/scripts/diag-level.sh`), cada una hasta el nivel y con un perfil de CPU de 15 s en el nivel **sin reiniciar el juego**. Logs y perfiles en `~/black-runs/m1.*` y `~/black-runs/m2.*`.
+
+| Medida | Antes | Después | Cambio |
+|---|---|---|---|
+| Menús / vídeos | ~260 fps | **60,0 fps** | `FLIP_STALL` espera al siguiente tick de 60 Hz (`fb87d22`) |
+| Nivel | ~8 fps | **~14 fps** | `getenv` una vez por sitio y sin recorrer la caché de texturas (`b6f991b`) |
+
+### Dónde se va el tiempo en el nivel (perfil m2)
+
+1. **Hilo principal del juego, ~40 %: esperando a que la GPU quede ociosa.** El KickOff de Direct3D (`sub_0026CF10`) avisa a la GPU y, **si el global `[0x279B48]` es distinto de cero**, espera en bucle a que `PFIFO_CACHE1_DMA_PUT == DMA_GET` (`0xFD003240/44`) y `PGRAPH_STATUS == 0` (`0xFD400700`). Se ejecuta en cada "hacer sitio" del pushbuffer (`sub_0026CDC0`) y al insertar fences (`sub_0026C920`) durante el dibujado de mallas. CPU y GPU quedan en serie.
+   - `[0x279B48]` está en la BSS de D3D (vale 0 al arrancar) y **ninguna instrucción lo escribe directamente**: se escribe por un puntero calculado o lo altera el runtime.
+   - **Siguiente paso (una sola ejecución):** `RECOMP_KERNEL_WATCH=0x279B48 RECOMP_KERNEL_WATCH_ALL=1` dice cuándo cambia y junto a qué llamada al kernel. Después, o bien quitar la causa (si es un fallo), o bien hacer que `CACHE1_DMA_PUT/GET` y `PGRAPH_STATUS` reflejen el estado real en cuanto el hilo de la GPU termina un tramo, para que la espera dure lo mismo que en el hardware.
+2. **Hilo temporizador, 68–74 %: el DPC de vblank de D3D girando** (`sub_00273C40`). Escribe 1 en `PCRTC_INTR_0` y espera a que baje el bit 24 de `PMC_INTR_0`, que en el port solo se borraba con el tick periódico del hilo de la GPU. Corregido en `f66f63d` (se borran tras el ISR); **pendiente de medir**.
+3. **Hilo de la GPU: ya es trabajo real de OpenGL.** `glDrawElements` 28 %, `glBufferSubData` 10 % (subida de vértices por dibujo), `beginRenderPass` 8 % (la capa OpenGL→Metal de Apple abre pases de render a menudo), `bind_vertex_attributes` 10 %. Mejorarlo requiere agrupar dibujos y evitar subidas repetidas, un trabajo más largo que conviene dejar para después de los puntos 1 y 2.
+4. **Audio:** el remuestreo nuevo cuesta ~4,6 % de su hilo. No es un problema.
+
+### Próxima ejecución (una sola, con todo)
+
+```sh
+cd black-recomp
+RECOMP_KERNEL_WATCH=0x279B48 RECOMP_KERNEL_WATCH_ALL=1 scripts/diag-level.sh m3 600
+python3 scripts/profile-summary.py ~/black-runs/m3.profile_level.txt 30
+```
+
+Confirma a la vez la corrección del vblank (punto 2) y quién activa la espera de GPU ociosa (punto 1).
