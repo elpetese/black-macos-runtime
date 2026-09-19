@@ -71,6 +71,7 @@ void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len)
 }
 
 static const uint8_t *s_aperture;          /* host view of 0xFD000000 */
+extern uint32_t xbox_Nv2aRegPeek(uint32_t offset) __attribute__((weak));
 
 /* nv2a.c's tile clip, reading the PFB tile registers where the title wrote
  * them: the PFB block of the aperture (+0x100000). */
@@ -101,6 +102,11 @@ typedef struct RAMHTEntry {
 
 static uint32_t pfifo_reg(uint32_t r)
 {
+    /* The PFIFO page may be served by the runtime (xbox_memory_layout.c
+     * intercepts it to give the interrupt registers their semantics); read
+     * its copy rather than take a fault per lookup. */
+    if (xbox_Nv2aRegPeek)
+        return xbox_Nv2aRegPeek(0x2000 + r);
     return ldl_le_p(s_aperture + 0x2000 + r);
 }
 
@@ -483,6 +489,17 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
     pgraph_process_pending(d);
     qemu_mutex_unlock(&d->pgraph.lock);
     return n > 0 ? n : 1;
+}
+
+/* A PGRAPH register as the renderer holds it. Some of them the title reads
+ * back through the aperture as values the GPU produced: D3D writes its fence
+ * with NV044_SET_MONOCHROME_COLOR0 and polls PATT_COLOR0 until the GPU has
+ * got there (sub_0026CBA0), and its software method 9 writes the register
+ * named by ZSTENCILCLEARVALUE with COLORCLEARVALUE. The aperture page is
+ * served by the runtime, which asks here for those. */
+uint32_t xnv2a_pgraph_reg(uint32_t offset)
+{
+    return s_d ? pgraph_reg_r(&s_d->pgraph, offset) : 0;
 }
 
 /* Frames presented so far; the hang monitor's sign of life. */

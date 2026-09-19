@@ -707,13 +707,27 @@ static uint32_t nv2a_irq_pmc(void)
     return v;
 }
 
+/* PGRAPH registers the GPU writes and D3D reads back (see xnv2a_pgraph_reg):
+ * served from the renderer, not the shadow. */
+extern uint32_t xnv2a_pgraph_reg(uint32_t offset) __attribute__((weak));
+static int nv2a_irq_from_renderer(uint32_t off)
+{
+    return off == 0x400B10u        /* PATT_COLOR0: D3D's fence marker      */
+        || off == 0x40186Cu        /* COLORCLEARVALUE: software method 9   */
+        || off == 0x401A88u;       /* ZSTENCILCLEARVALUE: software method 9 */
+}
+
 static uint64_t nv2a_irq_read(void *ctx, uint32_t offset, unsigned size)
 {
     uint32_t off = NV2A_IRQ_PAGES[(uintptr_t)ctx] + offset;
     uint32_t word, v;
-    pthread_mutex_lock(&g_nv2a_irq_lock);
-    word = (off & ~3u) == NV2A_PMC_INTR_0 ? nv2a_irq_pmc() : *nv2a_irq_slot(off & ~3u);
-    pthread_mutex_unlock(&g_nv2a_irq_lock);
+    if (nv2a_irq_from_renderer(off & ~3u) && xnv2a_pgraph_reg) {
+        word = xnv2a_pgraph_reg((off & ~3u) - 0x400000u);
+    } else {
+        pthread_mutex_lock(&g_nv2a_irq_lock);
+        word = (off & ~3u) == NV2A_PMC_INTR_0 ? nv2a_irq_pmc() : *nv2a_irq_slot(off & ~3u);
+        pthread_mutex_unlock(&g_nv2a_irq_lock);
+    }
     v = word >> ((off & 3u) * 8u);
     if (size == 1) return v & 0xFFu;
     if (size == 2) return v & 0xFFFFu;
@@ -791,8 +805,26 @@ int xbox_Nv2aSoftwareInterrupt(uint32_t trapped_addr, uint32_t trapped_data,
         pthread_mutex_lock(&g_nv2a_irq_lock);
         pending = *nv2a_irq_slot(NV2A_PGRAPH_INTR) & (1u << 20);
         pthread_mutex_unlock(&g_nv2a_irq_lock);
-        if (!pending)
+        if (!pending) {
+            /* Record of what was delivered: the first few in full, then a
+             * per-parameter tally every 500. */
+            static unsigned total, by_param[32];
+            unsigned p = trapped_data & 0x1Fu;
+            total++;
+            by_param[p]++;
+            if (total <= 12)
+                fprintf(stderr, "  [NV2A] software method param 0x%08X acknowledged after %d us\n",
+                        trapped_data, i * 50);
+            if (total % 500 == 0) {
+                fprintf(stderr, "  [NV2A] software methods delivered: %u (by param&0x1F:", total);
+                for (unsigned k = 0; k < 32; k++)
+                    if (by_param[k]) fprintf(stderr, " %u:%u", k, by_param[k]);
+                fprintf(stderr, ")\n");
+            }
+            if (total <= 12 || total % 500 == 0)
+                fflush(stderr);
             return 1;
+        }
         nanosleep(&w, NULL);
     }
     {
