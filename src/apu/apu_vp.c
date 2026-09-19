@@ -125,8 +125,11 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
+static void voice_resample_reset(uint16_t v);
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    voice_resample_reset(v);
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -198,6 +201,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        voice_resample_reset((uint16_t)selected_handle);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -942,32 +946,85 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * A voice plays at its own rate: the pitch register gives the ratio, as
+ * rate = output/source = 2^(-pitch/4096). Fetching one source sample per
+ * 48 kHz output sample -- which is what this did while libsamplerate was
+ * stubbed out -- played a 22 kHz sound 2.2x fast and an octave-plus high:
+ * everything in Black sounded sped up. Linear interpolation, with the
+ * position carried from frame to frame per voice.
  * ============================================================ */
+
+static struct {
+    double frac;            /* position between cur and nxt, in source samples */
+    float cur[2], nxt[2];
+    int primed;
+} s_resample[MCPX_HW_MAX_VOICES];
+
+static void voice_resample_reset(uint16_t v)
+{
+    if (v < MCPX_HW_MAX_VOICES)
+        s_resample[v].primed = 0;
+}
+
+/* One source sample; 0 when the voice has nothing more to give. */
+static int voice_fetch_one(MCPXAPUState *d, uint16_t v, float out[2])
+{
+    float tmp[1][2];
+    int count;
+
+    if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+        return 0;
+    count = voice_get_samples(d, v, tmp, 1);
+    if (count <= 0)
+        return 0;
+    out[0] = tmp[0][0];
+    out[1] = tmp[0][1];
+    return 1;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    double step = (rate > 0.0f) ? 1.0 / rate : 1.0;
+    int n = 0;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    if (step < 1.0 / 64.0) step = 1.0 / 64.0;
+    if (step > 16.0) step = 16.0;
+
+    if (!s_resample[v].primed) {
+        if (!voice_fetch_one(d, v, s_resample[v].cur))
+            return -1;
+        if (!voice_fetch_one(d, v, s_resample[v].nxt)) {
+            s_resample[v].nxt[0] = s_resample[v].cur[0];
+            s_resample[v].nxt[1] = s_resample[v].cur[1];
+        }
+        s_resample[v].frac = 0.0;
+        s_resample[v].primed = 1;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+
+    while (n < requested_num) {
+        double f;
+        while (s_resample[v].frac >= 1.0) {
+            s_resample[v].cur[0] = s_resample[v].nxt[0];
+            s_resample[v].cur[1] = s_resample[v].nxt[1];
+            if (!voice_fetch_one(d, v, s_resample[v].nxt)) {
+                s_resample[v].primed = 0;
+                return n > 0 ? n : -1;
+            }
+            s_resample[v].frac -= 1.0;
+        }
+        f = s_resample[v].frac;
+        samples[n][0] = (float)(s_resample[v].cur[0]
+                        + (s_resample[v].nxt[0] - s_resample[v].cur[0]) * f);
+        samples[n][1] = (float)(s_resample[v].cur[1]
+                        + (s_resample[v].nxt[1] - s_resample[v].cur[1]) * f);
+        s_resample[v].frac += step;
+        n++;
+    }
+    return n;
 }
 
 /* ============================================================
@@ -1008,6 +1065,24 @@ static void voice_process(MCPXAPUState *d,
                                         NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
     float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
     dbg->rate = rate;
+    /* RECOMP_APU_RATES: the source rate each voice plays at, every 10 s --
+     * what the resampler is converting from. */
+    if (getenv("RECOMP_APU_RATES")) {
+        static unsigned hist[8], frames;
+        static int64_t last_ms;
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        float hz = 48000.0f / rate;
+        hist[hz < 12000 ? 0 : hz < 20000 ? 1 : hz < 23000 ? 2 : hz < 30000 ? 3
+             : hz < 40000 ? 4 : hz < 46000 ? 5 : hz < 50000 ? 6 : 7]++;
+        frames++;
+        if (now - last_ms > 10000) {
+            fprintf(stderr, "[APU] voice source rates (voice-frames): <12k %u, 12-20k %u,"
+                    " ~22k %u, 23-30k %u, ~32k %u, ~44k %u, ~48k %u, >50k %u\n",
+                    hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]);
+            memset(hist, 0, sizeof hist);
+            last_ms = now;
+        }
+    }
 
     /* Step amplitude envelope */
     float ea_value = voice_step_envelope(

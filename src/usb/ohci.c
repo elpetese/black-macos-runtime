@@ -463,9 +463,19 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             if (s_trace) {
                 static unsigned reports;
                 static uint8_t last_btn, last_a;
+                static uint8_t last_axes[8];
                 int changed = rep[2] != last_btn || rep[4] != last_a;
                 last_btn = rep[2];
                 last_a = rep[4];
+                /* The sticks too: a look axis that is not at rest when no key
+                 * is held shows up here, not in the buttons. */
+                if (memcmp(last_axes, rep + 12, 8) != 0) {
+                    memcpy(last_axes, rep + 12, 8);
+                    fprintf(stderr, "  [OHCI%d] axes LX %d LY %d RX %d RY %d\n", hc->index,
+                            (int16_t)(rep[12] | rep[13] << 8), (int16_t)(rep[14] | rep[15] << 8),
+                            (int16_t)(rep[16] | rep[17] << 8), (int16_t)(rep[18] | rep[19] << 8));
+                    fflush(stderr);
+                }
                 if ((reports++ % 500u) == 0 || changed) {
                     fprintf(stderr, "  [OHCI%d] IN ep%u report #%u, buttons "
                                     "%02X, A %02X\n", hc->index, endpoint,
