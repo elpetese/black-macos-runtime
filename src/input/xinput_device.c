@@ -156,11 +156,64 @@ static void open_controllers(void)
     fflush(stderr);
 }
 
-void xbox_InputInit(void)
+/* Controllers are found on the thread that polls them.
+ *
+ * SDL2 on macOS schedules its HID manager on the run loop of the thread that
+ * initialised the joystick subsystem, and services it from whichever thread
+ * calls the update. Initialising here on the game's main thread while the
+ * USB controller model polled from its own thread meant that run loop never
+ * ran: no device was ever enumerated, and a PS4 pad plugged in before launch
+ * or after read as "SDL sees 0 joystick(s)". It also only looked once. So:
+ * initialise on the first poll, update on every poll, and rescan whenever the
+ * count changes -- which is also what makes hot-plugging work. */
+static void input_rescan(void);
+
+static void input_poll_host(void)
 {
-    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
-        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
-    if (SDL_IsGameController(0)) {
+    static int ready;
+    static int last_count = -1;
+    static uint32_t last_ms;
+    uint32_t now;
+    int count;
+
+    if (getenv("RECOMP_BACKGROUND"))
+        return;
+    if (!ready) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4, "1");
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5, "1");
+        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+        if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+            fprintf(stderr, "  [INPUT] SDL game controller init failed: %s\n", SDL_GetError());
+            fflush(stderr);
+        }
+        ready = 1;
+    }
+    SDL_GameControllerUpdate();
+    /* Nothing reads SDL's event queue here; keep it from filling. */
+    SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+
+    now = SDL_GetTicks();
+    if (last_count >= 0 && now - last_ms < 500)
+        return;
+    last_ms = now;
+    count = SDL_NumJoysticks();
+    if (count != last_count) {
+        last_count = count;
+        input_rescan();
+    }
+}
+
+static void input_rescan(void)
+{
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
+        if (g_pads[i] && !SDL_GameControllerGetAttached(g_pads[i])) {
+            SDL_GameControllerClose(g_pads[i]);
+            g_pads[i] = NULL;
+            g_controller_connected[i] = FALSE;
+        }
+    }
+    if (SDL_NumJoysticks() > 0 && SDL_IsGameController(0)) {
         const char *name = SDL_JoystickNameForIndex(0);
         if (name && strstr(name, "DualSense")) {
             const char *mapping =
@@ -176,6 +229,11 @@ void xbox_InputInit(void)
         }
     }
     open_controllers();
+}
+
+void xbox_InputInit(void)
+{
+    /* Host controllers are set up on the polling thread (input_poll_host). */
     xbox_KeyboardInit();
 }
 
@@ -183,6 +241,9 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
+
+    if (dwPort == 0)
+        input_poll_host();
 
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
