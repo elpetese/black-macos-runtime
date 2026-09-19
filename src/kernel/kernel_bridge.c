@@ -27,6 +27,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "f7_instrumentation.h"
 #include "recomp_icall_feedback.h"
 #include "mcpx_mmio.h"
 #include <sys/mman.h>
@@ -3146,7 +3147,9 @@ static void bridge_NtReadFile(void)
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
-        if (poff)
+        if (!recomp_verbose())
+            ;
+        else if (poff)
             fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
@@ -5639,7 +5642,8 @@ static void kernel_thunk_dispatch(void)
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
-        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
+        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200
+            && recomp_verbose()) {
             fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample

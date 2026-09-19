@@ -44,6 +44,7 @@ extern uint64_t g_f7_input_nonzero_buttons;
 
 /* Call once at shutdown (e.g. from main_posix.c atexit or similar). */
 void f7_print_counts(void);
+int recomp_verbose(void);
 
 #ifdef __cplusplus
 }

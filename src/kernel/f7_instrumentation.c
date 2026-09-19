@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /**
  * f7_instrumentation.c — F7.0 boundary counters
  */
@@ -64,4 +65,15 @@ void f7_print_counts(void)
         (unsigned long long)g_f7_input_poll_count,
         (unsigned long long)g_f7_input_nonzero_buttons);
     fflush(stderr);
+}
+
+/* RECOMP_VERBOSE=1 turns on the per-frame and per-read progress lines. Off by
+ * default: at full speed they wrote megabytes a minute and the stdio lock
+ * they take on every line changes the timing the bugs depend on. */
+int recomp_verbose(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("RECOMP_VERBOSE") != NULL;
+    return v;
 }

@@ -564,7 +564,7 @@ static void clear_surface(uint32_t param)
     /* Progress markers, interleaved with everything else in the log. The
      * summary says drawing stopped; only a marker next to the surrounding
      * activity says what the title was doing when it stopped. */
-    if ((s_gpu.clears % 100) == 0)
+    if ((s_gpu.clears % 100) == 0 && recomp_verbose())
         fprintf(stderr, "  [GPU] clear #%u\n", s_gpu.clears);
     /* Distinct clear colours actually used. "Cleared to black" and "the clear
      * never ran" look identical in the framebuffer, and only one of them is a
@@ -2007,7 +2007,7 @@ static void draw_primitive(void)
     drawlog();
     s_gpu.draws++;
     g_f7_nv2a_pgraph_draw_count++;
-    if ((s_gpu.draws % 200) == 0)
+    if ((s_gpu.draws % 200) == 0 && recomp_verbose())
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 

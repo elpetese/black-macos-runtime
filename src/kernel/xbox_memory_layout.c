@@ -13,6 +13,7 @@
  */
 
 #include "xbox_memory_layout.h"
+#include "f7_instrumentation.h"
 #include "kernel.h"
 #include "mcpx_mmio.h"
 #include <stdio.h>
@@ -738,7 +739,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
-                {
+                if (recomp_verbose()) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "

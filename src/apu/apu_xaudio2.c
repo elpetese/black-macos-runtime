@@ -155,7 +155,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;
     g_f7_apu_frames_submitted++;
-    if (g_f7_apu_frames_submitted % 60 == 0) {
+    if (g_f7_apu_frames_submitted % 60 == 0 && recomp_verbose()) {
         extern void f7_print_counts(void);
         f7_print_counts();
     }
@@ -264,11 +264,11 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         g_audio_nonzero_announced = 1;
         fprintf(stderr, "[SDL-AUDIO] first non-silent PCM buffer (peak=%d)\n", peak);
     }
-    if (g_f7_apu_frames_submitted % 120 == 0 && peak == 0) {
+    if (g_f7_apu_frames_submitted % 120 == 0 && peak == 0 && recomp_verbose()) {
         fprintf(stderr, "[SDL-AUDIO] silent buffer submitted (frames=%llu)\n",
             (unsigned long long)g_f7_apu_frames_submitted);
     }
-    if (g_f7_apu_frames_submitted % 60 == 0) {
+    if (g_f7_apu_frames_submitted % 60 == 0 && recomp_verbose()) {
         extern void f7_print_counts(void);
         f7_print_counts();
     }
