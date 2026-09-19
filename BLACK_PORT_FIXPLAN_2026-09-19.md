@@ -305,3 +305,32 @@ cd black-recomp && scripts/diag-level.sh v1 600
 # [STAT] del nivel > 14 fps; perfil sin sub_00273C40 ni sub_0026CF10 dominando
 ```
 Si algo falla: `RECOMP_NV2A_IRQ=0` aísla el cambio de los registros; el hilo de bits "ocupado" es independiente.
+
+---
+
+## 8. Verificación v2 (20/09): una ejecución, todo registrado
+
+Ejecución única con `scripts/diag-level.sh v2 600` (perfil de menús y de nivel, volcado de bloqueos, `[STAT]` cada 10 s, trazas USB/APU, capturas). Logs y perfiles en `~/black-runs/v2.*`.
+
+**Antes de v2 hubo una v1 con pantalla negra.** El volcado de v1 la explicó sin repetir: `sub_0026CBA0` (la espera de fence de D3D) sondeaba `PATT_COLOR0` (`0xFD400B10`), que la GPU rellena con el método de fence de D3D (`NV044_SET_MONOCHROME_COLOR0`, subcanal 5) y que la apertura nunca reflejaba. Lo mismo pasaba con `COLORCLEARVALUE`/`ZSTENCILCLEARVALUE`, que usa el aviso 9. **Corrección `07c56ed`:** esos tres registros se sirven desde xemu.
+
+| Comprobación | v2 |
+|---|---|
+| Arranque, menús y vídeos | 60 fps estables |
+| Nivel | alcanzado; **~15,5 fps** |
+| Bloqueos / crashes | 0 / 0 |
+| Destrucción (`DESTRUCT.bks`) | 4 cargas sin congelarse |
+| Avisos por software entregados | ~35.000 (Swap 1: ~22.000; fence 5: ~12.900; 8 y 9: 13), **0 sin reconocer** |
+
+**Perfil del nivel:**
+- **Hilo temporizador:** 98 % en reposo. El giro del DPC de vblank ha desaparecido.
+- **Hilo principal:** 92 % **esperando** el evento de fence (`sub_0026CC10` → `KeWaitForSingleObject`), en reposo. La CPU va por delante y espera a la GPU, como en el hardware.
+- **Hilo de la GPU:** 100 %, **único cuello de botella**. Casi todo es la capa OpenGL→Metal de Apple: `glDrawElements` 23 %, `glBufferSubData` 7 %, pases de render y *command buffers* ~15 %, `glReadPixels` de superficies 2 %.
+
+**Siguiente trabajo de rendimiento** (renderizador, proyecto aparte):
+1. evitar la subida de vértices por dibujo (buffers persistentes);
+2. no descargar superficies a la CPU salvo que el juego las lea;
+3. agrupar dibujos con el mismo estado;
+4. alternativa de fondo: el renderizador Vulkan de xemu sobre MoltenVK.
+
+**Pendiente, sin cambios:** PTIMER (`0xFD009400`) no se actualiza, así que las estadísticas de tiempo de D3D salen a 0 (no bloquea). Flags entre funciones en la librería matemática (solo Inf/NaN). Crash al final de vídeos (`sub_0013DD20`): no apareció en v2; medir en varias ejecuciones.
