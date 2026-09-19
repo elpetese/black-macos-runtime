@@ -406,6 +406,21 @@ void xbox_KeyboardPressSlot(int slot)
     pthread_mutex_unlock(&s_lock);
 }
 
+/* Every held key up at once. The window only hears keyUp while it has the
+ * focus: a key held through Cmd-Tab or a screenshot never got one, and stayed
+ * down for the rest of the session -- a look axis pinned, the view spinning. */
+void xbox_KeyboardReleaseAll(void)
+{
+    uint64_t t = now_ms();
+    int i;
+
+    pthread_mutex_lock(&s_lock);
+    for (i = 0; i < K_COUNT; i++)
+        if (s_until[i] > t)
+            s_until[i] = t;
+    pthread_mutex_unlock(&s_lock);
+}
+
 void xbox_KeyboardReleaseSlot(int slot)
 {
     if (slot < 0 || slot >= K_COUNT)

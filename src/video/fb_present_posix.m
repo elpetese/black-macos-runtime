@@ -29,6 +29,7 @@ int  xbox_KeyboardSlotForKey(unsigned char c);
 int  xbox_KeyboardSlotForKeyCode(unsigned short keycode);
 void xbox_KeyboardPressSlot(int slot);
 void xbox_KeyboardReleaseSlot(int slot);
+void xbox_KeyboardReleaseAll(void);
 int  xbox_KeyboardAutostartPending(void);
 void xbox_KeyboardTitleSeen(void);
 
@@ -719,21 +720,65 @@ static int init_metal(void)
  * bytes. This view forwards keyDown/keyUp to the same hold timers, so the
  * window is fully keyboard-playable on its own (and no longer depends on stdin
  * being a TTY, e.g. when launched from Finder). */
+/* The slot each physical key (virtual key code) pressed, so its keyUp
+ * releases exactly that; -1 when none. */
+static signed char s_keycode_slot[256];
+static void init_keycode_slots(void) __attribute__((constructor));
+static void init_keycode_slots(void)
+{
+    memset(s_keycode_slot, 0xFF, sizeof s_keycode_slot);
+}
+
 @interface XBFrameKeyView : NSView
 @end
 @implementation XBFrameKeyView
 - (BOOL)acceptsFirstResponder { return YES; }
 - (BOOL)becomeFirstResponder { return YES; }
+- (BOOL)resignFirstResponder
+{
+    xbox_KeyboardReleaseAll();
+    return YES;
+}
+/* Losing the focus any other way -- Cmd-Tab, a click on another window, a
+ * screenshot shortcut -- also takes the keyUps with it. */
+- (void)viewDidMoveToWindow
+{
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc removeObserver:self];
+    if (!self.window)
+        return;
+    [nc addObserver:self selector:@selector(xek_focusLost:)
+               name:NSWindowDidResignKeyNotification object:self.window];
+    [nc addObserver:self selector:@selector(xek_focusLost:)
+               name:NSApplicationDidResignActiveNotification object:nil];
+}
+- (void)xek_focusLost:(NSNotification *)note
+{
+    (void)note;
+    xbox_KeyboardReleaseAll();
+    memset(s_keycode_slot, 0xFF, sizeof s_keycode_slot);
+}
 - (void)keyDown:(NSEvent *)event  { [self xek_handleKey:event down:YES]; }
 - (void)keyUp:(NSEvent *)event    { [self xek_handleKey:event down:NO]; }
 - (void)xek_handleKey:(NSEvent *)event down:(BOOL)down
 {
-    NSString *chars = [event characters];
+    NSString *chars = [event charactersIgnoringModifiers];
+    unsigned short code = [event keyCode];
     int slot = -1;
 
     /* RECOMP_BACKGROUND: scripted runs take input from RECOMP_INPUT_SCRIPT only. */
     if (getenv("RECOMP_BACKGROUND"))
         return;
+
+    /* A key comes up as the slot it went down as. Mapping the keyUp by its
+     * character again lost it whenever a modifier changed in between -- L
+     * down, Option pressed, and the up arrived as a different character that
+     * matched no slot, leaving L held. */
+    if (!down && code < 256 && s_keycode_slot[code] >= 0) {
+        xbox_KeyboardReleaseSlot(s_keycode_slot[code]);
+        s_keycode_slot[code] = -1;
+        return;
+    }
 
     if (chars && [chars length] >= 1) {
         unichar u = [chars characterAtIndex:0];
@@ -746,8 +791,13 @@ static int init_metal(void)
         slot = xbox_KeyboardSlotForKeyCode((unsigned short)[event keyCode]);
 
     if (slot >= 0) {
-        if (down)  xbox_KeyboardPressSlot(slot);
-        else       xbox_KeyboardReleaseSlot(slot);
+        if (down) {
+            xbox_KeyboardPressSlot(slot);
+            if (code < 256)
+                s_keycode_slot[code] = (signed char)slot;
+        } else {
+            xbox_KeyboardReleaseSlot(slot);
+        }
     } else if (down) {
         [super keyDown:event];   /* let unbound keys fall through to defaults */
     }
@@ -869,10 +919,20 @@ static void *render_thread(void *unused)
         @autoreleasepool {
             render_frame();
         }
-        if (now_ms() - last_print > 1000) {
-            fprintf(stderr, "[FBWIN] frames_presented=%llu\n",
-                    (unsigned long long)s_fb_frames_presented);
+        if (now_ms() - last_print > 10000) {
+            /* The one line a quiet run keeps: whether the game is still
+             * producing frames (flips) as opposed to the window repainting
+             * the last one, and whether input is being read. */
+            extern unsigned xnv2a_flip_count(void) __attribute__((weak));
+            extern uint64_t g_f7_input_poll_count;
+            static unsigned last_flips;
+            unsigned flips = xnv2a_flip_count ? xnv2a_flip_count() : 0;
+            fprintf(stderr, "[STAT] game frames %u (%.1f/s), window frames %llu, input polls %llu\n",
+                    flips, (flips - last_flips) / ((now_ms() - last_print) / 1000.0),
+                    (unsigned long long)s_fb_frames_presented,
+                    (unsigned long long)g_f7_input_poll_count);
             fflush(stderr);
+            last_flips = flips;
             last_print = now_ms();
         }
         if (xbox_KeyboardAutostartPending() && s_pixels) {

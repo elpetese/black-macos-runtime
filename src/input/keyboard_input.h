@@ -74,6 +74,7 @@ int xbox_KeyboardSlotForKeyCode(unsigned short keycode);
  * active even when stdin is not a TTY (e.g. launched from a GUI). */
 void xbox_KeyboardPressSlot(int slot);
 void xbox_KeyboardReleaseSlot(int slot);
+void xbox_KeyboardReleaseAll(void);
 
 /* RECOMP_AUTOSTART support: nonzero while waiting for the title screen, and
  * the call the presenter makes when it sees it (presses Start once and starts
