@@ -46,6 +46,15 @@ add_subdirectory(src/apu)
 # GPU: NV2A hardware emulation (register handlers, MMIO, push buffer)
 add_subdirectory(src/nv2a)
 
+# xemu's NV2A renderer (OpenGL), macOS only for now. An OBJECT library: the
+# executable links it directly (see the game's CMakeLists), because its
+# renderer registers itself from a constructor a static archive would drop.
+# RECOMP_XEMU_GPU=1 at run time routes the pushbuffer through it.
+if(APPLE)
+    add_subdirectory(third_party/xemu_nv2a)
+    target_compile_definitions(xbox_kernel PRIVATE XBOX_HAVE_XEMU_NV2A=1)
+endif()
+
 # USB: MCPX OHCI host controllers. A title's XAPI is statically linked and
 # drives these registers directly, so a pad only exists if they do.
 add_subdirectory(src/usb)

@@ -617,7 +617,20 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             volatile uint32_t *get =
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
             if (*get != *put) {
-                *get = *put;
+                /* Walk what the title submitted BEFORE telling it the GPU
+                 * consumed it. GET is its licence to reuse that memory, and
+                 * walking afterwards read commands it had already begun
+                 * overwriting -- which xemu's PGRAPH, unlike the survey,
+                 * acts on (an enabled texture stage with no dimensions).
+                 * PUT and GET are physical; the contiguous window is the
+                 * physical view. */
+                uint32_t g = *get, p = *put;
+                if (s_nv2a_trace) {           /* wrapped (p < g) too */
+                    extern void nv2a_pb_scan(uint32_t, uint32_t);
+                    nv2a_pb_scan(XBOX_CONTIG_BASE | (g & 0x0FFFFFFFu),
+                                 XBOX_CONTIG_BASE | (p & 0x0FFFFFFFu));
+                }
+                *get = p;
             }
         }
         fence_mirrors_tick();
@@ -662,9 +675,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    if (last_put && put > last_put)
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                    /* The walk itself happens above, before GET advances. */
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */

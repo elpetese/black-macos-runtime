@@ -517,6 +517,11 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
 
+/* Set when xemu's PGRAPH renders (RECOMP_XEMU_GPU): this executor then keeps
+ * tracking surfaces and flips for the framebuffer window but writes no pixels,
+ * so the two never paint the same memory. */
+int g_pb_exec_no_draw;
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -536,7 +541,7 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
-    for (y = 0; y < s_gpu.clip_h; y++) {
+    for (y = 0; y < s_gpu.clip_h && !g_pb_exec_no_draw; y++) {
         uint8_t *row = mem + s_gpu.color_base
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
         if (bpp == 4) {
@@ -1875,7 +1880,7 @@ static void raster_batch(void)
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
 
-    if (s_gpu.idx_count < 3)
+    if (s_gpu.idx_count < 3 || g_pb_exec_no_draw)
         return;
     if (!batch_is_screen_space()) {
         if (!raster_batch_transformed())

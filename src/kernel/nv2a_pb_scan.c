@@ -42,6 +42,22 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+#if defined(XBOX_HAVE_XEMU_NV2A)
+extern int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
+                        uint32_t *params, size_t avail, int inc);
+extern int g_pb_exec_no_draw;
+/* RECOMP_XEMU_GPU: render through xemu's PGRAPH (third_party/xemu_nv2a). */
+static int xemu_gpu_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("RECOMP_XEMU_GPU") != NULL;
+        if (on)
+            g_pb_exec_no_draw = 1;
+    }
+    return on;
+}
+#endif
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 
@@ -152,19 +168,27 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
+    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va == start_va)
         return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
 
-    while (va < end_va && words < 0x100000u) {
+    /* Walk from GET to PUT the way the GPU does, following jumps: D3D's
+     * pushbuffer is a ring, and when it wraps PUT lies below GET with a JMP
+     * back to the start in between. Stopping at the jump, or skipping a
+     * wrapped segment, dropped every command in it -- texture and shader
+     * state included, which xemu's PGRAPH then used unset. */
+    while (va != end_va && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            /* Old-style (bit 0) and new-style (0x20000000) jumps both carry
+             * the physical target in the low bits. */
             jumps++;
-            break;                            /* a jump ends this segment */
+            if (jumps > 64)
+                break;
+            va = 0x80000000u | (w & 0x0FFFFFFCu);
+            continue;
         }
         if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
             continue;
@@ -174,17 +198,40 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            for (uint32_t i = 0; i < count && va != end_va; ) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
-                /* Same walk, two consumers: the survey counts, the executor
-                 * acts. Keeping them on one decode means they can never
-                 * disagree about what the stream said. */
-                if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
-                va += 4;
-                words++;
+                uint32_t take = 1;
+#if defined(XBOX_HAVE_XEMU_NV2A)
+                /* xemu's PGRAPH renders; it may consume several words of one
+                 * method at once (inline vertex data), so it is told how many
+                 * follow and says how many it took. */
+                if (xemu_gpu_enabled()) {
+                    uint32_t avail = count - i;
+                    if (end_va > va && (end_va - va) / 4 < avail)
+                        avail = (end_va - va) / 4;
+                    take = (uint32_t)xnv2a_method(subch, m,
+                                                  *(const uint32_t *)(mem + va),
+                                                  (uint32_t *)(mem + va), avail,
+                                                  !noninc);
+                    if (take < 1 || take > avail)
+                        take = 1;
+                }
+#endif
+                for (uint32_t k = 0; k < take; k++) {
+                    uint32_t mk = noninc ? method : method + (i + k) * 4;
+                    note(subch, mk);
+                    /* Same walk, two consumers: the survey counts, the
+                     * executor acts. With xemu rendering, the executor still
+                     * tracks surfaces and flips for the window, but draws
+                     * nothing (g_pb_exec_no_draw). */
+                    if (s_exec_enabled)
+                        nv2a_pb_exec_method(subch, mk,
+                                            *(const uint32_t *)(mem + va));
+                    va += 4;
+                    words++;
+                }
+                i += take;
+                (void)m;
             }
             continue;
         }
