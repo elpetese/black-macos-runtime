@@ -1632,6 +1632,12 @@ static void bridge_MmGetPhysicalAddress(void)
      * Just return the Xbox VA as-is. Don't call xbox_MmGetPhysicalAddress
      * which would return a native pointer. */
     g_eax = addr;
+    if (getenv("RECOMP_MMPHYS_LOG")) {
+        static unsigned n;
+        if (n++ < 40)
+            fprintf(stderr, "  [KERNEL] MmGetPhysicalAddress(0x%08X) from 0x%08X\n", addr,
+                    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + g_esp));
+    }
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */

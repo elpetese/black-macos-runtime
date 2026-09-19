@@ -179,6 +179,41 @@ static void thread_init(void)
 /* The flip completes as soon as it is asked for, as the runtime's own
  * executor already does: advance the read index to the write index, and put
  * what was rendered into guest memory, where the framebuffer window reads. */
+static struct {
+    unsigned draws, ztest, zwrite, zbound, aa, w, h, zpitch, zfmt;
+    uint32_t c0, setupraster, zclipmin, zclipmax, zoff, coff;
+    unsigned zfunc[8], clears, zclears;
+    uint32_t clear_param, zclear_value;
+} s_z;
+
+/* RECOMP_XEMU_DRAWLOG=<flip> logs that frame's draws; =L<n> logs the n-th
+ * frame with more than 300 draws, which lands in gameplay whatever the time
+ * the menus took. */
+static unsigned s_frame_draws, s_big_frames;
+extern uint32_t xbox_ContiguousAllocatedBytes(void);
+
+static int drawlog_this_frame(void)
+{
+    const char *e = getenv("RECOMP_XEMU_DRAWLOG");
+    if (!e)
+        return 0;
+    if (*e == 'L')
+        return s_big_frames == (unsigned)atoi(e + 1);
+    return (int)s_flips == atoi(e);
+}
+
+static int drawlog_active(void)
+{
+    static int cached = -1;
+    const char *e;
+    if (cached < 0)
+        cached = getenv("RECOMP_XEMU_DRAWLOG") != NULL;
+    if (!cached)
+        return 0;
+    e = getenv("RECOMP_XEMU_DRAWLOG");
+    return drawlog_this_frame();
+}
+
 static void complete_flip(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -188,6 +223,9 @@ static void complete_flip(NV2AState *d)
     pgraph_reg_w(pg, NV_PGRAPH_SURFACE, s);
     pg->waiting_for_flip = false;
     s_flips++;
+    if (s_frame_draws > 300)
+        s_big_frames++;
+    s_frame_draws = 0;
     {
         static int shown;
         if (shown < 6 && getenv("RECOMP_XEMU_VERBOSE")) {
@@ -201,6 +239,22 @@ static void complete_flip(NV2AState *d)
                         sb->color, sb->draw_dirty);
             fprintf(stderr, "\n");
         }
+    }
+    if (getenv("RECOMP_XEMU_ZLOG")) {
+        if ((s_flips % 60) == 0)
+            fprintf(stderr, "  [XZ] flip %u: %u draws, %u z-test, %u z-write, %u with zeta bound;"
+                    " last: control0=%08X setupraster=%08X zclip=[%08X,%08X] zeta off=%08X pitch=%u fmt=%u"
+                    " color off=%08X aa=%u clip %ux%u\n",
+                    s_flips, s_z.draws, s_z.ztest, s_z.zwrite, s_z.zbound, s_z.c0,
+                    s_z.setupraster, s_z.zclipmin, s_z.zclipmax, s_z.zoff, s_z.zpitch,
+                    s_z.zfmt, s_z.coff, s_z.aa, s_z.w, s_z.h);
+        if ((s_flips % 60) == 0)
+            fprintf(stderr, "  [XZ]   zfunc never/less/eq/lequal/greater/ne/gequal/always ="
+                    " %u %u %u %u %u %u %u %u; %u clears (%u with Z), last param %08X zclear %08X\n",
+                    s_z.zfunc[0], s_z.zfunc[1], s_z.zfunc[2], s_z.zfunc[3], s_z.zfunc[4],
+                    s_z.zfunc[5], s_z.zfunc[6], s_z.zfunc[7], s_z.clears, s_z.zclears,
+                    s_z.clear_param, s_z.zclear_value);
+        memset(&s_z, 0, sizeof s_z);
     }
     pgraph_gl_download_dirty_surfaces(d);
     if (getenv("RECOMP_XEMU_VERBOSE")) {
@@ -251,28 +305,96 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
                     " next 0x%08X 0x%08X\n", (method - 0x1B04) / 0x40, param, avail, inc,
                     avail > 1 ? params[1] : 0, avail > 2 ? params[2] : 0);
     }
+    /* RECOMP_XEMU_SKIP_COMPOSITE (debugging): drop full-screen draws made
+     * without a depth buffer during gameplay -- Black's blurred-copy
+     * composite -- to see the scene as the draws before it left it. */
+    {
+        static int skipping;
+        if (method == 0x17FC && getenv("RECOMP_XEMU_SKIP_COMPOSITE")) {
+            PGRAPHState *pg = &d->pgraph;
+            if (param != 0 && s_big_frames > 0 && pg->surface_zeta.offset == 0
+                && pg->surface_shape.clip_width == 640)
+                skipping = 1;
+            else if (param == 0 && skipping) {
+                skipping = 0;
+                return 1;
+            }
+        }
+        if (skipping)
+            return 1;
+    }
+    /* In the logged frame, the blend and depth methods as they arrive. */
+    if (drawlog_active() && subch == 0
+        && (method == 0x304 || method == 0x344 || method == 0x348 || method == 0x350
+            || method == 0x30C || method == 0x354 || method == 0x35C))
+        fprintf(stderr, "  [XM] %04X = %08X\n", method, param);
     qemu_mutex_lock(&d->pgraph.lock);
     n = pgraph_method(d, subch, method, param, params, avail, avail, inc != 0);
     /* RECOMP_XEMU_DRAWLOG=<flip>: PGRAPH's texture/shader state at each draw
      * of that frame, as xemu sees it (all four stages). */
-    if (method == 0x17FC && param == 0 && getenv("RECOMP_XEMU_DRAWLOG")
-        && (int)s_flips == atoi(getenv("RECOMP_XEMU_DRAWLOG"))) {
+    if (method == 0x17FC && param != 0)
+        s_frame_draws++;
+    if (method == 0x17FC && param == 0 && drawlog_this_frame()) {
         PGRAPHState *pg = &d->pgraph;
         static int idx;
-        fprintf(stderr, "  [XDRAW %d] shaderprog=%08X blend=%08X combctl=%08X",
-                idx++, pgraph_reg_r(pg, NV_PGRAPH_SHADERPROG),
+        fprintf(stderr, "  [XDRAW %d] color=%08X zeta=%08X c0=%08X clip %ux%u shaderprog=%08X blend=%08X combctl=%08X",
+                idx++, pg->surface_color.offset, pg->surface_zeta.offset,
+                pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0),
+                pg->surface_shape.clip_width, pg->surface_shape.clip_height,
+                pgraph_reg_r(pg, NV_PGRAPH_SHADERPROG),
                 pgraph_reg_r(pg, NV_PGRAPH_BLEND), pgraph_reg_r(pg, NV_PGRAPH_COMBINECTL));
         for (int t = 0; t < 4; t++)
             fprintf(stderr, " | t%d en=%d off=%08X fmt=%08X", t,
                     (pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + t * 4) >> 30) & 1,
                     pgraph_reg_r(pg, NV_PGRAPH_TEXOFFSET0 + t * 4),
                     pgraph_reg_r(pg, NV_PGRAPH_TEXFMT0 + t * 4));
+        fprintf(stderr, "\n        attrs:");
+        for (int k = 0; k < NV2A_VERTEXSHADER_ATTRIBUTES; k++) {
+            VertexAttribute *va = &pg->vertex_attributes[k];
+            if (va->count)
+                fprintf(stderr, " a%d=%c:%08X/%u", k, va->dma_select ? 'B' : 'A',
+                        (uint32_t)va->offset, va->stride);
+        }
+        fprintf(stderr, " dmaA=%08X dmaB=%08X contig_used=%08X",
+                (uint32_t)pg->dma_vertex_a, (uint32_t)pg->dma_vertex_b, xbox_ContiguousAllocatedBytes());
         fprintf(stderr, "\n        comb: ci0=%08X co0=%08X ai0=%08X ao0=%08X f0=%08X sf0=%08X sf1=%08X ci1=%08X ai1=%08X\n",
                 pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORI0), pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORO0),
                 pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAI0), pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAO0),
                 pgraph_reg_r(pg, NV_PGRAPH_COMBINEFACTOR0), pgraph_reg_r(pg, NV_PGRAPH_COMBINESPECFOG0),
                 pgraph_reg_r(pg, NV_PGRAPH_COMBINESPECFOG1), pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORI0 + 4),
                 pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAI0 + 4));
+    }
+    /* RECOMP_XEMU_ZLOG: per frame, how the draws use depth -- how many test
+     * it, how many write it, and whether a zeta surface was bound -- printed
+     * every 60 flips. */
+    if (method == 0x17FC && param != 0 && getenv("RECOMP_XEMU_ZLOG")) {
+        PGRAPHState *pg = &d->pgraph;
+        PGRAPHGLState *r = pg->gl_renderer_state;
+        uint32_t c0 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0);
+        s_z.draws++;
+        if (c0 & NV_PGRAPH_CONTROL_0_ZENABLE)
+            s_z.zfunc[(c0 >> 16) & 7]++;
+        if (c0 & NV_PGRAPH_CONTROL_0_ZENABLE) s_z.ztest++;
+        if (c0 & NV_PGRAPH_CONTROL_0_ZWRITEENABLE) s_z.zwrite++;
+        if (r && r->zeta_binding) s_z.zbound++;
+        s_z.c0 = c0;
+        s_z.zoff = pg->surface_zeta.offset;
+        s_z.zpitch = pg->surface_zeta.pitch;
+        s_z.zfmt = pg->surface_shape.zeta_format;
+        s_z.coff = pg->surface_color.offset;
+        s_z.aa = pg->surface_shape.anti_aliasing;
+        s_z.w = pg->surface_shape.clip_width;
+        s_z.h = pg->surface_shape.clip_height;
+        s_z.setupraster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+        s_z.zclipmax = pgraph_reg_r(pg, NV_PGRAPH_ZCLIPMAX);
+        s_z.zclipmin = pgraph_reg_r(pg, NV_PGRAPH_ZCLIPMIN);
+    }
+    if (method == 0x1D94 && getenv("RECOMP_XEMU_ZLOG")) {
+        s_z.clears++;
+        if (param & 1)
+            s_z.zclears++;
+        s_z.clear_param = param;
+        s_z.zclear_value = pgraph_reg_r(&d->pgraph, NV_PGRAPH_ZSTENCILCLEARVALUE);
     }
     /* Nothing services PGRAPH interrupts here -- on hardware the title's
      * driver acknowledges them from its ISR -- so acknowledge them now, and
