@@ -364,6 +364,131 @@ static int build_candidates(SurfaceCandidate *candidates, int *count)
     return n;
 }
 
+/* The NV2A video overlay (PVIDEO), composited the way the display hardware
+ * does it and xemu's display shader does (hw/xbox/nv2a/pgraph/gl/display.c):
+ * a YUY2 frame in GPU memory, scaled into an output rectangle, drawn where the
+ * framebuffer holds the colour key. XMV playback puts its frames here rather
+ * than through the 3D pipeline, so without this every video -- the title's,
+ * the menus' backgrounds, the cut-scenes -- is the black key rectangle.
+ *
+ * Registers are read where the title wrote them: the PVIDEO block of the
+ * aperture (0xFD008000). Frame data is physical memory, which is the
+ * contiguous window. */
+#define PVIDEO_VA            0xFD008000u
+#define PVIDEO_BUFFER        0x0700
+#define PVIDEO_STOP          0x0704
+#define PVIDEO_BASE          0x0900
+#define PVIDEO_LIMIT         0x0908
+#define PVIDEO_OFFSET        0x0920
+#define PVIDEO_SIZE_IN       0x0928
+#define PVIDEO_POINT_IN      0x0930
+#define PVIDEO_DS_DX         0x0938
+#define PVIDEO_DT_DY         0x0940
+#define PVIDEO_POINT_OUT     0x0948
+#define PVIDEO_SIZE_OUT      0x0950
+#define PVIDEO_FORMAT        0x0958
+#define PVIDEO_COLOR_KEY     0x0B00
+#define PVIDEO_UNITY         0x00100000u
+
+static uint32_t pvideo_reg(uint32_t r)
+{
+    return *(volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset() + PVIDEO_VA + r);
+}
+
+static float pvideo_scale(uint32_t din_dout, uint32_t out_size)
+{
+    float in = floorf((float)din_dout * (float)(out_size - 1) / (float)(1u << 20) + 0.5f);
+    return (in + 1.0f) / (float)out_size;
+}
+
+static inline uint8_t clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
+
+static void composite_pvideo(uint32_t *dst)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t buffer, size_in, format, key;
+    int in_w, in_h, pitch, out_x, out_y, out_w, out_h, key_on;
+    float sx = 1.0f, sy = 1.0f, in_s, in_t;
+    const uint8_t *src;
+
+    /* STOP with bit 0 tears the overlay down; in plain memory that write
+     * would just sit there, so act on it and consume it. */
+    if (pvideo_reg(PVIDEO_STOP) & 1u) {
+        *(volatile uint32_t *)(mem + PVIDEO_VA + PVIDEO_BUFFER) = 0;
+        *(volatile uint32_t *)(mem + PVIDEO_VA + PVIDEO_STOP) = 0;
+    }
+    buffer = pvideo_reg(PVIDEO_BUFFER);
+    size_in = pvideo_reg(PVIDEO_SIZE_IN);
+    if (getenv("RECOMP_PVIDEO_DEBUG")) {
+        static uint64_t last;
+        if (now_ms() - last > 3000) {
+            last = now_ms();
+            fprintf(stderr, "  [PVIDEO] buffer=%08X stop=%08X base=%08X off=%08X size_in=%08X"
+                    " point_in=%08X size_out=%08X point_out=%08X format=%08X key=%08X\n",
+                    buffer, pvideo_reg(PVIDEO_STOP), pvideo_reg(PVIDEO_BASE),
+                    pvideo_reg(PVIDEO_OFFSET), size_in, pvideo_reg(PVIDEO_POINT_IN),
+                    pvideo_reg(PVIDEO_SIZE_OUT), pvideo_reg(PVIDEO_POINT_OUT),
+                    pvideo_reg(PVIDEO_FORMAT), pvideo_reg(PVIDEO_COLOR_KEY));
+        }
+    }
+    if (!(buffer & 1u) || size_in == 0xFFFFFFFFu)
+        return;
+
+    format = pvideo_reg(PVIDEO_FORMAT);
+    pitch = (int)(format & 0x1FFF);
+    in_w = (int)(size_in & 0x7FF);
+    in_h = (int)((size_in >> 16) & 0x7FF);
+    out_x = (int)(pvideo_reg(PVIDEO_POINT_OUT) & 0xFFF);
+    out_y = (int)((pvideo_reg(PVIDEO_POINT_OUT) >> 16) & 0xFFF);
+    out_w = (int)(pvideo_reg(PVIDEO_SIZE_OUT) & 0xFFF);
+    out_h = (int)((pvideo_reg(PVIDEO_SIZE_OUT) >> 16) & 0xFFF);
+    if (!out_w || !out_h || !pitch)
+        return;
+    if (pvideo_reg(PVIDEO_DS_DX) != PVIDEO_UNITY)
+        sx = pvideo_scale(pvideo_reg(PVIDEO_DS_DX), (uint32_t)out_w);
+    if (pvideo_reg(PVIDEO_DT_DY) != PVIDEO_UNITY)
+        sy = pvideo_scale(pvideo_reg(PVIDEO_DT_DY), (uint32_t)out_h);
+    if (in_w > out_w) in_w = (int)floorf((float)out_w * sx + 0.5f);
+    if (in_h > out_h) in_h = (int)floorf((float)out_h * sy + 0.5f);
+    if (in_w <= 0 || in_h <= 0)
+        return;
+    in_s = (float)(pvideo_reg(PVIDEO_POINT_IN) & 0x7FFF) / 16.0f;
+    in_t = (float)(pvideo_reg(PVIDEO_POINT_IN) >> 17) / 8.0f;
+    key_on = (format >> 20) & 1;
+    key = pvideo_reg(PVIDEO_COLOR_KEY) & 0xFFFFFFu;
+
+    {
+        uint64_t phys = ((uint64_t)pvideo_reg(PVIDEO_BASE) + pvideo_reg(PVIDEO_OFFSET)) & 0x07FFFFFFu;
+        uint32_t va = 0x80000000u | (uint32_t)phys;
+        if (!xbox_IsXboxAddress(va) || !xbox_IsXboxAddress(va + (uint32_t)(pitch * in_h) - 1))
+            return;
+        src = mem + va;
+    }
+
+    for (int y = out_y; y < out_y + out_h && y < (int)s_height; y++) {
+        int ty = (int)(in_t + (float)(y - out_y) * sy);
+        if (ty < 0 || ty >= in_h)
+            continue;
+        const uint8_t *line = src + (size_t)ty * (size_t)pitch;
+        uint32_t *row = dst + (size_t)y * s_width;
+        for (int x = out_x; x < out_x + out_w && x < (int)s_width; x++) {
+            int tx = (int)(in_s + (float)(x - out_x) * sx);
+            if (tx < 0 || tx >= in_w)
+                continue;
+            if (key_on && (row[x] & 0xFFFFFFu) != key)
+                continue;
+            /* LE_CR8YB8CB8YA8: Y0 Cb Y1 Cr per pixel pair (YUY2). */
+            const uint8_t *pair = line + (size_t)(tx & ~1) * 2;
+            int Y = pair[(tx & 1) ? 2 : 0] - 16, U = pair[1] - 128, V = pair[3] - 128;
+            int r = (298 * Y + 409 * V + 128) >> 8;
+            int g = (298 * Y - 100 * U - 208 * V + 128) >> 8;
+            int b = (298 * Y + 516 * U + 128) >> 8;
+            row[x] = 0xFF000000u | ((uint32_t)clamp8(r) << 16)
+                   | ((uint32_t)clamp8(g) << 8) | clamp8(b);
+        }
+    }
+}
+
 static int update_pixels(void)
 {
     uint32_t fb_va, pitch, bpp;
@@ -458,6 +583,9 @@ static int update_pixels(void)
         }
     }
 
+    if (bpp == 4)
+        composite_pvideo((uint32_t *)s_pixels);
+
     pthread_mutex_unlock(&s_pixels_lock);
     return 1;
 }
@@ -528,8 +656,10 @@ static const char *shader_source =
     "fragment float4 fs(Out in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
     "  constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);\n"
     "  float4 t = tex.sample(s, in.uv);\n"
-    "  if (t.x == 0 && t.y == 0 && t.z == 0) return float4(in.uv, 1.0, 1.0);\n"
-    "  return t;\n"
+    /* Black is black. This used to substitute a UV gradient for every pure
+     * black texel, a bring-up aid that showed "nothing presented" at a
+     * glance -- and, once titles render, painted it over every dark pixel. */
+    "  return float4(t.rgb, 1.0);\n"
     "}\n";
 
 static int init_metal(void)
