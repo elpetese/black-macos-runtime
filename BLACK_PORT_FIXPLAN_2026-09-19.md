@@ -262,3 +262,46 @@ python3 scripts/profile-summary.py ~/black-runs/m3.profile_level.txt 30
 ```
 
 Confirma a la vez la corrección del vblank (punto 2) y quién activa la espera de GPU ociosa (punto 1).
+
+---
+
+## 7. Auditoría estática del 20/09 (sin ejecutar el juego)
+
+Revisión sistemática del ejecutable y del C generado, por **clases** de error (las que ya habían causado fallos), no caso a caso.
+
+| Clase | Qué se buscó | Resultado |
+|---|---|---|
+| 1. Argumentos de las llamadas al kernel | Las 89 funciones del kernel que usa Black, contra sus prototipos reales | **Todas correctas.** Las entradas "sin tabla" son exportaciones de datos (`XboxHardwareInfo`, `LaunchDataPage`…). |
+| 2. Esperas sobre registros de hardware (apertura = RAM) | Todos los bucles cortos que leen registros NV2A | Las esperas de "GPU ociosa" terminan al instante (la RAM da 0 = ocioso). **Problemas reales:** el KickOff (`0x100410`) y el vblank (`PMC_INTR_0`/`PCRTC_INTR_0`), más el canal de interrupciones por software (abajo). |
+| 3. Flags que cruzan funciones | Saltos que usan flags del llamador o de la función llamada | 2 casos reales, ambos en la librería matemática de C (`0xA3F09`/`0xA3FD5` acos/asin, `0xA35A4`): usan flags de `0xA6F6C`/`0xA6F29` (exponente Inf/NaN). **Solo afecta a Inf/NaN.** Pendiente (baja prioridad): soporte en el lifter. |
+| 4. Instrucciones sin traducir en código real | `TODO` del lifter en funciones referenciadas | La mayoría son datos desensamblados como código. Reales: `cli`/`sti` en DirectSound (`0x280D9F`, una lectura cortísima), `ldmxcsr`/`stmxcsr` (`0x2B480`, modo SSE, efecto menor), y un parche de XAPI al kernel (`0x26F0D`) que no aplica al port. **Nada grave.** |
+
+### Hallazgo principal: los registros de interrupción de la GPU no tenían la semántica del hardware
+
+- En la Xbox, `PGRAPH_INTR`, `PCRTC_INTR_0`, `PFIFO_INTR_0` y `PBUS_INTR_0` se borran **escribiendo 1**, y `PMC_INTR_0` es el **resumen** de los pendientes de cada unidad. En el port eran RAM y un hilo los ponía a 0 periódicamente. Consecuencias:
+  - el DPC de vblank de D3D gira hasta ese borrado periódico (68–74 % de un hilo);
+  - borrarlos antes de tiempo rompió el arranque (la ventana en blanco del 20/09).
+- **Las interrupciones por software de la GPU se descartaban.** D3D usa `NO_OPERATION` con parámetro para que la GPU le avise. El manejador del juego (`0x273EA0` → `0x2740F0`, tabla de saltos en `0x274304`) hace:
+  - **1:** contabilidad del Swap y callback de swap;
+  - **5:** `KeSetEvent` del evento de espera de fences. `sub_0026CC10` espera ese evento **sin límite de tiempo** cuando la GPU va lejos: **candidato a los cuelgues**;
+  - **12/13:** `InsertCallback`;
+  - **8:** escritura de registros RDI (el `0x28` del arranque).
+- **Corrección** (commit de este apartado, **pendiente de ejecutar**):
+  - las tres páginas de 16 KB (`0xFD000000`, `0xFD400000`, `0xFD600000`) se interceptan y se sirven desde una copia con semántica real: borrado al escribir 1 y `PMC_INTR_0` calculado;
+  - el vblank activa su bit con `xbox_Nv2aIntrRaise` y queda pendiente hasta que el juego lo reconoce;
+  - los `NO_OPERATION` con parámetro se pasan al ISR del juego desde el hilo temporizador, que se despierta al momento; la GPU espera el reconocimiento (máximo 200 ms, después se descarta con aviso);
+  - el hilo rápido de bits "ocupado" ya **no** toca los registros de interrupción. Lo hacía con la tabla anterior y habría repetido el fallo de la ventana en blanco.
+  - Desactivable con `RECOMP_NV2A_IRQ=0` (vuelve al comportamiento anterior).
+
+### Otras observaciones
+
+- Crash al final de los vídeos (`sub_0013DD20`): recorre un array de objetos de sonido (`[ebp+i*8]`, contador `[ebp+0x1C]`) y lee un puntero basura. Con el código solo no se distingue entre una entrada no inicializada y una modificada por otro hilo. Varios arreglos de hilos del 19–20/09 atacan ese tipo de carrera; **medir**.
+
+### Verificación pendiente (una sola ejecución)
+
+```sh
+cd black-recomp && scripts/diag-level.sh v1 600
+# esperar: log con "NV2A interrupt registers: emulated"; ningún "[HANG]";
+# [STAT] del nivel > 14 fps; perfil sin sub_00273C40 ni sub_0026CF10 dominando
+```
+Si algo falla: `RECOMP_NV2A_IRQ=0` aísla el cambio de los registros; el hilo de bits "ocupado" es independiente.

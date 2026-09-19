@@ -638,18 +638,235 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* ── NV2A interrupt registers with hardware semantics ─────────────────
+ *
+ * The aperture is plain RAM, and three things the title does depend on the
+ * difference:
+ *   - the status registers are write-1-to-clear: an ISR acknowledges by writing
+ *     back what it read, and D3D's vblank DPC spins until PMC_INTR_0 drops the
+ *     PCRTC bit after that write -- in RAM it stayed up until a periodic
+ *     zeroing, 68-74% of the timer thread in Black's level;
+ *   - PMC_INTR_0 is not a register but the OR of the units' pending bits;
+ *   - the GPU interrupts D3D for software methods (NO_OPERATION with a
+ *     parameter): fence wake-ups, swap bookkeeping, InsertCallback. Those were
+ *     dropped, so a wait on the fence event had nothing to end it.
+ * The three 16 KB pages holding these registers are intercepted (the same
+ * mechanism as the APU/AC97/USB) and served from a shadow copy. POSIX/arm64
+ * only; elsewhere, and with RECOMP_NV2A_IRQ=0, the old plain-RAM behaviour. */
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <time.h>
+#define NV2A_IRQ_PAGE  0x4000u
+static const uint32_t NV2A_IRQ_PAGES[3] = { 0x000000u, 0x400000u, 0x600000u };
+static uint32_t g_nv2a_irq_shadow[3][NV2A_IRQ_PAGE / 4];
+static int g_nv2a_irq_on;
+static pthread_mutex_t g_nv2a_irq_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define NV2A_PMC_INTR_0     0x000100u
+#define NV2A_PBUS_INTR_0    0x001100u
+#define NV2A_PFIFO_INTR_0   0x002100u
+#define NV2A_PGRAPH_INTR    0x400100u
+#define NV2A_PGRAPH_NSOURCE 0x400108u
+#define NV2A_PGRAPH_TRAPPED_ADDR 0x400704u
+#define NV2A_PGRAPH_TRAPPED_DATA 0x400708u
+#define NV2A_PCRTC_INTR_0   0x600100u
+
+static int nv2a_irq_page(uint32_t off)
+{
+    for (int i = 0; i < 3; i++)
+        if (off >= NV2A_IRQ_PAGES[i] && off < NV2A_IRQ_PAGES[i] + NV2A_IRQ_PAGE)
+            return i;
+    return -1;
+}
+
+static int nv2a_irq_owns(uint32_t off)
+{
+    return nv2a_irq_page(off) >= 0;
+}
+
+static uint32_t *nv2a_irq_slot(uint32_t off)
+{
+    int p = nv2a_irq_page(off);
+    return p < 0 ? NULL : &g_nv2a_irq_shadow[p][(off - NV2A_IRQ_PAGES[p]) / 4];
+}
+
+static int nv2a_irq_w1c(uint32_t off)
+{
+    return off == NV2A_PBUS_INTR_0 || off == NV2A_PFIFO_INTR_0
+        || off == NV2A_PGRAPH_INTR || off == NV2A_PCRTC_INTR_0;
+}
+
+/* PMC_INTR_0 as the units report it. */
+static uint32_t nv2a_irq_pmc(void)
+{
+    uint32_t v = 0;
+    if (*nv2a_irq_slot(NV2A_PFIFO_INTR_0))  v |= 1u << 8;
+    if (*nv2a_irq_slot(NV2A_PGRAPH_INTR))   v |= 1u << 12;
+    if (*nv2a_irq_slot(NV2A_PBUS_INTR_0))   v |= 1u << 28;
+    if (*nv2a_irq_slot(NV2A_PCRTC_INTR_0) & 1u) v |= 1u << 24;
+    return v;
+}
+
+static uint64_t nv2a_irq_read(void *ctx, uint32_t offset, unsigned size)
+{
+    uint32_t off = NV2A_IRQ_PAGES[(uintptr_t)ctx] + offset;
+    uint32_t word, v;
+    pthread_mutex_lock(&g_nv2a_irq_lock);
+    word = (off & ~3u) == NV2A_PMC_INTR_0 ? nv2a_irq_pmc() : *nv2a_irq_slot(off & ~3u);
+    pthread_mutex_unlock(&g_nv2a_irq_lock);
+    v = word >> ((off & 3u) * 8u);
+    if (size == 1) return v & 0xFFu;
+    if (size == 2) return v & 0xFFFFu;
+    return v;
+}
+
+static void nv2a_irq_write(void *ctx, uint32_t offset, uint64_t value, unsigned size)
+{
+    uint32_t off = NV2A_IRQ_PAGES[(uintptr_t)ctx] + offset;
+    uint32_t word_off = off & ~3u, shift = (off & 3u) * 8u;
+    uint32_t mask = size >= 4 ? 0xFFFFFFFFu : (((1u << (size * 8u)) - 1u) << shift);
+    uint32_t val = (uint32_t)(value << shift) & mask;
+    uint32_t *slot;
+
+    if (word_off == NV2A_PMC_INTR_0)
+        return;                                 /* read-only summary */
+    pthread_mutex_lock(&g_nv2a_irq_lock);
+    slot = nv2a_irq_slot(word_off);
+    if (nv2a_irq_w1c(word_off))
+        *slot &= ~val;                          /* write 1 to clear */
+    else
+        *slot = (*slot & ~mask) | val;
+    pthread_mutex_unlock(&g_nv2a_irq_lock);
+}
+
+/* Raise pending bits from the runtime side (a device model, not the title). */
+void xbox_Nv2aIntrRaise(uint32_t off, uint32_t bits)
+{
+    if (!g_nv2a_irq_on) {
+        *(volatile uint32_t *)((char *)g_nv2a_memory + off) |= bits;
+        return;
+    }
+    pthread_mutex_lock(&g_nv2a_irq_lock);
+    *nv2a_irq_slot(off) |= bits;
+    pthread_mutex_unlock(&g_nv2a_irq_lock);
+}
+
+int xbox_Nv2aIrqEmulated(void)
+{
+    return g_nv2a_irq_on;
+}
+
+uint32_t xbox_Nv2aRegPeek(uint32_t off)
+{
+    uint32_t v;
+    if (!g_nv2a_irq_on || !nv2a_irq_owns(off))
+        return *(volatile uint32_t *)((char *)g_nv2a_memory + off);
+    pthread_mutex_lock(&g_nv2a_irq_lock);
+    v = off == NV2A_PMC_INTR_0 ? nv2a_irq_pmc() : *nv2a_irq_slot(off);
+    pthread_mutex_unlock(&g_nv2a_irq_lock);
+    return v;
+}
+
+/* A software method: hand the title's GPU interrupt handler what xemu trapped
+ * and wait for it to acknowledge, as PFIFO does on hardware (the pushbuffer
+ * stays stalled meanwhile). Returns 1 if the title acknowledged. */
+extern void xbox_KernelRequestNv2aInterrupt(void);
+int xbox_Nv2aSoftwareInterrupt(uint32_t trapped_addr, uint32_t trapped_data,
+                               uint32_t nsource)
+{
+    struct timespec w = { 0, 50000 };
+    int i;
+
+    if (!g_nv2a_irq_on)
+        return 0;
+    pthread_mutex_lock(&g_nv2a_irq_lock);
+    *nv2a_irq_slot(NV2A_PGRAPH_TRAPPED_ADDR) = trapped_addr;
+    *nv2a_irq_slot(NV2A_PGRAPH_TRAPPED_DATA) = trapped_data;
+    *nv2a_irq_slot(NV2A_PGRAPH_NSOURCE)      = nsource;
+    *nv2a_irq_slot(NV2A_PGRAPH_INTR)        |= 1u << 20;   /* ERROR */
+    pthread_mutex_unlock(&g_nv2a_irq_lock);
+    xbox_KernelRequestNv2aInterrupt();
+    for (i = 0; i < 4000; i++) {                /* 200 ms */
+        uint32_t pending;
+        pthread_mutex_lock(&g_nv2a_irq_lock);
+        pending = *nv2a_irq_slot(NV2A_PGRAPH_INTR) & (1u << 20);
+        pthread_mutex_unlock(&g_nv2a_irq_lock);
+        if (!pending)
+            return 1;
+        nanosleep(&w, NULL);
+    }
+    {
+        static int warned;
+        if (warned++ < 5) {
+            fprintf(stderr, "  [NV2A] software method 0x%08X param 0x%08X not acknowledged"
+                    " in 200 ms; dropping it\n", trapped_addr, trapped_data);
+            fflush(stderr);
+        }
+    }
+    pthread_mutex_lock(&g_nv2a_irq_lock);
+    *nv2a_irq_slot(NV2A_PGRAPH_INTR) &= ~(1u << 20);
+    pthread_mutex_unlock(&g_nv2a_irq_lock);
+    return 0;
+}
+
+static void nv2a_irq_start(void)
+{
+#if !defined(_WIN32) && defined(__aarch64__)
+    const char *e = getenv("RECOMP_NV2A_IRQ");
+    static const char *names[3] = { "NV2A PMC/PFIFO", "NV2A PGRAPH", "NV2A PCRTC" };
+    int ok = 1;
+
+    if ((e && e[0] == '0') || sysconf(_SC_PAGESIZE) > (long)NV2A_IRQ_PAGE)
+        return;
+    for (int i = 0; i < 3; i++)
+        memcpy(g_nv2a_irq_shadow[i], (char *)g_nv2a_memory + NV2A_IRQ_PAGES[i], NV2A_IRQ_PAGE);
+    for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++)
+        if (nv2a_irq_owns(NV2A_IDLE[i].offset))
+            *nv2a_irq_slot(NV2A_IDLE[i].offset) |= NV2A_IDLE[i].idle_mask;
+    for (int i = 0; i < 3; i++)
+        if (!xbox_mmio_intercept(XBOX_NV2A_BASE + NV2A_IRQ_PAGES[i], NV2A_IRQ_PAGE,
+                                 nv2a_irq_read, nv2a_irq_write,
+                                 (void *)(uintptr_t)i, names[i]))
+            ok = 0;
+    g_nv2a_irq_on = ok;
+    fprintf(stderr, "  NV2A interrupt registers: %s\n",
+            ok ? "emulated (write-1-to-clear, PMC summary, software methods)"
+               : "NOT emulated (intercept failed)");
+#endif
+}
+
+#else /* _WIN32: plain RAM, as before */
+static const int g_nv2a_irq_on = 0;
+static int nv2a_irq_owns(uint32_t off) { (void)off; return 0; }
+static void nv2a_irq_start(void) {}
+void xbox_Nv2aIntrRaise(uint32_t off, uint32_t bits)
+{ *(volatile uint32_t *)((char *)g_nv2a_memory + off) |= bits; }
+int xbox_Nv2aIrqEmulated(void) { return 0; }
+uint32_t xbox_Nv2aRegPeek(uint32_t off)
+{ return *(volatile uint32_t *)((char *)g_nv2a_memory + off); }
+int xbox_Nv2aSoftwareInterrupt(uint32_t a, uint32_t d, uint32_t n)
+{ (void)a; (void)d; (void)n; return 0; }
+#endif
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            volatile uint32_t *r;
+            /* With the interrupt registers emulated (nv2a_irq_*), their
+             * pending bits are cleared by the title's own acknowledgement,
+             * as on hardware, and must not be zeroed behind its back. */
+            if (g_nv2a_irq_on && nv2a_irq_owns(NV2A_ACK[i].offset))
+                continue;
+            r = (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+            if (g_nv2a_irq_on && nv2a_irq_owns(NV2A_IDLE[i].offset))
+                continue;           /* set once in the shadow, see nv2a_irq_start */
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
             if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
@@ -751,7 +968,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         }
         if (s_nv2a_trace) {
             static uint32_t last_start = 0xFFFFFFFFu;
-            uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
+            uint32_t start = xbox_Nv2aRegPeek(0x600800);
             if (start != last_start) {
                 last_start = start;
                 fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
@@ -803,8 +1020,14 @@ static DWORD WINAPI nv2a_busy_ack_thread(LPVOID param)
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_busy_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            volatile uint32_t *r;
+            /* Busy bits only. The interrupt status registers share the table
+             * (mask 0xFFFFFFFF) and must not be cleared this fast: D3D reads
+             * them after raising, and clearing them within microseconds is
+             * what broke its startup (the white window). */
+            if (NV2A_ACK[i].busy_mask == 0xFFFFFFFFu)
+                continue;
+            r = (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
             if (*r & NV2A_ACK[i].busy_mask)
                 *r &= ~NV2A_ACK[i].busy_mask;
         }
@@ -823,6 +1046,7 @@ static DWORD WINAPI nv2a_busy_ack_thread(LPVOID param)
 static void xbox_Nv2aAckStart(void)
 {
     g_nv2a_ack_stop = 0;
+    nv2a_irq_start();
     {
         HANDLE h = CreateThread(NULL, 0, nv2a_busy_ack_thread, g_nv2a_memory, 0, NULL);
         if (h)

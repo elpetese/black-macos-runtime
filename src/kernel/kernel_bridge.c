@@ -2044,8 +2044,11 @@ static void kernel_vblank_tick(void)
         return;
 
     g_vblank_count++;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    /* Pending until the title acknowledges it (write-1-to-clear, emulated in
+     * xbox_memory_layout.c); PMC_INTR_0 then follows by itself. */
+    xbox_Nv2aIntrRaise(NV2A_PCRTC_INTR_0, NV2A_PCRTC_INTR_VBLANK);
+    if (!xbox_Nv2aIrqEmulated())
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) |= NV2A_PMC_INTR_PCRTC;
 
     {
         static unsigned n;
@@ -2337,6 +2340,20 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+/* A GPU software method waiting for the title's interrupt handler (see
+ * xbox_Nv2aSoftwareInterrupt). The timer thread delivers it -- it owns a guest
+ * stack and TIB and already delivers the vblank -- and is woken for it rather
+ * than left to its 10 ms tick, since the pushbuffer is stalled meanwhile. */
+static volatile LONG g_nv2a_swint_request;
+static HANDLE g_timer_wake;
+
+void xbox_KernelRequestNv2aInterrupt(void)
+{
+    InterlockedExchange(&g_nv2a_swint_request, 1);
+    if (g_timer_wake)
+        SetEvent(g_timer_wake);
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2364,11 +2381,19 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    g_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
     for (;;) {
         long long now;
         int i;
 
-        Sleep(10);
+        if (g_timer_wake)
+            WaitForSingleObject(g_timer_wake, 10);
+        else
+            Sleep(10);
+        if (InterlockedExchange(&g_nv2a_swint_request, 0)) {
+            kernel_raise_interrupt(NV2A_VECTOR);
+            kernel_drain_dpcs();
+        }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_ac97_tick();    /* the audio clock */
         kernel_irq_sources_tick();

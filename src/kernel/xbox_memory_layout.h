@@ -523,4 +523,13 @@ void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline 
 #define XBOX_THREAD_MODE_SPAWN  1
 void xbox_SetThreadMode(int mode);
 
+/* NV2A interrupt registers (xbox_memory_layout.c): raise pending bits from a
+ * device model, read a register as the title would, and hand a GPU software
+ * method to the title's interrupt handler (returns 1 once acknowledged). */
+void     xbox_Nv2aIntrRaise(uint32_t offset, uint32_t bits);
+int      xbox_Nv2aIrqEmulated(void);
+uint32_t xbox_Nv2aRegPeek(uint32_t offset);
+int      xbox_Nv2aSoftwareInterrupt(uint32_t trapped_addr, uint32_t trapped_data,
+                                    uint32_t nsource);
+
 #endif /* XBOX_MEMORY_LAYOUT_H */

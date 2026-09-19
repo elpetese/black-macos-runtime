@@ -198,6 +198,10 @@ static struct {
  * frame with more than 300 draws, which lands in gameplay whatever the time
  * the menus took. */
 static unsigned s_frame_draws, s_big_frames;
+/* The runtime's side of GPU software methods (xbox_memory_layout.c). Weak, so
+ * the renderer still links into a host that does not provide it. */
+extern int xbox_Nv2aSoftwareInterrupt(uint32_t trapped_addr, uint32_t trapped_data,
+                                      uint32_t nsource) __attribute__((weak));
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
 static int drawlog_this_frame(void)
@@ -433,10 +437,34 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
         s_z.clear_param = param;
         s_z.zclear_value = pgraph_reg_r(&d->pgraph, NV_PGRAPH_ZSTENCILCLEARVALUE);
     }
-    /* Nothing services PGRAPH interrupts here -- on hardware the title's
-     * driver acknowledges them from its ISR -- so acknowledge them now, and
-     * say which method raised an error, once per method. */
+    /* A software method -- NO_OPERATION with a parameter. D3D uses these to be
+     * called back by the GPU: fence wake-ups (5), swap bookkeeping (1),
+     * InsertCallback (12, 13). On hardware PFIFO stalls, the title's GPU ISR
+     * reads TRAPPED_ADDR/DATA and acknowledges. Hand it over the same way
+     * when the runtime emulates the interrupt registers; the pushbuffer waits
+     * here until the title has handled it. Dropping them, as this used to,
+     * left a D3D wait on the fence event with nothing to end it. */
+    if ((d->pgraph.pending_interrupts & NV_PGRAPH_INTR_ERROR) && method == 0x100
+        && xbox_Nv2aSoftwareInterrupt) {
+        PGRAPHState *pg = &d->pgraph;
+        uint32_t ta = pgraph_reg_r(pg, NV_PGRAPH_TRAPPED_ADDR);
+        uint32_t td = pgraph_reg_r(pg, NV_PGRAPH_TRAPPED_DATA_LOW);
+        uint32_t ns = pgraph_reg_r(pg, NV_PGRAPH_NSOURCE);
+        int handled;
+
+        qemu_mutex_unlock(&pg->lock);
+        handled = xbox_Nv2aSoftwareInterrupt(ta, td, ns);
+        qemu_mutex_lock(&pg->lock);
+        if (handled) {
+            pg->pending_interrupts &= ~NV_PGRAPH_INTR_ERROR;
+            pg->waiting_for_nop = false;
+        }
+    }
+    /* Anything else nothing here services -- on hardware the title's driver
+     * acknowledges it from its ISR -- is acknowledged now, and the method
+     * that raised an error named once. */
     if (d->pgraph.pending_interrupts) {
+        d->pgraph.waiting_for_nop = false;
         if (d->pgraph.pending_interrupts & NV_PGRAPH_INTR_ERROR) {
             static uint32_t seen[64]; static int nseen;
             int k;
