@@ -19,6 +19,8 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 
+const char *nv2a_profile_get_counter_name(unsigned int cnt);
+
 NV2AStats g_nv2a_stats;
 
 void nv2a_profile_increment(void)
@@ -39,12 +41,42 @@ void nv2a_profile_increment(void)
     }
 }
 
+/* xboxrecomp: xemu shows these counters in its debug UI, which this host does
+ * not have. RECOMP_XEMU_PROF=N prints the non-zero ones every N frames, so the
+ * per-frame shape of a scene (draws, texture uploads, buffer updates, surface
+ * downloads) can be read from a run's log instead of guessed at. */
+static void xboxrecomp_profile_report(void)
+{
+    static int every = -1;
+    static int64_t seen;
+
+    if (every < 0) {
+        const char *s = getenv("RECOMP_XEMU_PROF");
+        every = s ? atoi(s) : 0;
+        if (s && every <= 0)
+            every = 300;
+    }
+    if (!every || (++seen % every))
+        return;
+
+    fprintf(stderr, "[PROF] frame %lld  %lld ms", (long long)seen,
+            (long long)g_nv2a_stats.frame_working.mspf);
+    for (unsigned int i = 0; i < NV2A_PROF__COUNT; i++) {
+        int v = g_nv2a_stats.frame_working.counters[i];
+        if (v)
+            fprintf(stderr, "  %s=%d", nv2a_profile_get_counter_name(i), v);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
 void nv2a_profile_flip_stall(void)
 {
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     int64_t render_time = (now-g_nv2a_stats.last_flip_time)/1000;
 
     g_nv2a_stats.frame_working.mspf = render_time;
+    xboxrecomp_profile_report();
     g_nv2a_stats.frame_history[g_nv2a_stats.frame_ptr] =
         g_nv2a_stats.frame_working;
     g_nv2a_stats.frame_ptr =

@@ -69,12 +69,31 @@ static int xemu_gpu_enabled(void)
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 
+/* Finding the entry again is the hot path: note() runs once per pushbuffer
+ * word, and a linear walk of up to PB_MAX_METHODS entries per word cost 42% of
+ * the GPU thread in a level (2026-09-19 profile) -- more than the drawing it
+ * was measuring. Methods are 4-byte aligned and below 0x2000 on every class
+ * this title uses, so index them directly and keep the walk for the rest. */
+#define PB_IDX_SUBCH   8
+#define PB_IDX_METHODS 0x2000
+static uint16_t s_index[PB_IDX_SUBCH][PB_IDX_METHODS / 4]; /* slot + 1, 0 = new */
+
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
+    uint16_t *slot = NULL;
+
+    if (subch < PB_IDX_SUBCH && method < PB_IDX_METHODS && !(method & 3)) {
+        slot = &s_index[subch][method >> 2];
+        if (*slot) {
+            s_seen[*slot - 1].count++;
             return;
+        }
+    } else {
+        for (int i = 0; i < s_seen_count; i++) {
+            if (s_seen[i].method == method && s_seen[i].subch == subch) {
+                s_seen[i].count++;
+                return;
+            }
         }
     }
     if (s_seen_count >= PB_MAX_METHODS) {
@@ -93,6 +112,8 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
         s_seen_count++;
+        if (slot)
+            *slot = (uint16_t)s_seen_count;   /* slot + 1: 0 stays "new" */
     }
 }
 
