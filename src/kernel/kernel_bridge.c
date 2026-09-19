@@ -2050,23 +2050,12 @@ static void kernel_vblank_tick(void)
     {
         static unsigned n;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
-        if (n++ < 3) {
+        if (n++ < 3)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
-            fflush(stderr);
-        }
+        fflush(stderr);
     }
-
-    /* Acknowledged. D3D's vblank DPC writes 1 to PCRTC_INTR_0 and then spins
-     * until PMC_INTR_0 drops the PCRTC bit -- immediate on hardware, where
-     * both are write-1-to-clear. Against plain RAM the bits stayed up until
-     * the GPU thread's periodic zeroing came round, and in a busy level that
-     * was late enough for the DPC to spin through most of the timer thread,
-     * at DISPATCH_LEVEL. The ISR has seen them by now, which is all they are
-     * for. */
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &= ~NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   &= ~NV2A_PMC_INTR_PCRTC;
 }
 
 /* AC'97 buffer completion, delivered.
