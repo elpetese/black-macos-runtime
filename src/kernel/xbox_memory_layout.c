@@ -2360,12 +2360,16 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * the GPU-instance bridge, so the two do not meet until the window is full.
  * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
  * title allocates once. */
-/* Starts past physical page 0 and the fake kernel page at 0x80010000, which
- * the kernel owns on hardware. Handing out physical 0 put Black's gamepad
- * table at 0x80000040; with the tiled aperture aliasing this window, a write
- * through 0xF0000040 (a surface whose data offset is still 0) then landed on
- * it, and XInputGetState was called with the handle 0xCCCCCCCC. */
-#define XBOX_CONTIG_FIRST_FREE  0x00020000u
+/* Starts 4 MB in. On hardware the kernel owns the bottom of physical memory,
+ * and titles do write there: a surface whose data offset is still 0, drawn or
+ * locked through the tiled aperture, puts a whole frame at physical 0. With
+ * the aperture aliasing this window, such a write lands on whatever was
+ * allocated first. Starting at page 0 put Black's gamepad table at 0x80000040
+ * (XInputGetState called with 0xCCCCCCCC); starting at 0x20000 only moved it
+ * to 0x80020C3C, still inside a 640x480 frame, and the handles read back as
+ * 0x00020000 -- a crash in XInputGetState, or input that stops mid-game.
+ * 4 MB is past the largest frame (1280x720x4). */
+#define XBOX_CONTIG_FIRST_FREE  0x00400000u
 static uint32_t g_contig_next = XBOX_CONTIG_BASE + XBOX_CONTIG_FIRST_FREE;
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
