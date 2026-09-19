@@ -13,6 +13,14 @@
 #include "hw/xbox/nv2a/pgraph/gl/renderer.h"
 #include "qemu/bitmap.h"
 #include "xnv2a.h"
+#include <time.h>
+
+/* getenv once per call site. These run per pushbuffer method -- millions of
+ * times a second -- and each getenv walks the environment under a lock: 12% of
+ * the GPU thread in Black's first level. The environment does not change
+ * after startup. */
+#define CGETENV(name) __extension__ ({ static int _ce_done; static const char *_ce_val; \
+    if (!_ce_done) { _ce_val = getenv(name); _ce_done = 1; } _ce_val; })
 #include <SDL3/SDL.h>
 
 struct config g_config = {
@@ -194,7 +202,7 @@ extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
 static int drawlog_this_frame(void)
 {
-    const char *e = getenv("RECOMP_XEMU_DRAWLOG");
+    const char *e = CGETENV("RECOMP_XEMU_DRAWLOG");
     if (!e)
         return 0;
     if (*e == 'L')
@@ -207,10 +215,10 @@ static int drawlog_active(void)
     static int cached = -1;
     const char *e;
     if (cached < 0)
-        cached = getenv("RECOMP_XEMU_DRAWLOG") != NULL;
+        cached = CGETENV("RECOMP_XEMU_DRAWLOG") != NULL;
     if (!cached)
         return 0;
-    e = getenv("RECOMP_XEMU_DRAWLOG");
+    e = CGETENV("RECOMP_XEMU_DRAWLOG");
     return drawlog_this_frame();
 }
 
@@ -218,6 +226,35 @@ static void complete_flip(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     uint32_t s = pgraph_reg_r(pg, NV_PGRAPH_SURFACE);
+
+    /* The flip completes at the next vertical blank. On hardware FLIP_STALL
+     * holds the GPU until then, and that stall -- D3D's pushbuffer filling up
+     * behind it -- is what paces a title to 60 Hz. Completing it at once let
+     * Black's menus and videos run at ~260 frames/s. RECOMP_FLIP_UNCAPPED=1
+     * restores the old behaviour. */
+    {
+        static int uncapped = -1;
+        static int64_t next_us;
+        struct timespec ts;
+        int64_t now_us;
+
+        if (uncapped < 0)
+            uncapped = CGETENV("RECOMP_FLIP_UNCAPPED") != NULL;
+        if (!uncapped) {
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            now_us = (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+            if (next_us == 0 || now_us - next_us > 50000)
+                next_us = now_us;          /* first flip, or fell far behind */
+            if (next_us > now_us) {
+                struct timespec w = { (time_t)((next_us - now_us) / 1000000),
+                                      (long)((next_us - now_us) % 1000000) * 1000 };
+                qemu_mutex_unlock(&pg->lock);
+                nanosleep(&w, NULL);
+                qemu_mutex_lock(&pg->lock);
+            }
+            next_us += 16683;              /* 59.94 Hz, NTSC */
+        }
+    }
 
     SET_MASK(s, NV_PGRAPH_SURFACE_READ_3D, GET_MASK(s, NV_PGRAPH_SURFACE_WRITE_3D));
     pgraph_reg_w(pg, NV_PGRAPH_SURFACE, s);
@@ -228,7 +265,7 @@ static void complete_flip(NV2AState *d)
     s_frame_draws = 0;
     {
         static int shown;
-        if (shown < 6 && getenv("RECOMP_XEMU_VERBOSE")) {
+        if (shown < 6 && CGETENV("RECOMP_XEMU_VERBOSE")) {
             PGRAPHGLState *r = pg->gl_renderer_state;
             SurfaceBinding *sb;
             shown++;
@@ -240,7 +277,7 @@ static void complete_flip(NV2AState *d)
             fprintf(stderr, "\n");
         }
     }
-    if (getenv("RECOMP_XEMU_ZLOG")) {
+    if (CGETENV("RECOMP_XEMU_ZLOG")) {
         if ((s_flips % 60) == 0)
             fprintf(stderr, "  [XZ] flip %u: %u draws, %u z-test, %u z-write, %u with zeta bound;"
                     " last: control0=%08X setupraster=%08X zclip=[%08X,%08X] zeta off=%08X pitch=%u fmt=%u"
@@ -257,7 +294,7 @@ static void complete_flip(NV2AState *d)
         memset(&s_z, 0, sizeof s_z);
     }
     pgraph_gl_download_dirty_surfaces(d);
-    if (getenv("RECOMP_XEMU_VERBOSE")) {
+    if (CGETENV("RECOMP_XEMU_VERBOSE")) {
         static unsigned flips;
         if ((flips++ % 100) == 0) {
             fprintf(stderr, "  [XNV2A] flip %u counters:", flips);
@@ -297,7 +334,7 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
             s_ramht_misses++;
     }
 
-    if (getenv("RECOMP_XEMU_VERBOSE") && method >= 0x1B04 && method < 0x1C00
+    if (CGETENV("RECOMP_XEMU_VERBOSE") && method >= 0x1B04 && method < 0x1C00
         && ((method - 0x1B04) % 0x40) == 0 && ((param >> 4) & 0xF) == 0) {
         static int shown;
         if (shown++ < 10)
@@ -310,7 +347,7 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
      * composite -- to see the scene as the draws before it left it. */
     {
         static int skipping;
-        if (method == 0x17FC && getenv("RECOMP_XEMU_SKIP_COMPOSITE")) {
+        if (method == 0x17FC && CGETENV("RECOMP_XEMU_SKIP_COMPOSITE")) {
             PGRAPHState *pg = &d->pgraph;
             if (param != 0 && s_big_frames > 0 && pg->surface_zeta.offset == 0
                 && pg->surface_shape.clip_width == 640)
@@ -367,7 +404,7 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
     /* RECOMP_XEMU_ZLOG: per frame, how the draws use depth -- how many test
      * it, how many write it, and whether a zeta surface was bound -- printed
      * every 60 flips. */
-    if (method == 0x17FC && param != 0 && getenv("RECOMP_XEMU_ZLOG")) {
+    if (method == 0x17FC && param != 0 && CGETENV("RECOMP_XEMU_ZLOG")) {
         PGRAPHState *pg = &d->pgraph;
         PGRAPHGLState *r = pg->gl_renderer_state;
         uint32_t c0 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0);
@@ -389,7 +426,7 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
         s_z.zclipmax = pgraph_reg_r(pg, NV_PGRAPH_ZCLIPMAX);
         s_z.zclipmin = pgraph_reg_r(pg, NV_PGRAPH_ZCLIPMIN);
     }
-    if (method == 0x1D94 && getenv("RECOMP_XEMU_ZLOG")) {
+    if (method == 0x1D94 && CGETENV("RECOMP_XEMU_ZLOG")) {
         s_z.clears++;
         if (param & 1)
             s_z.zclears++;
