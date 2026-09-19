@@ -15,6 +15,7 @@
  */
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
+#include "xbox_dirty_tracking.h"
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
@@ -834,6 +835,9 @@ NTSTATUS __stdcall xbox_NtReadFile(
      * is met or the file ends. */
     size_t done = 0;
     ssize_t n = 0;
+    /* read() into a write-tracked page fails (EFAULT) instead of faulting;
+     * release the range first (xbox_dirty_tracking.c). */
+    xbox_dirty_prepare_write(Buffer, (size_t)Length);
     while (done < (size_t)Length) {
         ssize_t got = read(fd, (char *)Buffer + done, (size_t)Length - done);
         if (got < 0) {

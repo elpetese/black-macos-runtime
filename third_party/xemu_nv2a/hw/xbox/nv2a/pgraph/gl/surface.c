@@ -773,6 +773,10 @@ static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force)
 
     nv2a_profile_inc_counter(NV2A_PROF_SURF_DOWNLOAD);
 
+    /* xboxrecomp: the readback may be written by the GL driver rather than by
+     * a store that faults, so a write-tracked range is released first. */
+    xbox_dirty_prepare_write(d->vram_ptr + surface->vram_addr,
+                             surface->pitch * surface->height);
     surface_download_to_buffer(d, surface, true, false, true,
                                d->vram_ptr + surface->vram_addr);
 

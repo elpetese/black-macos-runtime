@@ -99,9 +99,14 @@ static bool check_texture_possibly_dirty(NV2AState *d,
      * as dirty and every texture is re-validated by its content hash when it
      * is bound. Marking the other cached textures that overlap it -- a walk
      * of the whole texture LRU, for every texture of every draw -- then
-     * decides nothing (20% of the GPU thread in Black's levels). */
-    (void)palette_vram_offset;
-    return true;
+     * decides nothing (20% of the GPU thread in Black's levels).
+     * When dirty-page tracking is armed at runtime (RECOMP_DIRTY_TRACKING=1),
+     * fall through to the real bitmap-based check below so only genuinely
+     * modified pages trigger a re-upload. */
+    if (!xbox_dirty_armed(d->vram->ptr, (size_t)memory_region_size(d->vram))) {
+        (void)palette_vram_offset;
+        return true;
+    }
 #endif
     if (check_texture_dirty(d, texture_vram_offset, length)) {
         possibly_dirty = true;

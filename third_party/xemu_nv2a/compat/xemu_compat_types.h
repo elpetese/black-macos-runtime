@@ -56,20 +56,47 @@ typedef struct MemoryRegion {
 #define DIRTY_MEMORY_NV2A       3
 #define DIRTY_MEMORY_NV2A_TEX   4
 
+/* xbox_dirty_tracking lives in the host runtime (src/kernel). It is a no-op
+ * unless armed by the host under RECOMP_DIRTY_TRACKING=1; unarmed it reports
+ * every page dirty, so callers behave exactly as the old stub. */
+extern int  xbox_dirty_armed(const void *host_base, size_t size);
+extern void xbox_dirty_arm(void *host_base, size_t size);
+extern bool xbox_dirty_test_and_clear(const void *host_base, size_t region_size,
+                                      size_t offset, size_t size);
+extern void xbox_dirty_set(const void *host_base, size_t region_size,
+                           size_t offset, size_t size);
+extern int  xbox_dirty_fault(uintptr_t fault_addr);
+extern void xbox_dirty_prepare_write(void *host_ptr, size_t len);
+
 static inline uint64_t memory_region_size(MemoryRegion *mr) { return mr->size; }
 static inline void *memory_region_get_ram_ptr(MemoryRegion *mr) { return mr->ptr; }
-/* No write tracking on guest RAM here: report everything as changed and let
- * the renderer's content hashes decide what actually needs re-uploading. */
+/* When write-tracking is armed on the region, consult the page bitmap -- only
+ * pages the guest actually stored to read dirty. Unarmed, every page is dirty
+ * as before, so textures/buffers are re-validated by content hash on every
+ * bind, which is how the boot path already runs. */
 static inline bool memory_region_test_and_clear_dirty(MemoryRegion *mr, hwaddr a,
                                                       hwaddr s, unsigned c)
-{ (void)mr; (void)a; (void)s; (void)c; return true; }
+{
+    (void)c;
+    if (!xbox_dirty_armed(mr->ptr, (size_t)mr->size))
+        return true;
+    return xbox_dirty_test_and_clear(mr->ptr, (size_t)mr->size, (size_t)a, (size_t)s);
+}
 static inline bool memory_region_get_dirty(MemoryRegion *mr, hwaddr a, hwaddr s, unsigned c)
 { (void)mr; (void)a; (void)s; (void)c; return true; }
+/* xemu marks what it wrote (surface downloads) this way. */
 static inline void memory_region_set_client_dirty(MemoryRegion *mr, hwaddr a,
                                                   hwaddr s, unsigned c)
-{ (void)mr; (void)a; (void)s; (void)c; }
+{
+    (void)c;
+    if (xbox_dirty_armed(mr->ptr, (size_t)mr->size))
+        xbox_dirty_set(mr->ptr, (size_t)mr->size, (size_t)a, (size_t)s);
+}
 static inline void memory_region_set_dirty(MemoryRegion *mr, hwaddr a, hwaddr s)
-{ (void)mr; (void)a; (void)s; }
+{
+    if (xbox_dirty_armed(mr->ptr, (size_t)mr->size))
+        xbox_dirty_set(mr->ptr, (size_t)mr->size, (size_t)a, (size_t)s);
+}
 
 #define OBJECT_CHECK(type, obj, name) ((type *)(obj))
 

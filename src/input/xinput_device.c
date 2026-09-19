@@ -213,21 +213,10 @@ static void input_rescan(void)
             g_controller_connected[i] = FALSE;
         }
     }
-    if (SDL_NumJoysticks() > 0 && SDL_IsGameController(0)) {
-        const char *name = SDL_JoystickNameForIndex(0);
-        if (name && strstr(name, "DualSense")) {
-            const char *mapping =
-                "050000004c050000cc09000000000000,"
-                "PlayStation Controller,"
-                "a:b1,b:b2,back:b8,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,"
-                "guide:b10,leftshoulder:b4,leftstick:b11,lefttrigger:a2,"
-                "rightshoulder:b5,rightstick:b12,righttrigger:a5,start:b9,x:b0,y:b3,"
-                "platform:Mac OS X,";
-            SDL_GameControllerAddMapping(mapping);
-            fprintf(stderr, "  [INPUT] applied DualSense mapping\n");
-            fflush(stderr);
-        }
-    }
+    /* No hand-written mappings: SDL's own database covers the DualShock 4
+     * (macOS names it "Wireless Controller") and the DualSense, and the
+     * mapping this used to add for them left the sticks unassigned and put
+     * the triggers on stick axes. */
     open_controllers();
 }
 

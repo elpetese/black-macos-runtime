@@ -1247,11 +1247,14 @@ HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share,
     return CreateFileA(buf, access, share, sa, disp, flags, templ);
 }
 
+extern void xbox_dirty_prepare_write(void *host_ptr, size_t len);
+
 BOOL ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped)
 {
     (void)overlapped;
     int fd = w32_handle_fd(h);
     if (fd < 0) { if (nread) *nread = 0; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    xbox_dirty_prepare_write(buf, len);     /* see xbox_dirty_tracking.c */
     ssize_t n = read(fd, buf, len);
     if (n < 0)  { if (nread) *nread = 0; SetLastError(ERROR_GEN_FAILURE);    return FALSE; }
     if (nread)  *nread = (DWORD)n;
