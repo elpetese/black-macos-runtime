@@ -94,6 +94,15 @@ static bool check_texture_possibly_dirty(NV2AState *d,
                                          unsigned int palette_length)
 {
     bool possibly_dirty = false;
+#if defined(XBOXRECOMP_NO_DIRTY_TRACKING)
+    /* xboxrecomp: guest RAM has no write tracking here, so every range reads
+     * as dirty and every texture is re-validated by its content hash when it
+     * is bound. Marking the other cached textures that overlap it -- a walk
+     * of the whole texture LRU, for every texture of every draw -- then
+     * decides nothing (20% of the GPU thread in Black's levels). */
+    (void)palette_vram_offset;
+    return true;
+#endif
     if (check_texture_dirty(d, texture_vram_offset, length)) {
         possibly_dirty = true;
         pgraph_gl_mark_textures_possibly_dirty(d, texture_vram_offset, length);

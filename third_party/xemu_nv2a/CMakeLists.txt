@@ -32,7 +32,7 @@ target_include_directories(xemu_nv2a PUBLIC
 target_compile_options(xemu_nv2a PRIVATE -std=gnu11 -w -O2)
 # OBJECT, not STATIC: the OpenGL renderer registers itself from a constructor
 # nothing references, which a static archive would silently drop.
-target_compile_definitions(xemu_nv2a PRIVATE CONFIG_OPENGL=1)
+target_compile_definitions(xemu_nv2a PRIVATE CONFIG_OPENGL=1 XBOXRECOMP_NO_DIRTY_TRACKING=1)
 # src/nv2a (the older register-level extraction behind RECOMP_NV2A_MMIO)
 # defines some of the same functions; keep xemu's under their own names.
 target_compile_definitions(xemu_nv2a PRIVATE

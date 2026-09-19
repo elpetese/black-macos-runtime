@@ -35,6 +35,13 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 
+/* getenv once per call site. These run per pushbuffer method -- millions of
+ * times a second -- and each getenv walks the environment under a lock: 12% of
+ * the GPU thread in Black's first level. The environment does not change
+ * after startup. */
+#define CGETENV(name) __extension__ ({ static int _ce_done; static const char *_ce_val; \
+    if (!_ce_done) { _ce_val = getenv(name); _ce_done = 1; } _ce_val; })
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
@@ -448,7 +455,7 @@ static uint32_t surface_bpp(void)
  */
 static void dump_surface_bmp(void)
 {
-    const char *prefix = getenv("RECOMP_FB_DUMP");
+    const char *prefix = CGETENV("RECOMP_FB_DUMP");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     static int seq;
@@ -596,7 +603,7 @@ static void clear_surface(uint32_t param)
      * zero.
      *
      * ponytail: bring-up aid, not a feature. It costs one branch per clear. */
-    if (getenv("RECOMP_RASTER_TEST")) {
+    if (CGETENV("RECOMP_RASTER_TEST")) {
         static int announced;
         /* Every clear, not once: the title clears each frame and double-buffers,
          * so a triangle drawn a single time is erased before anyone sees it. */
@@ -619,7 +626,7 @@ static void clear_surface(uint32_t param)
      * would show the one nothing is writing. */
     /* The window has to read where the pixels actually are, which is the
      * resolved address rather than the DMA-object offset. */
-    if (getenv("RECOMP_FB_WINDOW")) {
+    if (CGETENV("RECOMP_FB_WINDOW")) {
         uint32_t fb_va = dma_resolve(s_gpu.color_offset);
         uint32_t fb_pitch = s_gpu.pitch;
         if (fb_va && fb_pitch)
@@ -846,7 +853,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
  */
 static void dump_texture_bmp(uint32_t seq)
 {
-    const char *prefix = getenv("RECOMP_TEX_DUMP");
+    const char *prefix = CGETENV("RECOMP_TEX_DUMP");
     uint32_t w = s_gpu.tex.width, h = s_gpu.tex.height, x, y;
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
@@ -952,13 +959,13 @@ static uint32_t modulate_argb(uint32_t a, uint32_t b)
  * diffuse/vertex colour the title feeds into the rasteriser. */
 static int modulate_disabled(void)
 {
-    const char *p = getenv("RECOMP_PB_NO_MODULATE");
+    const char *p = CGETENV("RECOMP_PB_NO_MODULATE");
     return p && *p && strcmp(p, "0") != 0;
 }
 
 static int white_diffuse(void)
 {
-    const char *p = getenv("RECOMP_PB_WHITE_DIFFUSE");
+    const char *p = CGETENV("RECOMP_PB_WHITE_DIFFUSE");
     if (p)
         return *p && strcmp(p, "0") != 0;
     return 1;
@@ -1601,7 +1608,7 @@ static void transform_vertex(uint32_t index, XfVertex *out)
 
     if (s_xf.exec_mode == 2) {
         VshState st;
-        if (getenv("RECOMP_XF_DUMPPROG")) {
+        if (CGETENV("RECOMP_XF_DUMPPROG")) {
             static int dumped;
             if (s_xf.batches == 200 && !dumped++) {
                 fprintf(stderr, "  [XF] c190=(%g %g %g %g) c191=(%g %g %g %g)\n",
@@ -1789,7 +1796,7 @@ static int raster_batch_transformed(void)
         break;
     }
 
-    if (getenv("RECOMP_XF_VERBOSE")) {
+    if (CGETENV("RECOMP_XF_VERBOSE")) {
         static int shown_attr;
         if (shown_attr++ < 6 && n) {
             for (uint32_t k = 0; k < 16; k++)
@@ -1808,7 +1815,7 @@ static int raster_batch_transformed(void)
                         v[k].x, v[k].y, v[k].z, v[k].ok);
         }
     }
-    if (getenv("RECOMP_XF_VERBOSE")) {
+    if (CGETENV("RECOMP_XF_VERBOSE")) {
         static int shown;
         if (shown++ < 12 && n) {
             fprintf(stderr, "  [XF] mode %u start %u prim %u n %u v0 ok %d (%.1f,%.1f,%.3f w=%.3f)"
@@ -1856,7 +1863,7 @@ static int xf_method(uint32_t method, uint32_t param)
     case NV097_SET_TRANSFORM_PROGRAM_START:  s_xf.prog_start = param; return 1;
     case NV097_SET_TRANSFORM_CONSTANT_LOAD:
         s_xf.const_load = param; s_xf.const_word = 0;
-        if (getenv("RECOMP_XF_DUMPPROG")) {
+        if (CGETENV("RECOMP_XF_DUMPPROG")) {
             static int shown;
             if (shown++ < 40) fprintf(stderr, "  [XF] CONSTANT_LOAD %u\n", param);
         }
@@ -1964,7 +1971,7 @@ static void drawlog(void)
     uint32_t k;
 
     if (target == -2) {
-        const char *e = getenv("RECOMP_PB_DRAWLOG");
+        const char *e = CGETENV("RECOMP_PB_DRAWLOG");
         target = e ? atoi(e) : -1;
     }
     if (target < 0 || (int)s_gpu.flips != target)
@@ -2029,7 +2036,7 @@ static void draw_primitive(void)
 
     raster_batch();
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -2186,7 +2193,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. */
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -2227,7 +2234,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
         s_gpu.color_offset = param;
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
             static uint32_t last;
             if (param != last) {
                 last = param;
@@ -2317,7 +2324,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_FLIP_READ:
         s_gpu.flip_read = param;
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
             static uint32_t last;
             if (param != last) {
                 last = param;
@@ -2329,7 +2336,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_FLIP_WRITE:
         s_gpu.flip_write = param;
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
             static uint32_t last;
             if (param != last) {
                 last = param;
@@ -2341,7 +2348,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_FLIP_MODULO:
         s_gpu.flip_modulo = param;
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
             static uint32_t last;
             if (param != last) {
                 last = param;
@@ -2356,7 +2363,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
             fprintf(stderr, "  [GPU] FLIP_INCREMENT_WRITE -> write=%u read=%u modulo=%u\n",
                     s_gpu.flip_write, s_gpu.flip_read, s_gpu.flip_modulo);
             fflush(stderr);
@@ -2365,7 +2372,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_FLIP_STALL:
         s_gpu.flip_read = s_gpu.flip_write;
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u modulo=%u\n",
@@ -2420,7 +2427,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0848:
     case 0x084C:
     case 0x0850:
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
             static int shown;
             if (shown++ < 8)
                 fprintf(stderr, "  [GPU] surface base/pitch method 0x%04X param 0x%08X\n",
@@ -2429,7 +2436,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case 0x09F8:
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
             static int shown;
             if (shown++ < 8)
                 fprintf(stderr, "  [GPU] surface/tiling method 0x%04X param 0x%08X\n",
@@ -2439,7 +2446,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case 0x17BC:
     case 0x17C4:
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
             static int shown;
             if (shown++ < 8)
                 fprintf(stderr, "  [GPU] vertex/begin method 0x%04X param 0x%08X\n",
@@ -2454,7 +2461,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
             uint32_t attr_idx = (method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4;
             s_gpu.attr[attr_idx].offset = dma_resolve(param);
-            if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
                 static int shown[32];
                 if (shown[attr_idx]++ < 4)
                     fprintf(stderr, "  [GPU] attr[%u] offset: 0x%08X\n", attr_idx, s_gpu.attr[attr_idx].offset);
@@ -2466,7 +2473,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
             a->stride = (param >> 8)  & 0xFF;
-            if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            if (CGETENV("RECOMP_PB_EXEC_VERBOSE")) {
                 static int shown[32];
                 if (shown[attr_idx]++ < 4)
                     fprintf(stderr, "  [GPU] attr[%u] format: type=%u size=%u stride=%u\n",
@@ -2575,7 +2582,7 @@ static void find_nan_matrices(void)
  * pointer or a number", and guessing wrong costs a run. */
 static void peek_addresses(void)
 {
-    const char *spec = getenv("RECOMP_PEEK");
+    const char *spec = CGETENV("RECOMP_PEEK");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     char buf[256];
     char *tok, *ctx = NULL;
@@ -2606,7 +2613,7 @@ static void peek_addresses(void)
  */
 static void peek_chain(void)
 {
-    const char *spec = getenv("RECOMP_PEEK_CHAIN");
+    const char *spec = CGETENV("RECOMP_PEEK_CHAIN");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     char buf[256], *tok, *ctx = NULL;
     uint32_t cur = 0;
@@ -2644,13 +2651,13 @@ void nv2a_pb_exec_report(void)
 {
     peek_addresses();
     peek_chain();
-    if (getenv("RECOMP_FIND_NAN")) {
+    if (CGETENV("RECOMP_FIND_NAN")) {
         /* Every report, not once: the matrix is fine early on and only turns
          * to NaN later, so a single scan at startup finds nothing and says
          * nothing. */
         find_nan_matrices();
     }
-    if (getenv("RECOMP_FIND_QUAD")) {
+    if (CGETENV("RECOMP_FIND_QUAD")) {
         static int done;
         if (!done) { done = 1; find_quad_vertices(); }
     }
@@ -2699,7 +2706,7 @@ void nv2a_pb_exec_report(void)
                     : d3d8_format_is_swizzled(s_tex_use[i].color) ? " swz" : " lin",
                 s_tex_use[i].batches);
 
-    if (getenv("RECOMP_TEX_STATE")) {
+    if (CGETENV("RECOMP_TEX_STATE")) {
         uint32_t k;
         for (k = 0; k < sizeof s_tex_set / sizeof s_tex_set[0]; k++)
             if (s_tex_set[k])
@@ -2716,7 +2723,7 @@ void nv2a_pb_exec_report(void)
      * stopped on, the answer is as likely to be the one seen twice as the
      * one seen a thousand times, and ten hides it. */
     {
-        int shown = getenv("RECOMP_PB_UNHANDLED_ALL") ? s_unhandled_count : 10;
+        int shown = CGETENV("RECOMP_PB_UNHANDLED_ALL") ? s_unhandled_count : 10;
     for (i = 0; i < shown && i < s_unhandled_count; i++) {
         int best = i;
         for (j = i + 1; j < s_unhandled_count; j++)

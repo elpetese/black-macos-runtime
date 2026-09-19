@@ -26,6 +26,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* getenv once per call site. These run per pushbuffer method -- millions of
+ * times a second -- and each getenv walks the environment under a lock: 12% of
+ * the GPU thread in Black's first level. The environment does not change
+ * after startup. */
+#define CGETENV(name) __extension__ ({ static int _ce_done; static const char *_ce_val; \
+    if (!_ce_done) { _ce_val = getenv(name); _ce_done = 1; } _ce_val; })
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 #define PB_MAX_METHODS 4096
@@ -52,7 +59,7 @@ static int xemu_gpu_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
-        on = getenv("RECOMP_XEMU_GPU") != NULL;
+        on = CGETENV("RECOMP_XEMU_GPU") != NULL;
         if (on)
             g_pb_exec_no_draw = 1;
     }
@@ -148,7 +155,7 @@ void nv2a_pb_scan_report(void)
 
     if (s_exec_enabled > 0)
         nv2a_pb_exec_report();
-    if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
+    if (!s_seen_count || !CGETENV("RECOMP_PB_SCAN"))
         return;
     fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised"
                     " -- %d distinct (subchannel, method) pairs\n",
@@ -184,8 +191,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     int subr_active = 0;
 
     if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va == start_va)
+        s_exec_enabled = CGETENV("RECOMP_PB_EXEC") != NULL;
+    if (!(CGETENV("RECOMP_PB_SCAN") || s_exec_enabled) || end_va == start_va)
         return;
 
     /* Walk from GET to PUT the way the GPU does, following jumps: D3D's
