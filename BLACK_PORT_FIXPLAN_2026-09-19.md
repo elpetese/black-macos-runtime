@@ -76,6 +76,40 @@ Cada afirmación se comprobó contra el código fuente (`xboxrecomp`, rama `maco
 
 Orden pensado para que cada paso haga medibles los siguientes. Cada bloque tiene su criterio de **hecho**.
 
+### Estado de P0 (19/09, tarde) — hecho
+
+| Paso | Commit | Verificado |
+|---|---|---|
+| P0.1 Soltar teclas al perder el foco; `keyUp` por tecla física | `67bc0b7` | Compila. **Falta probarlo a mano** (Cmd-Tab con una tecla pulsada). |
+| P0.2 SDL inicializado y actualizado en el hilo que lee el mando, con búsqueda continua | `1dc1f8c` | SDL ya enumera en ese hilo (log `[INPUT] SDL sees …`). **Falta probarlo con el mando de PS4 conectado.** |
+| P0.3 Logs por fotograma detrás de `RECOMP_VERBOSE=1`; línea `[STAT]` cada 10 s | `5a78406` | Prueba hasta el nivel: 132 KB de log en 7 min (antes ~15 MB), sin bloqueos ni crashes. |
+| Script de prueba en el repo | `black-recomp 0f3df8e` | `scripts/run-scripted.sh NOMBRE SEGUNDOS level`; logs en `~/black-runs`. |
+
+### Nuevas mediciones con `[STAT]` (cambian las prioridades)
+
+| Fase | Fotogramas del juego/s | Esperado en Xbox |
+|---|---|---|
+| Vídeos/menús | **~260** | 60 (o 30) |
+| Nivel | **~8–19** | 30–60 |
+
+1. **El nivel va muy lento.** Causa probable, confirmada en el código: el stub de memoria modificada de la capa xemu (`compat/xemu_compat_types.h`) responde siempre "modificada". `check_texture_dirty` (`pgraph/gl/texture.c`) vuelve a validar, hashear y convertir cada textura en cada uno de los ~600 dibujos por fotograma. **Nuevo P2b.**
+2. **Los menús van sin límite.** El juego presenta ~4 veces más fotogramas que la Xbox, así que la presentación no espera al vblank. Sospechosos: la paridad de campo simulada (`xbox_Nv2aFieldParity`, que podría cambiar en cada lectura) y la espera de vblank de D3D. Cualquier lógica ligada al fotograma corre a otra velocidad. **Nuevo P2c.**
+
+Ambos pueden estar detrás de "el control se siente mal" y de la cámara: con 8 fps y un dt grande, un retroceso integrado por fotograma se comporta distinto.
+
+### P2b — Rendimiento del nivel (seguimiento real de escrituras)
+
+- Marcar como "modificadas" solo las páginas que la CPU escribe: proteger en solo lectura (`mprotect`) las páginas de las texturas ya subidas, y en el manejador de SIGBUS/SIGSEGV (ya existe uno para MMIO) marcar la página y desprotegerla. `memory_region_test_and_clear_dirty` consulta ese mapa de bits.
+- Alternativa más barata para empezar: el ~90 % de las texturas del nivel son estáticas. Un contador de generación por página que solo avance con escrituras del guest a la ventana contigua ya reduce el trabajo.
+- **Medir antes y después** con `[STAT]` y `sample` durante 10 s en el nivel.
+- **Hecho cuando:** el nivel va a ≥30 fotogramas/s.
+
+### P2c — Ritmo de fotogramas como en la Xbox
+
+- Registrar (con `RECOMP_VERBOSE`) cuándo D3D espera el vblank y qué lee (paridad de campo, contador de vblank, `KeWaitForSingleObject` sobre el evento de vblank).
+- Hacer que la paridad solo cambie con el vblank real (60 Hz) y no en cada lectura; comprobar que los vídeos XMV siguen funcionando, ya que dependen de ella.
+- **Hecho cuando:** los menús van a 60 fotogramas/s y los vídeos a su velocidad.
+
 ### P0 — Arreglos confirmados y baratos (menos de 1 h cada uno)
 
 **P0.1 Soltar todas las teclas al perder el foco**
