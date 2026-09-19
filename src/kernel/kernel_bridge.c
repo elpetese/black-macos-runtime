@@ -1894,6 +1894,34 @@ typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
 
+/* Producers are every device model that raises an interrupt -- the OHCI thread,
+ * the timer thread's vblank and AC97 ISRs -- each on its own host thread. Two
+ * of them queueing at once wrote the same slot and one DPC was lost; when it
+ * was the USB driver's, the master interrupt enable its ISR had cleared was
+ * never set again and the pad went silent for the rest of the run. Never held
+ * across a deferred routine, which may queue another. */
+static volatile LONG g_dpc_lock;
+
+static void dpc_lock(void)
+{
+#if defined(_MSC_VER)
+    while (InterlockedCompareExchange(&g_dpc_lock, 1, 0) != 0)
+        YieldProcessor();
+#else
+    while (__atomic_exchange_n(&g_dpc_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+#endif
+}
+
+static void dpc_unlock(void)
+{
+#if defined(_MSC_VER)
+    InterlockedExchange(&g_dpc_lock, 0);
+#else
+    __atomic_store_n(&g_dpc_lock, 0, __ATOMIC_RELEASE);
+#endif
+}
+
 static void bridge_KeInsertQueueDpc(void)
 {
     uint32_t dpc  = STACK_ARG(0);
@@ -1903,9 +1931,11 @@ static void bridge_KeInsertQueueDpc(void)
 
     if (!dpc) { g_eax = 0; return; }
 
+    dpc_lock();
     tail = g_dpc_tail;
     next = (tail + 1) % XBOX_MAX_PENDING_DPC;
     if (next == g_dpc_head) {
+        dpc_unlock();
         fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
         fflush(stderr);
         g_eax = 0;
@@ -1915,6 +1945,7 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
     g_dpc_tail = next;
+    dpc_unlock();
     g_eax = 1;
 }
 
@@ -2089,10 +2120,16 @@ static void kernel_ac97_tick(void)
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
 {
-    while (g_dpc_head != g_dpc_tail) {
-        LONG head = g_dpc_head;
-        PendingDpc d = g_dpc_queue[head];
-        g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
+    for (;;) {
+        PendingDpc d;
+        dpc_lock();
+        if (g_dpc_head == g_dpc_tail) {
+            dpc_unlock();
+            break;
+        }
+        d = g_dpc_queue[g_dpc_head];
+        g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
+        dpc_unlock();
         kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
 }
