@@ -1,0 +1,199 @@
+# Black (Xbox) → Apple Silicon: revisión y plan de corrección
+
+**Fecha:** 19 de septiembre de 2026
+**Base:** `BLACK_PORT_ESTADO_2026-09-19.md`
+**Qué es este documento:** (1) la verificación, contra el código y los logs, de un análisis externo del estado del port; (2) una revisión de cómo se trabajó el 19/09 y qué se hizo mal; (3) el plan de corrección resultante, ordenado y con criterios de "hecho".
+
+---
+
+## 1. Verificación del análisis externo
+
+Cada afirmación se comprobó contra el código fuente (`xboxrecomp`, rama `macos-port`), el ejecutable del juego y los logs de las ejecuciones del 19/09. Leyenda: ✅ correcta · ⚠️ parcialmente correcta o sin verificar · ❌ incorrecta.
+
+### 1.1 Niveles
+
+| Afirmación | Veredicto | Evidencia |
+|---|---|---|
+| La misión 1 carga y se juega; "no carga" suele ser otra cosa | ✅ | Pruebas del 19/09: nivel cargado, disparo, recarga, objetivos. |
+| El juego ignora el mando ~40 s tras cargar | ✅ observado · ⚠️ causa | Medido en varias pruebas. Que sea una intro "a propósito" **no está verificado**; puede ser la carga del streaming de audio/voz. |
+| Arranque inestable ~1 de cada 3 (crash XMV, pila machacada, cuelgue a ~37 s) | ✅ | Documentado; medido antes de los arreglos de hilos del 19/09. **No se ha vuelto a medir después**: varios de esos arreglos (dispatch por hilo, IRQL, precisión FPU) atacan precisamente carreras. |
+| Las builds antiguas "cargan" pero se ven vacías | ✅ | Fallo de flags en `sub_00172EB0` (commit `6932e7d`). |
+| Misión 2+ no probada; puede faltar código traducido | ⚠️ | Cierto que no está probada. Pero la ICALL feedback **ya existe y está activa** (`BLACK_ICALL_FEEDBACK=ON`): `build-mac/icall_targets.dump` tiene 876 destinos y **0 sin resolver** en todo lo ejecutado. |
+| Menú de pausa invisible (panel + texto colapsado en 151,210) | ✅ | Documentado. |
+
+### 1.2 Teclado y cámara
+
+| Afirmación | Veredicto | Evidencia |
+|---|---|---|
+| El mando emulado no manda ejes sucios en reposo | ✅ | `RECOMP_USB_TRACE`: ejes a 0 en reposo, solo cambian mientras se pulsa. |
+| La vista cae tras disparar (recoil) | ⚠️ | Observado en pruebas con script **sin tocar el stick derecho**, así que es un comportamiento del juego y no del mapeo. La causa (recoil) es una **hipótesis** que nadie ha medido todavía. |
+| La mira clavada al suelo se debe a que el teclado envía ±1.0 | ❌ | La deriva aparece en ejecuciones donde **nunca se pulsa** el stick derecho. La saturación empeora la sensación, pero no es la causa. |
+| Perder el foco puede dejar un eje "pegado" | ✅ **confirmado en código** | `fb_present_posix.m`: la vista Cocoa solo reenvía `keyDown`/`keyUp`; no hay `resignKey`/`windowDidResignKey`. Una tecla pulsada mantiene `s_until = UINT64_MAX` (`keyboard_input.c`) hasta un `keyUp` que no llega si el foco cambió (Cmd-Tab, captura de pantalla…). **Encaja con "se queda dando vueltas":** un eje de giro pegado. |
+| El tiempo no está anclado: present desbloqueado, dt explota | ❌ | Todas las ejecuciones usan `RECOMP_VBLANK=1`; se midieron ~47–52 fotogramas/s en el nivel, no un present libre. Medir el dt que ve el juego sigue siendo útil. |
+| Redondear según la precisión también en `fst/fstp`, comparaciones, cargas, `fprem`, `fyl2x` | ❌ | En el x87 el control de precisión **solo** afecta a FADD, FSUB(R), FMUL, FDIV(R) y FSQRT (manual de Intel). Un `fstp dword` ya redondea a float por sí mismo, y las comparaciones y cargas no redondean. `fp_pc()` cubre exactamente esas operaciones, incluidas las variantes `fi*`. |
+| PS4: permisos de "Monitorización de entrada" y hints HIDAPI | ⚠️ | Posible, pero hay una causa **confirmada en código** más básica: `xinput_device.c` enumera los mandos **una sola vez** al arrancar (`open_controllers()`) y **nadie bombea los eventos de SDL** (no hay `SDL_PumpEvents`/`SDL_PollEvent` en el runtime). En macOS los mandos aparecen de forma asíncrona, así que al enumerar hay 0 y nunca se vuelve a mirar. |
+
+### 1.3 Proceso
+
+| Afirmación | Veredicto | Comentario |
+|---|---|---|
+| No hay batería de regresión (N arranques automáticos) | ✅ | Es la mayor carencia. |
+| exFAT + `._*` es un problema de entorno | ✅ | Ya rompió git y CMake. |
+| Demasiados logs por fotograma, que alteran el timing | ✅ | `[NV2A] DMA_PUT`, `[GPU] draw #`, `[FBWIN]` (este último ya silenciado). |
+| Sospechar primero del recompilador y del kernel | ✅ | Es lo que mostraron todos los fallos graves del 19/09. |
+| La ICALL coverage es manual | ⚠️ | La grabación es automática; lo manual es el paso `merge` → semillas → regenerar. |
+| "Golden frames" contra xemu | ✅ idea · ⚠️ coste | Requiere tener xemu con BIOS/MCPX en este Mac; no está instalado. |
+| El filtro del panel negro no es un arreglo | ✅ | Correcto, y así está documentado. |
+
+**Conclusión:** el análisis es útil como marco de trabajo y acierta en el proceso (regresión, entorno, logs, orden de ataque). Pero tiene errores técnicos concretos: el tiempo desbloqueado, la extensión del redondeo x87 y el teclado ±1 como causa de la deriva. Además no ve los dos fallos reales y comprobables del control: **teclas pegadas al perder el foco** y **SDL sin bombeo de eventos**. Sus comandos de ICALL (`--db … merge`) no coinciden con la herramienta real (sección 5).
+
+---
+
+## 2. Revisión de lo sucedido el 19/09
+
+### 2.1 Lo que funcionó
+
+- **Buscar la causa en el recompilador y el kernel** resolvió los tres fallos graves: los flags sobrescritos (nivel translúcido), la precisión x87 (bloqueo al disparar) y la cola DPC sin cerrojo (mando muerto).
+- **El volcado automático de bloqueos** (`RECOMP_HANG_DUMP`) convirtió un "se congela" en una línea de código concreta en **dos ejecuciones**. Antes de tenerlo, el mismo problema consumió muchas más.
+- **Las pruebas del recompilador**: se añadieron casos para cada fallo del lifter (93 pruebas en verde).
+
+### 2.2 Lo que se hizo mal (y cuánto costó)
+
+1. **Demasiadas ejecuciones de una sola sonda**, antes de montar el volcado automático. Cada intento hasta el nivel cuesta ~6 min, y muchos se perdieron por:
+   - usar `$t:a` en zsh (modificador de ruta), que corrompió los scripts;
+   - pulsar Start/A en el script cuando el nivel ya había cargado, lo que pausó el juego y se confundió con "no responde";
+   - arrancar tests mientras seguían abiertas partidas anteriores.
+2. **Se atacó un síntoma antes que la causa.** El panel negro se ocultó con un filtro; funciona, pero ocultó también que el menú de pausa sigue roto.
+3. **Primera hipótesis del bloqueo equivocada** (carrera entre hilos → cerrojo IRQL). El arreglo del IRQL es correcto y se mantiene, pero no era la causa. **Lección:** capturar el estado del hilo atascado **antes** de corregir, no después.
+4. **Se diagnosticó "juego congelado" cuando era la ventana** (seguía superficies de 160×120). Un contador de fotogramas del juego en el log lo habría distinguido en un minuto.
+5. **No se ha vuelto a medir la estabilidad del arranque** después de los arreglos de hilos. Sigue figurando como "1 de cada 3" sin un dato posterior.
+6. **Logs en el scratchpad temporal:** se perdieron los de las pruebas d1–d10 y e1–e2. Los volcados que respaldan una conclusión deben guardarse en el repo (`notes/`).
+7. **Se trabajó sobre exFAT** todo el día, con limpiezas manuales de `._*` en cada compilación.
+
+---
+
+## 3. Plan de corrección
+
+Orden pensado para que cada paso haga medibles los siguientes. Cada bloque tiene su criterio de **hecho**.
+
+### P0 — Arreglos confirmados y baratos (menos de 1 h cada uno)
+
+**P0.1 Soltar todas las teclas al perder el foco**
+- Dónde: `src/video/fb_present_posix.m` (la vista de teclado) y `src/input/keyboard_input.c`.
+- Qué: añadir `xbox_KeyboardReleaseAll()` (poner `s_until[i] = 0` para todos los slots) y llamarla desde `resignFirstResponder` de la vista y desde `windowDidResignKey:` del delegado de la ventana.
+- Hecho cuando: pulsar L, hacer Cmd-Tab y volver no deja la vista girando, y `RECOMP_USB_TRACE` muestra los ejes a 0.
+
+**P0.2 Detectar mandos en caliente (PS4)**
+- Dónde: `src/input/xinput_device.c`.
+- Qué: en `xbox_InputGetState` (o en un temporizador), llamar a `SDL_PumpEvents()` y, si `SDL_NumJoysticks()` cambió, volver a ejecutar `open_controllers()`. Activar `SDL_HINT_JOYSTICK_HIDAPI` y `SDL_HINT_JOYSTICK_HIDAPI_PS4` antes de `SDL_InitSubSystem`. Registrar en el log el nombre y el GUID de cada mando.
+- Si sigue a 0: revisar el permiso de Monitorización de entrada del terminal y probar el mando con otra app SDL2.
+- Hecho cuando: el log muestra ≥1 mando y sus ejes en reposo a 0.
+
+**P0.3 Silenciar los logs por fotograma**
+- `[NV2A] DMA_PUT`, `[GPU] draw #`, `[GPU] transform`: moverlos detrás de `RECOMP_NV2A_TRACE` / `RECOMP_PB_EXEC_VERBOSE`.
+- Hecho cuando: una partida de 10 minutos genera menos de 1 MB de log.
+
+### P1 — Entorno y regresión
+
+**P1.1 Salir de exFAT.** Copiar `xboxrecomp` y `black-recomp` a APFS (disco interno o una imagen sparse APFS en el disco externo). Mantener el filtro de `._*` como red de seguridad.
+
+**P1.2 `rebuild-black.sh`**: borrar `._*`, ejecutar las pruebas del lifter (abortar si fallan), regenerar y compilar.
+
+```sh
+cd porting/xboxrecomp
+python3 -m unittest discover -s tools/recomp -p 'test_*.py' -t . || exit 1
+python3 -m tools.recomp game_files/default.xbe --game-name Black --all --split 1000 \
+    --gen-dir ../../black-recomp/src/recomp/gen
+cd ../../black-recomp && make -C build-mac -j8 black-recomp
+```
+
+**P1.3 Batería de arranques `boot-test.sh`**: N arranques de 120 s con `RECOMP_HANG_DUMP=8`, `RECOMP_FB_SNAP` y un script que pulse Start. Clasificar cada uno (menú alcanzado / crash XMV / pila machacada / cuelgue) leyendo el log, y guardar los volcados de los fallos en `notes/boot-fails/`. Varias copias en paralelo (3 caben bien en este Mac).
+
+**P1.4 Contador de fotogramas del juego** en el log (1 línea cada 10 s: flips de xemu y fps). Así se distingue "juego parado" de "ventana parada".
+
+**Hecho cuando:** `boot-test.sh 20` da una cifra, y esa cifra es la línea base de P2.
+
+### P2 — Estabilidad del arranque (vídeos)
+
+1. **Medir primero** con P1.3: los arreglos del 19/09 pueden haber cambiado la tasa.
+2. Para cada tipo de fallo restante:
+   - **Crash al final de un XMV** (`sub_0013DD20` vía `0x140D90`, dirección `0x9xxxxxxx`): volcar el objeto del decodificador con los registros en vivo; buscar un uso tras liberar o una lectura de un puntero sin inicializar. Revisar la traducción de esa función con el mismo método que `sub_00172EB0` (flags, precisión, `sbb/adc`).
+   - **`esp` = puntero del heap en `sub_0020F6A0`**: comprobar el balance de pila de las llamadas indirectas cercanas (ya existe `RECOMP_ABI_CALL` con comprobación de violaciones) y los tamaños de argumentos stdcall de las llamadas al kernel de ese tramo (el precedente es `NtQueryDirectoryFile`, 9 → 10).
+   - **Cuelgue sin crash**: ya lo vuelca `RECOMP_HANG_DUMP`; leer qué espera cada hilo.
+3. Ante un fallo del lifter, añadir **una prueba** antes de regenerar.
+
+**Hecho cuando:** ≥19/20 arranques llegan al menú y cada fallo restante tiene su volcado en `notes/`.
+
+### P3 — Cámara que cae tras disparar
+
+1. **Medir**, con una sola ejecución: script que llega al nivel, espera a "RENDEZVOUS", dispara una vez y no toca nada durante 10 s, y luego una ráfaga de 10 disparos. Con `RECOMP_FB_SNAP` y un volcado periódico del objeto del jugador (localizar su dirección con el volcado de registros del hilo principal durante el disparo).
+2. Localizar la escritura del ángulo vertical (float en el objeto del jugador) y la función que la hace.
+3. Revisar su traducción: flags, `fp_pc`, `sbb/adc`, `js` en 8/16 bits, conversiones `cvt*`/`fistp`, y el dt que usa (el juego lee `KeQueryPerformanceCounter` / `KeTickCount`; comprobar que las frecuencias son las que espera).
+4. Prueba del lifter para el caso encontrado, regenerar y repetir el paso 1.
+
+**No hacer:** un límite "si el ángulo pasa de X, resetear". Esconde el fallo.
+
+**Hecho cuando:** tras un disparo sin tocar el stick, el ángulo vuelve a su valor (±0,5°), y tras 10 disparos la vista no acaba en el suelo.
+
+### P4 — Teclado más jugable (calidad, no la causa)
+
+- Stick derecho con rampa: al pulsar, subir a ~0,5 del máximo en ~150 ms; al soltar, volver a 0 en ~80 ms. El movimiento (WASD) puede seguir al máximo.
+- Opcional: ratón → stick derecho, con la ventana capturando el cursor.
+- Hecho cuando: se recorre la primera calle con teclado apuntando con precisión.
+
+### P5 — Menús: panel negro y pausa invisible
+
+1. `RECOMP_XEMU_DRAWLOG` en un fotograma de menú y en uno de pausa; identificar el dibujo del panel y los quads de texto colapsados.
+2. Seguir hacia atrás desde el flusher de lotes `0xD4C50` / buffer `0x563120` hasta la función que decide visibilidad y posición.
+3. Revisar su traducción igual que en P3. Añadir la prueba del lifter.
+4. Cuando el panel desaparezca solo y el texto se vea, quitar el filtro por defecto (`RECOMP_KEEP_BLACK_PANEL` pasa a ser innecesario).
+
+**Hecho cuando:** la pausa se ve sin filtro.
+
+### P6 — Resto de misiones
+
+Ciclo real con la herramienta existente (`tools/recomp/icall_feedback.py`):
+
+```sh
+# 1. Compilar con BLACK_ICALL_FEEDBACK=ON (ya lo está en build-mac) y jugar la misión nueva.
+#    Al salir o en un crash se escribe build-mac/icall_targets.dump.
+cd porting/xboxrecomp
+python3 -m tools.recomp.icall_feedback merge ../../black-recomp/build-mac/icall_targets.dump
+python3 -m tools.disasm --seed-functions tools/recomp/output/icall_targets.json   # + semillas de black-recomp/seeds
+# 2. Regenerar (P1.2) y repetir hasta que el volcado no tenga destinos con flag 2/3 (sin resolver).
+```
+
+Antes de ejecutar, comprobar las opciones exactas con `python3 -m tools.recomp.icall_feedback --help`, y combinarlas con `black-recomp/seeds/hand_seeds.json` como en la regeneración actual.
+
+**Hecho cuando:** cada misión probada carga, o falla con un destino ICALL o un volcado de bloqueo con nombre, nunca con una pantalla negra muda.
+
+### P7 — Calidad de los vídeos
+
+`RECOMP_FMV_DUMP` sobre un fotograma decodificado. Sin xemu disponible, comparar con los valores esperados del propio formato: los bloques DC-only indican coeficientes AC perdidos. Revisar la traducción MMX/SSE del IDCT (saturaciones `packuswb`, `pmulhw`, desplazamientos).
+
+### P8 — Audio
+
+- Confirmar de oído el remuestreo (`2d4e619`).
+- Después: interpolación de mejor calidad y mezcla de los mixbins según el DSP (hoy es passthrough: bins 0–15 izquierda, 16–31 derecha).
+
+---
+
+## 4. Matriz por sesión
+
+```
+[ ] pruebas del lifter en verde
+[ ] regenerado y compilado desde rebuild-black.sh (sin ._*)
+[ ] boot-test: ___/20 al menú (volcados en notes/)
+[ ] nivel: "RENDEZVOUS" visible, el mando responde después
+[ ] 1 disparo sin tocar el stick → el ángulo vuelve
+[ ] Cmd-Tab con una tecla pulsada → nada queda pegado
+[ ] log de 10 min < 1 MB
+[ ] volcados que respaldan conclusiones guardados en notes/
+```
+
+## 5. Correcciones a los comandos del análisis externo
+
+- **`RECOMP_ICALL_FEEDBACK=1` como variable de entorno no existe:** es la opción de compilación `BLACK_ICALL_FEEDBACK=ON`, ya activa en `build-mac`.
+- **`icall_feedback --db … merge` / `seeds --out … --align 16`:** la herramienta documenta `merge <fichero>` y escribe `tools/recomp/output/icall_targets.json`, que se pasa a `tools.disasm --seed-functions`. Confirmar con `--help` antes de usarlo.
+- **`timeout 120`** no existe en macOS por defecto (`gtimeout` de coreutils, o un bucle con `kill`, como en los scripts de prueba usados el 19/09).
+- **`SDL_Init(SDL_INIT_VIDEO | …)`:** no conviene, porque la ventana es Cocoa propia. Basta con `SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER)` más los hints y el bombeo de eventos (P0.2).
