@@ -786,9 +786,48 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+/* The busy bits on their own thread.
+ *
+ * nv2a_ack_thread clears them between pushbuffer segments, and a segment is
+ * now drawn by xemu on that same thread -- tens of milliseconds in a level.
+ * D3D's KickOff (sub_0026D0C0 in Black) sets the PFB flush bit and spins
+ * until it drops, so every kick waited for the GPU to finish the previous
+ * segment: CPU and GPU in series, ~40% of Black's game thread in that spin
+ * and 8-14 frames/s in its first level. On hardware the flush takes
+ * microseconds and has nothing to do with drawing. Only the NV2A_ACK table
+ * is handled here; the interrupt registers keep their old cadence (clearing
+ * those promptly broke D3D's startup). */
+static volatile LONG g_nv2a_busy_stop;
+static DWORD WINAPI nv2a_busy_ack_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    while (!InterlockedCompareExchange(&g_nv2a_busy_stop, 0, 0)) {
+        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            if (*r & NV2A_ACK[i].busy_mask)
+                *r &= ~NV2A_ACK[i].busy_mask;
+        }
+#if defined(_WIN32)
+        Sleep(0);
+#else
+        {
+            struct timespec w = { 0, 20000 };   /* 20 us */
+            nanosleep(&w, NULL);
+        }
+#endif
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     g_nv2a_ack_stop = 0;
+    {
+        HANDLE h = CreateThread(NULL, 0, nv2a_busy_ack_thread, g_nv2a_memory, 0, NULL);
+        if (h)
+            CloseHandle(h);
+    }
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
