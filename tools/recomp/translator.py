@@ -814,6 +814,12 @@ class FunctionTranslator:
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
+        # Result snapshots for a flag setter whose operand is overwritten
+        # before a branch could read it (lifter.snapshot_clobbered_flags).
+        # Taken whether or not this function branches: the flags may be read
+        # by a caller's code after a tail jump, and an unused one costs nothing.
+        lines.append("    uint32_t _fr = 0, _fr8 = 0, _fr16 = 0, _fr2 = 0, _fr2_8 = 0, _fr2_16 = 0;")
+        lines.append("    (void)_fr; (void)_fr8; (void)_fr16; (void)_fr2; (void)_fr2_8; (void)_fr2_16;")
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch

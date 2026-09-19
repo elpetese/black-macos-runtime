@@ -171,6 +171,9 @@ def _fmt_mem_write(op, value_expr):
 _REG_WIDTH = {
     "al": 1, "ah": 1, "bl": 1, "bh": 1, "cl": 1, "ch": 1, "dl": 1, "dh": 1,
     "ax": 2, "bx": 2, "cx": 2, "dx": 2, "si": 2, "di": 2, "bp": 2, "sp": 2,
+    # Flag-result snapshots (snapshot_clobbered_flags), at the width of the
+    # operand they stand for.
+    "_fr8": 1, "_fr16": 2, "_fr2_8": 1, "_fr2_16": 2,
 }
 
 
@@ -513,9 +516,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}{lhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}{lhs} >= 0)", desc
         # Ordered: reconstruct original a = result + b
         if cmp_macro and rhs:
             return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
@@ -540,9 +543,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}{lhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}{lhs} >= 0)", desc
         if jcc in ("jb", "jnae", "jc"):
             return f"({lhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb", "jnc"):
@@ -564,9 +567,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}{lhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}{lhs} >= 0)", desc
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -576,9 +579,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc in ("js", "jl"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}{lhs} < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}{lhs} >= 0)", desc
         if jcc == "jle":
             return f"((int32_t){lhs} <= 0)", desc
         if jcc == "jg":
@@ -596,9 +599,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}{lhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}{lhs} >= 0)", desc
         if jcc in ("jl", "jle", "jg", "jge"):
             cast = "(int32_t)" + lhs
             op = {"jl": "<", "jle": "<=", "jg": ">", "jge": ">="}[jcc]
@@ -617,9 +620,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} == 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}{lhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}{lhs} >= 0)", desc
         if jcc in ("jg", "jnle"):
             return f"((int32_t){lhs} > 0)", desc
         if jcc in ("jge", "jnl"):
@@ -637,9 +640,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}{lhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}{lhs} >= 0)", desc
         return None
 
     # ── shld/shrd: double-precision shift, result-based ──
@@ -649,9 +652,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}{lhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}{lhs} >= 0)", desc
         return None
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
@@ -3150,6 +3153,153 @@ FLAG_MERGE = "__merge__"
 _FLAG_MERGE_LIMIT = 4
 
 
+# ── Flag operands overwritten before the branch ─────────────────
+#
+# A result-based flag setter (sub, add, and, dec, ...) is lifted as a plain
+# write, and the branch after it rebuilds ZF/SF from the destination as it is
+# when the branch runs. An instruction that leaves EFLAGS alone may overwrite
+# that destination first; MSVC schedules exactly that:
+#
+#     sub eax, 4
+#     mov eax, dword ptr [0x56f02c]
+#     je  ...
+#
+# which came out as `eax = eax - 4; eax = MEM32(0x56F02C); if (eax == 0)`,
+# testing the loaded value. In Black that sent every opaque mesh down the
+# subtractive-blend path (the je decides blend mode from a material flag).
+# cmp/test are already safe -- they snapshot into _fa/_fb -- so for the rest,
+# snapshot the operand the moment something is about to overwrite it, and
+# have the condition read the snapshot.
+
+_REG_FAMILY = {}
+for _full, _subs in (("eax", ("al", "ah", "ax")), ("ebx", ("bl", "bh", "bx")),
+                     ("ecx", ("cl", "ch", "cx")), ("edx", ("dl", "dh", "dx")),
+                     ("esi", ("si",)), ("edi", ("di",)), ("ebp", ("bp",)),
+                     ("esp", ("sp",))):
+    _REG_FAMILY[_full] = _full
+    for _s in _subs:
+        _REG_FAMILY[_s] = _full
+
+# Setters whose conditions already read snapshots or no operands at all.
+_FLAG_SETTERS_SNAPSHOTTED = frozenset({
+    "cmp", "test", "bsf", "bsr", "comiss", "comisd", "ucomiss", "ucomisd",
+    "fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi", "sahf",
+    "cmpxchg", "lock cmpxchg",
+})
+
+_SNAP_NAMES = {0: {1: "_fr8", 2: "_fr16", 4: "_fr"},
+               1: {1: "_fr2_8", 2: "_fr2_16", 4: "_fr2"}}
+
+
+def _operand_reads(op):
+    """(register families, reads memory) that an operand's value depends on."""
+    if op.type == "reg":
+        fam = _REG_FAMILY.get(str(op.reg).lower())
+        return ({fam} if fam else set()), False
+    if op.type == "mem":
+        regs = set()
+        for r in (op.mem_base, op.mem_index):
+            fam = _REG_FAMILY.get(str(r).lower()) if r else None
+            if fam:
+                regs.add(fam)
+        return regs, True
+    return set(), False
+
+
+def _insn_writes(insn):
+    """(register families, writes memory) for a flags-preserving instruction.
+
+    Conservative: an extra snapshot costs one assignment, a missed one is a
+    wrong branch."""
+    m = insn.mnemonic
+    ops = insn.operands
+    regs, mem = set(), False
+
+    def dest(op):
+        nonlocal mem
+        if op.type == "reg":
+            fam = _REG_FAMILY.get(str(op.reg).lower())
+            if fam:
+                regs.add(fam)
+        elif op.type == "mem":
+            mem = True
+
+    if m.startswith("rep") or m in ("movsb", "movsw", "stosb", "stosw", "stosd",
+                                    "lodsb", "lodsw", "lodsd", "scasb", "scasd",
+                                    "cmpsb", "cmpsd") \
+            or (m == "movsd" and not any(o.type == "reg" and str(o.reg).startswith("xmm")
+                                          for o in ops)):
+        return {"esi", "edi", "ecx", "eax"}, True
+    if m in ("push", "pushfd", "pushal"):
+        return {"esp"}, True
+    if m in ("pop", "popfd"):
+        regs.add("esp")
+        if ops:
+            dest(ops[0])
+        return regs, mem
+    if m == "leave":
+        return {"esp", "ebp"}, False
+    if m in ("call",):
+        return {"eax", "ecx", "edx", "esp"}, True
+    if m in ("cdq", "cwd"):
+        return {"edx"}, False
+    if m in ("cwde", "cbw", "lahf"):
+        return {"eax"}, False
+    if m == "xchg":
+        for o in ops:
+            dest(o)
+        return regs, mem
+    if m in ("fnstsw", "fstsw") and (not ops or ops[0].type == "reg"):
+        return {"eax"}, False
+    if m in ("nop", "wait", "int3", "int", "cld", "std", "cli", "sti",
+             "sfence", "out", "ret"):
+        return set(), False
+    if ops:
+        dest(ops[0])
+    return regs, mem
+
+
+def _snap_plan(insn, state):
+    """For a flags-preserving `insn`, which of the state's operands it
+    overwrites. Returns (new_ops, [(snapshot_name, original_op)]) or None."""
+    if not isinstance(state, tuple) or len(state) != 2 \
+            or state[0] in _FLAG_SETTERS_SNAPSHOTTED:
+        return None
+    setter, ops = state
+    if setter == FLAG_MERGE or not ops:
+        return None
+    wregs, wmem = _insn_writes(insn)
+    if not wregs and not wmem:
+        return None
+    new_ops = list(ops)
+    snaps = []
+    for k, op in enumerate(ops[:2]):
+        if op.type not in ("reg", "mem") or str(getattr(op, "reg", "")).startswith("_fr"):
+            continue
+        rregs, rmem = _operand_reads(op)
+        if not (rregs & wregs or (rmem and wmem)):
+            continue
+        width = _operand_width(op) or 4
+        name = _SNAP_NAMES[k].get(width, _SNAP_NAMES[k][4])
+        new_ops[k] = Operand(type="reg", reg=name)
+        snaps.append((name, op))
+    if not snaps:
+        return None
+    return new_ops, snaps
+
+
+def snapshot_clobbered_flags(insn, state):
+    """C statements that save the flag operands `insn` is about to overwrite,
+    and the flag state to continue with. (stmts, state)."""
+    plan = _snap_plan(insn, state)
+    if not plan:
+        return [], state
+    new_ops, snaps = plan
+    stmts = [f"{name} = (uint32_t)({_fmt_operand_read(op)}); /* flags outlive {insn.mnemonic} */"
+             for name, op in snaps]
+    return stmts, (state[0], new_ops)
+
+
 def next_flag_state(insn, state):
     """Flag state after `insn`, given the state before it."""
     m = insn.mnemonic
@@ -3158,11 +3308,14 @@ def next_flag_state(insn, state):
     if m in _FLAGS_UNDEFINED:
         return None
     if m in _EFLAGS_PRESERVE:
-        return state
+        plan = _snap_plan(insn, state)
+        return (state[0], plan[0]) if plan else state
     if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi", "sahf"):
         return (m, list(insn.operands))
-    if m.startswith("f") or m.startswith("cmov") or m.startswith("j") \
-            or m.startswith("set"):
+    if m.startswith("f") or m.startswith("cmov") or m.startswith("set"):
+        plan = _snap_plan(insn, state)
+        return (state[0], plan[0]) if plan else state
+    if m.startswith("j"):
         return state
     if m.startswith("rep"):
         rest = insn.op_str.strip() if hasattr(insn, "op_str") else ""
@@ -3237,6 +3390,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
     while i < len(insns):
         curr = insns[i]
+
+        # An instruction that keeps the flags but overwrites what they were
+        # computed from: save the operand first (snapshot_clobbered_flags).
+        if (last_flag_setter and curr.mnemonic not in FLAG_SETTERS
+                and curr.mnemonic not in _EFLAGS_SETTERS):
+            snap_stmts, snap_state = snapshot_clobbered_flags(
+                curr, (last_flag_setter, last_flag_ops))
+            if snap_stmts:
+                stmts.extend(snap_stmts)
+                last_flag_setter, last_flag_ops = snap_state
 
         # Try cmp/test + jcc pattern first (2-instruction match)
         match = try_match_cmp_jcc(insns, i, lifter=lifter)
