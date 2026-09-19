@@ -38,6 +38,7 @@ static int s_seen_count;
  * looking method numbers out of parameter data, and the counts then describe
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
+static uint32_t s_tot_calls, calls_bad;
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -179,6 +180,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t va = start_va;
     uint32_t words = 0, jumps = 0, unknown = 0;
+    uint32_t subr_return = 0, calls = 0;
+    int subr_active = 0;
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
@@ -204,8 +207,30 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             va = 0x80000000u | (w & 0x0FFFFFFCu);
             continue;
         }
-        if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
+        /* CALL and RETURN: one level of subroutine, as on the hardware.
+         * Skipping them dropped every method in a called block -- D3D's
+         * recorded pushbuffers and state blocks -- which left Black drawing
+         * its level with the blend state of the particles before it. */
+        if ((w & 3u) == 2u) {
+            if (subr_active) {
+                calls_bad++;
+                break;                          /* nested CALL: a fault on HW */
+            }
+            subr_return = va;
+            subr_active = 1;
+            calls++;
+            va = 0x80000000u | (w & 0x0FFFFFFCu);
             continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {
+            if (!subr_active) {
+                calls_bad++;
+                continue;
+            }
+            subr_active = 0;
+            va = subr_return;
+            continue;
+        }
         if ((w & 0x00030003u) == 0u) {
             uint32_t count  = (w >> 18) & 0x7FFu;
             uint32_t subch  = (w >> 13) & 7u;
@@ -260,5 +285,17 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
+    if (calls && !s_tot_calls) {
+        fprintf(stderr, "  [PB] first pushbuffer CALL followed\n");
+        fflush(stderr);
+    }
+    s_tot_calls += calls;
+    if (calls_bad) {
+        static int shown;
+        if (!shown++) {
+            fprintf(stderr, "  [PB] CALL/RETURN out of order (%u)\n", calls_bad);
+            fflush(stderr);
+        }
+    }
     s_tot_segments++;
 }
