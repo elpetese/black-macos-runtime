@@ -2469,16 +2469,6 @@ static void bridge_RtlNtStatusToDosError(void)
  */
 
 /* Extract the ANSI path string from an Xbox OBJECT_ATTRIBUTES */
-static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
-{
-    uint32_t ansi_str_va, buf_va;
-    if (!obj_attrs_va) return NULL;
-    ansi_str_va = BRIDGE_MEM32(obj_attrs_va + 4);
-    if (!ansi_str_va) return NULL;
-    buf_va = BRIDGE_MEM32(ansi_str_va + 4);
-    if (!buf_va) return NULL;
-    return (const char*)XBOX_TO_NATIVE(buf_va);
-}
 
 /* Write NTSTATUS + Information into Xbox IO_STATUS_BLOCK */
 static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t info)
@@ -2560,6 +2550,21 @@ static HANDLE bridge_resolve_handle(uint32_t token)
     return (HANDLE)(uintptr_t)token;
 }
 
+/* The Xbox path each open handle was opened with, so a later open relative
+ * to it (OBJECT_ATTRIBUTES.RootDirectory) can be resolved. XAPI's save-block
+ * counter walks a save tree exactly that way: it opens each subdirectory by
+ * its bare name with the parent's handle as the root. */
+static char *s_handle_xpath[BRIDGE_HANDLE_MAX];
+
+static void bridge_set_handle_xpath(uint32_t token, const char *xpath)
+{
+    uint32_t i = token & BRIDGE_HANDLE_MASK;
+    if ((token & 0xFF000000u) != BRIDGE_HANDLE_TAG || i == 0 || i >= BRIDGE_HANDLE_MAX)
+        return;
+    free(s_handle_xpath[i]);
+    s_handle_xpath[i] = xpath ? strdup(xpath) : NULL;
+}
+
 static HANDLE bridge_take_handle(uint32_t token)
 {
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
@@ -2567,10 +2572,54 @@ static HANDLE bridge_take_handle(uint32_t token)
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
             HANDLE h = s_handle_table[i];
             s_handle_table[i] = NULL;
+            free(s_handle_xpath[i]);
+            s_handle_xpath[i] = NULL;
             return h;
         }
     }
     return NULL;   /* untagged -> not a table handle, do not close */
+}
+
+/* The object name an OBJECT_ATTRIBUTES names, as a NUL-terminated Xbox path.
+ *
+ * Guest layout: { HANDLE RootDirectory; POBJECT_STRING ObjectName; ULONG
+ * Attributes }, and OBJECT_STRING is { USHORT Length; USHORT MaximumLength;
+ * char *Buffer }. The Buffer is NOT terminated at Length: XAPI's FindFirstFile
+ * passes "u:\*" with Length 3 to open the directory "u:\" and keeps the rest
+ * as the search mask. Reading to the NUL opened a file literally named "*".
+ *
+ * Returns a per-thread buffer, valid until the next call on that thread. */
+static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
+{
+    static __thread char out[2][MAX_PATH];
+    static __thread int which;
+    char name[MAX_PATH];
+    uint32_t root, ansi_str_va, buf_va, len;
+    char *dst;
+
+    if (!obj_attrs_va) return NULL;
+    root        = BRIDGE_MEM32(obj_attrs_va + 0);
+    ansi_str_va = BRIDGE_MEM32(obj_attrs_va + 4);
+    if (!ansi_str_va) return NULL;
+    len    = BRIDGE_MEM16(ansi_str_va);
+    buf_va = BRIDGE_MEM32(ansi_str_va + 4);
+    if (!buf_va) return NULL;
+    if (len >= sizeof name) len = sizeof name - 1;
+    memcpy(name, XBOX_TO_NATIVE(buf_va), len);
+    name[len] = '\0';
+
+    dst = out[which ^= 1];
+    if ((root & 0xFF000000u) == BRIDGE_HANDLE_TAG &&
+        (root & BRIDGE_HANDLE_MASK) < BRIDGE_HANDLE_MAX &&
+        s_handle_xpath[root & BRIDGE_HANDLE_MASK]) {
+        const char *base = s_handle_xpath[root & BRIDGE_HANDLE_MASK];
+        size_t bl = strlen(base);
+        int sep = bl > 0 && base[bl - 1] != '\\';
+        snprintf(dst, MAX_PATH, "%s%s%s", base, sep ? "\\" : "", name);
+    } else {
+        memcpy(dst, name, len + 1);
+    }
+    return dst;
 }
 
 /* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path. */
@@ -2610,6 +2659,7 @@ static NTSTATUS bridge_create_file_impl(
 
     if (NT_SUCCESS(st)) {
         bridge_write_handle(handle_va, h);
+        bridge_set_handle_xpath(bridge_handle_token(h), name.Buffer);
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
         fprintf(stderr, "  [FILE] open ok \"%.*s\"\n", (int)name.Length, name.Buffer);
     } else {
@@ -3164,15 +3214,23 @@ static void bridge_NtDeleteFile(void)
     g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
 }
 
-/* ── NtQueryDirectoryFile (ordinal 207, 9 args = 36 bytes) ─ */
+/* ── NtQueryDirectoryFile (ordinal 207, 10 args = 40 bytes) ─
+ * The Xbox kernel keeps NT's FileInformationClass between Length and the
+ * mask: (Handle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation,
+ * Length, FileInformationClass, FileMask, RestartScan). Black's XAPI
+ * FindFirstFile/FindNextFile (0x00025883, 0x000258EB) push all ten. Reading
+ * nine took the class (1) as the mask and the mask pointer as RestartScan, so
+ * every call restarted the scan, and popping 36 bytes left 4 behind on the
+ * guest stack after each call. */
 static void bridge_NtQueryDirectoryFile(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va      = STACK_ARG(4);
     uint32_t info_va     = STACK_ARG(5);
     uint32_t length      = STACK_ARG(6);
-    uint32_t filename_va = STACK_ARG(7);  /* PXBOX_ANSI_STRING */
-    uint32_t restart     = STACK_ARG(8);  /* BOOLEAN */
+    /* STACK_ARG(7): FileInformationClass -- always FileDirectoryInformation */
+    uint32_t filename_va = STACK_ARG(8);  /* PXBOX_ANSI_STRING */
+    uint32_t restart     = STACK_ARG(9) & 0xFF;  /* BOOLEAN */
     XBOX_IO_STATUS_BLOCK ios;
     XBOX_ANSI_STRING     fn;
     PXBOX_ANSI_STRING    pfn = NULL;
@@ -4725,7 +4783,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 204: return 16;  /* NtProtectVirtualMemory (4) */
     case 205: return  8;  /* NtPulseEvent (2) */
     case 206: return 20;  /* NtQueueApcThread (5) */
-    case 207: return 36;  /* NtQueryDirectoryFile (9) */
+    case 207: return 40;  /* NtQueryDirectoryFile (10) */
     case 210: return  8;  /* NtQueryFullAttributesFile (2) */
     case 211: return 20;  /* NtQueryInformationFile (5) */
     case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */

@@ -29,6 +29,8 @@ int  xbox_KeyboardSlotForKey(unsigned char c);
 int  xbox_KeyboardSlotForKeyCode(unsigned short keycode);
 void xbox_KeyboardPressSlot(int slot);
 void xbox_KeyboardReleaseSlot(int slot);
+int  xbox_KeyboardAutostartPending(void);
+void xbox_KeyboardTitleSeen(void);
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int xbox_IsXboxAddress(uintptr_t);
@@ -134,6 +136,62 @@ static int read_fb(uint32_t fb_va, uint32_t pitch, uint32_t bpp)
             }
         }
     }
+    return 1;
+}
+
+/* Black's title screen, recognised in the presented 640x480 BGRA frame: the
+ * white "PRESS START" line at y 344..356 under the gold BLACK logo. Both are
+ * required, so a white video placeholder or a fade does not count. */
+static int looks_like_title(const uint8_t *px)
+{
+    uint32_t text = 0, gold = 0;
+    if (s_width != 640 || s_height != 480)
+        return 0;
+    for (uint32_t y = 344; y < 357; y++)
+        for (uint32_t x = 260; x < 380; x++) {
+            const uint8_t *p = px + ((size_t)y * s_width + x) * 4u;
+            if (p[0] > 180 && p[1] > 180 && p[2] > 180)
+                text++;
+        }
+    for (uint32_t y = 120; y < 240; y += 2)
+        for (uint32_t x = 200; x < 440; x += 2) {
+            const uint8_t *p = px + ((size_t)y * s_width + x) * 4u;
+            if (p[2] > 110 && p[1] > 80 && p[0] < p[2] - 20)   /* B G R */
+                gold++;
+        }
+    return text > 40 && text < 1200 && gold > 400;
+}
+
+/* Write an s_width x s_height BGRA buffer as a bottom-up 24-bit BMP. */
+static int write_bmp24(const char *path, const uint8_t *pixels)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return 0;
+    uint32_t row = ((s_width * 3u) + 3u) & ~3u;
+    uint8_t header[54] = {0};
+    uint8_t *line = calloc(1, row);
+    header[0] = 'B'; header[1] = 'M';
+    uint32_t image_size = row * s_height;
+    uint32_t file_size = 54u + image_size;
+    memcpy(header + 2, &file_size, 4);
+    header[10] = 54; header[14] = 40;
+    memcpy(header + 18, &s_width, 4);
+    memcpy(header + 22, &s_height, 4);
+    header[26] = 1; header[28] = 24;
+    memcpy(header + 34, &image_size, 4);
+    fwrite(header, 1, sizeof header, f);
+    for (int y = s_height; y-- > 0;) {
+        const uint8_t *src = pixels + (size_t)y * s_width * 4u;
+        for (uint32_t x = 0; x < s_width; x++) {
+            line[x * 3u + 0] = src[x * 4u + 0];
+            line[x * 3u + 1] = src[x * 4u + 1];
+            line[x * 3u + 2] = src[x * 4u + 2];
+        }
+        fwrite(line, 1, row, f);
+    }
+    free(line);
+    fclose(f);
     return 1;
 }
 
@@ -537,6 +595,10 @@ static int init_metal(void)
     NSString *chars = [event characters];
     int slot = -1;
 
+    /* RECOMP_BACKGROUND: scripted runs take input from RECOMP_INPUT_SCRIPT only. */
+    if (getenv("RECOMP_BACKGROUND"))
+        return;
+
     if (chars && [chars length] >= 1) {
         unichar u = [chars characterAtIndex:0];
         if (u < 128)
@@ -647,36 +709,10 @@ static void *render_thread(void *unused)
                     if (tmp && read_fb_to(candidates[i].va, candidates[i].pitch, candidates[i].bpp, tmp)) {
                         char path[256];
                         snprintf(path, sizeof(path), "%sf%04d-%08X.bmp", prefix, frame, candidates[i].va);
-                        FILE *f = fopen(path, "wb");
-                        if (f) {
-                            uint32_t row = ((s_width * 3u) + 3u) & ~3u;
-                            uint8_t header[54] = {0};
-                            uint8_t *line = calloc(1, row);
-                            header[0] = 'B'; header[1] = 'M';
-                            uint32_t image_size = row * s_height;
-                            uint32_t file_size = 54u + image_size;
-                            memcpy(header + 2, &file_size, 4);
-                            header[10] = 54; header[14] = 40;
-                            memcpy(header + 18, &s_width, 4);
-                            memcpy(header + 22, &s_height, 4);
-                            header[26] = 1; header[28] = 24;
-                            memcpy(header + 34, &image_size, 4);
-                            fwrite(header, 1, sizeof header, f);
-                            for (int y = s_height; y-- > 0;) {
-                                const uint8_t *src = tmp + (size_t)y * s_width * 4u;
-                                for (uint32_t x = 0; x < s_width; x++) {
-                                    line[x * 3u + 0] = src[x * 4u + 0];
-                                    line[x * 3u + 1] = src[x * 4u + 1];
-                                    line[x * 3u + 2] = src[x * 4u + 2];
-                                }
-                                fwrite(line, 1, row, f);
-                            }
-                            free(line);
-                            fclose(f);
+                        if (write_bmp24(path, tmp))
                             fprintf(stderr, "  [FBWIN] wrote %s score=%u first=0x%08X\n",
                                     path, candidates[i].nonzero_score, candidates[i].first_pixel);
-                            fflush(stderr);
-                        }
+                        fflush(stderr);
                     }
                     free(tmp);
                 }
@@ -702,6 +738,60 @@ static void *render_thread(void *unused)
                     (unsigned long long)s_fb_frames_presented);
             fflush(stderr);
             last_print = now_ms();
+        }
+        if (xbox_KeyboardAutostartPending() && s_pixels) {
+            static int title_frames, misses;
+            int title;
+            pthread_mutex_lock(&s_pixels_lock);
+            title = looks_like_title(s_pixels);
+            pthread_mutex_unlock(&s_pixels_lock);
+            /* The scanner flickers to the other buffer now and then; a few
+             * misses do not reset the count, a sustained absence does. */
+            if (title) {
+                title_frames++;
+                misses = 0;
+            } else if (++misses > 30) {         /* half a second without it */
+                title_frames = 0;
+            }
+            if (title_frames >= 120) {          /* ~2 s of title */
+                xbox_KeyboardTitleSeen();
+                title_frames = 0;
+            }
+        }
+        {
+            /* RECOMP_FB_SNAP=<prefix>: save the presented frame once a second,
+             * so a run can be reviewed afterwards without watching the window. */
+            static const char *snap;
+            static int snap_init;
+            static uint64_t last_snap;
+            if (!snap_init) {
+                snap = getenv("RECOMP_FB_SNAP");
+                snap_init = 1;
+            }
+            if (snap && s_pixels && now_ms() - last_snap >= 1000) {
+                char path[512];
+                last_snap = now_ms();
+                snprintf(path, sizeof(path), "%s%06llu.bmp", snap,
+                         (unsigned long long)s_fb_frames_presented);
+                pthread_mutex_lock(&s_pixels_lock);
+                write_bmp24(path, s_pixels);
+                pthread_mutex_unlock(&s_pixels_lock);
+                /* RECOMP_SNAP_VA=<va>: also save a 640x480x32 image at that
+                 * guest address (a render target the title draws into). */
+                {
+                    const char *sva = getenv("RECOMP_SNAP_VA");
+                    if (sva) {
+                        uint8_t *tmp = calloc(1, (size_t)s_width * s_height * 4u);
+                        if (tmp && read_fb_to((uint32_t)strtoul(sva, NULL, 0),
+                                              s_width * 4u, 4, tmp)) {
+                            snprintf(path, sizeof(path), "%s%06llu_va.bmp", snap,
+                                     (unsigned long long)s_fb_frames_presented);
+                            write_bmp24(path, tmp);
+                        }
+                        free(tmp);
+                    }
+                }
+            }
         }
         {
             const char *dump = getenv("RECOMP_FB_DUMP");
@@ -778,8 +868,15 @@ void xbox_FramebufferWindowStart(void)
             [s_window makeFirstResponder:kv];
             [kv release];
         }
-        [s_window makeKeyAndOrderFront:nil];
-        [NSApp activateIgnoringOtherApps:YES];
+        /* RECOMP_BACKGROUND: show the window without taking focus, so an
+         * automated run neither steals the user's keystrokes nor reads them
+         * as game input. */
+        if (getenv("RECOMP_BACKGROUND")) {
+            [s_window orderFrontRegardless];
+        } else {
+            [s_window makeKeyAndOrderFront:nil];
+            [NSApp activateIgnoringOtherApps:YES];
+        }
         s_dump_at = now_ms() + 4000u;
         s_dumped = 0;
         s_running = 1;

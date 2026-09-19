@@ -1049,6 +1049,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -1251,6 +1253,10 @@ class Lifter:
                  "minps", "maxps", "rsqrtss", "rcpss",
                  "sqrtps", "rsqrtps", "rcpps",
                  "cmpneqps", "cmpeqps", "cmpltps", "cmpleps",
+                 "cmpnltps", "cmpnleps", "cmpunordps", "cmpordps",
+                 "cmpeqss", "cmpltss", "cmpless", "cmpunordss",
+                 "cmpneqss", "cmpnltss", "cmpnless", "cmpordss",
+                 "cvtpi2ps",
                  "movmskps",
                  "pand", "pandn", "por", "pxor", "pcmpgtd"):
             return self._lift_sse(insn, m, ops)
@@ -1660,6 +1666,35 @@ class Lifter:
             out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
         out.append(_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})"))
         return out
+
+    def _lift_rotate_carry(self, insn, ops, m):
+        """rcl/rcr: rotate through CF, one bit at a time.
+
+        MSVC's 64-bit division helpers (__aulldiv, __alldiv, __aullrem) shift
+        a divisor wider than 32 bits down with "shr hi, 1 / rcr lo, 1". Lifted
+        as nothing, the low word never received the bit shifted out of the
+        high one, and every 64-bit division by a large number came out wrong.
+        The count is masked to 5 bits and taken modulo width+1, as the CPU
+        does. _cf is declared for any function containing these (see
+        _function_needs_cf)."""
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        width = (_operand_width(ops[0]) or 4) * 8
+        mask = {8: "0xFFu", 16: "0xFFFFu", 32: "0xFFFFFFFFu"}.get(width, "0xFFFFFFFFu")
+        top = f"{width - 1}u"
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        if m == "rcr":
+            step = (f"_rc_c = _rc_v & 1u; _rc_v = (_rc_v >> 1) | ((uint32_t)(_cf & 1) << {top});"
+                    f" _cf = (int)_rc_c;")
+        else:
+            step = (f"_rc_c = (_rc_v >> {top}) & 1u; _rc_v = ((_rc_v << 1) | (uint32_t)(_cf & 1)) & {mask};"
+                    f" _cf = (int)_rc_c;")
+        return [
+            f"{{ uint32_t _rc_v = (uint32_t)({dst}) & {mask}, _rc_c, _rc_n = ((uint32_t)({cnt}) & 31u) % {width + 1}u;",
+            f"  while (_rc_n--) {{ {step} }}",
+            "  " + _fmt_operand_write(ops[0], "_rc_v") + f" }} /* {m} */",
+        ]
 
     def _lift_rotate(self, insn, ops, m):
         if len(ops) < 2:
@@ -2311,6 +2346,14 @@ class Lifter:
 
         dst = ops[0]
 
+        # cvtpi2ps xmm, mm/m64: two int32 to the low two float lanes. It has
+        # an mm source, so it arrives here rather than at the SSE lifter.
+        if m == "cvtpi2ps" and len(ops) >= 2 and dst.type == "reg" and dst.reg.startswith("xmm"):
+            s_ = src(ops[1])
+            if s_ is not None:
+                return [f"{{ RecompMmx _s = {s_}; {dst.reg}.f[0] = (float)_s.d[0];"
+                        f" {dst.reg}.f[1] = (float)_s.d[1]; }} /* cvtpi2ps */"]
+
         if m in self._MMX_BINARY and len(ops) >= 2:
             a, b = src(dst), src(ops[1])
             if a is None or b is None:
@@ -2659,6 +2702,44 @@ class Lifter:
             if nops >= 2:
                 return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}")
                         + " /* rcpps (low lane; 4-lane model TODO) */"]
+
+        # ── Scalar comparison ──
+        # Lane 0 becomes an all-ones or all-zero mask, the other lanes keep
+        # the destination's. Used as the select mask in branchless clamps and
+        # min/max, so the no-op these used to be left a float where a mask
+        # was expected.
+        _SS_PRED = {"eq": "_a == _b", "lt": "_a < _b", "le": "_a <= _b",
+                    "unord": "(_a != _a || _b != _b)", "neq": "!(_a == _b)",
+                    "nlt": "!(_a < _b)", "nle": "!(_a <= _b)",
+                    "ord": "(_a == _a && _b == _b)"}
+        if m.startswith("cmp") and m.endswith("ss") and m[3:-2] in _SS_PRED:
+            if nops >= 2 and _is_xmm(ops[0]):
+                return [f"{{ float _a = {ops[0].reg}.f[0], _b = {_sse_read(ops[1])};"
+                        f" {ops[0].reg}.u[0] = ({_SS_PRED[m[3:-2]]}) ? 0xFFFFFFFFu : 0u; }}"
+                        f" /* {m} */"]
+        if m in ("cmpnltps", "cmpnleps", "cmpunordps", "cmpordps"):
+            a = _packed_read(ops[0]) if nops >= 2 else None
+            b = _packed_read(ops[1]) if nops >= 2 else None
+            if a is not None and b is not None:
+                pred = _SS_PRED[m[3:-2]]
+                written = _packed_write(ops[0], "_r")
+                if written is not None:
+                    return [f"{{ RecompXmm _pa = {a}, _pb = {b}, _r; int _i;"
+                            f" for (_i = 0; _i < 4; _i++) {{ float _a = _pa.f[_i], _b = _pb.f[_i];"
+                            f" _r.u[_i] = ({pred}) ? 0xFFFFFFFFu : 0u; }} {written} }} /* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+
+        # ── cvtpi2ps: two packed int32 (an mm register or m64) to the low two
+        # float lanes; the high two are left alone. The XMV video decoder's
+        # colour conversion goes through it.
+        if m == "cvtpi2ps":
+            if nops >= 2 and _is_xmm(ops[0]):
+                if ops[1].type == "mem":
+                    srcv = f"MMX_MEM({_fmt_mem(ops[1])})"
+                else:
+                    srcv = ops[1].reg
+                return [f"{{ RecompMmx _s = {srcv}; {ops[0].reg}.f[0] = (float)_s.d[0];"
+                        f" {ops[0].reg}.f[1] = (float)_s.d[1]; }} /* cvtpi2ps */"]
 
         # ── Packed comparison ──
         if m in ("cmpneqps", "cmpeqps", "cmpltps", "cmpleps"):

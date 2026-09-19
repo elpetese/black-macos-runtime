@@ -12,6 +12,8 @@ void xbox_KeyboardRestoreTerminal(void) {}
 int  xbox_KeyboardSlotForKey(unsigned char c) { (void)c; return -1; }
 void xbox_KeyboardPressSlot(int slot) { (void)slot; }
 void xbox_KeyboardReleaseSlot(int slot) { (void)slot; }
+int  xbox_KeyboardAutostartPending(void) { return 0; }
+void xbox_KeyboardTitleSeen(void) {}
 
 #else
 
@@ -53,6 +55,14 @@ static uint64_t s_epoch;
 #define MAX_SCRIPT 64
 static struct { uint64_t at, until; int slot; } s_script[MAX_SCRIPT];
 static int s_script_len;
+
+/* RECOMP_AUTOSTART: hold the script until the title screen is on screen, then
+ * press Start and run the script with its times counted from that press. The
+ * title appears anywhere from ~35 to ~60 s into a run, so presses timed from
+ * boot landed during loading or a video as often as on the title. */
+static int s_autostart;
+static int s_autostart_fired;
+#define AUTOSTART_SCRIPT_DELAY_MS 1500u   /* script time 0 = this long after Start */
 
 static struct termios s_saved;
 static volatile sig_atomic_t s_tty_raw;
@@ -216,8 +226,10 @@ static void load_script(void)
                 fprintf(stderr, "  Keyboard: unknown button \"%.*s\" in "
                                 "RECOMP_INPUT_SCRIPT\n", (int)len, q);
             } else if (s_script_len < MAX_SCRIPT) {
-                s_script[s_script_len].at    = s_epoch + at;
-                s_script[s_script_len].until = s_epoch + at + hold;
+                /* Relative until xbox_KeyboardTitleSeen() rebases them. */
+                uint64_t base = s_autostart ? 0 : s_epoch;
+                s_script[s_script_len].at    = base + at;
+                s_script[s_script_len].until = base + at + hold;
                 s_script[s_script_len].slot  = slot;
                 s_script_len++;
             }
@@ -243,8 +255,53 @@ void xbox_KeyboardInit(void)
         return;
     done = 1;
     s_epoch = now_ms();
+    s_autostart = getenv("RECOMP_AUTOSTART") != NULL;
     load_script();
+    if (s_autostart) {
+        s_active = 1;
+        fprintf(stderr, "  Keyboard: RECOMP_AUTOSTART -- Start on the title screen, "
+                        "script counted from there\n");
+    }
     start_tty();
+}
+
+/* The title can be visible before it accepts input (it fades in, and its UI
+ * script arms Start a little later), so a press that is ignored is repeated
+ * while the title is still there -- a few times, then the script takes over. */
+#define AUTOSTART_RETRY_MS 5000u
+#define AUTOSTART_MAX_PRESSES 5
+static int      s_autostart_presses;
+static uint64_t s_autostart_last;
+
+int xbox_KeyboardAutostartPending(void)
+{
+    return s_autostart && s_autostart_presses < AUTOSTART_MAX_PRESSES
+        && (!s_autostart_presses || now_ms() - s_autostart_last >= AUTOSTART_RETRY_MS);
+}
+
+void xbox_KeyboardTitleSeen(void)
+{
+    uint64_t t;
+    int i;
+
+    if (!xbox_KeyboardAutostartPending())
+        return;
+    t = now_ms();
+    pthread_mutex_lock(&s_lock);
+    s_until[K_START] = t + 200u;
+    s_autostart_last = t;
+    if (!s_autostart_fired) {
+        s_autostart_fired = 1;
+        for (i = 0; i < s_script_len; i++) {
+            s_script[i].at    += t + AUTOSTART_SCRIPT_DELAY_MS;
+            s_script[i].until += t + AUTOSTART_SCRIPT_DELAY_MS;
+        }
+    }
+    s_autostart_presses++;
+    pthread_mutex_unlock(&s_lock);
+    fprintf(stderr, "  Keyboard: title screen detected at +%llu ms -- pressing Start\n",
+            (unsigned long long)(t - s_epoch));
+    fflush(stderr);
 }
 
 int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
@@ -275,7 +332,7 @@ int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
         down[i] = s_until[i] > t;
     pthread_mutex_unlock(&s_lock);
 
-    for (i = 0; i < s_script_len; i++) {
+    for (i = 0; i < s_script_len && (!s_autostart || s_autostart_fired); i++) {
         if (s_script[i].at <= t && t < s_script[i].until) {
             if (!down[s_script[i].slot]) {
                 static unsigned announced[MAX_SCRIPT];
@@ -298,9 +355,10 @@ int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
             pad->bAnalogButtons[analog[i]] = 255;
 
     g_f7_input_poll_count++;
+    /* Buttons only: a host pad's resting stick drift is never exactly 0, and
+     * counting it made every poll look like a press. */
     if (pad->wButtons || pad->bAnalogButtons[0] || pad->bAnalogButtons[1] ||
-        pad->bAnalogButtons[2] || pad->bAnalogButtons[3] ||
-        pad->sThumbLX || pad->sThumbLY || pad->sThumbRX || pad->sThumbRY) {
+        pad->bAnalogButtons[2] || pad->bAnalogButtons[3]) {
         g_f7_input_nonzero_buttons++;
     }
 

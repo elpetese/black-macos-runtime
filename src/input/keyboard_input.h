@@ -75,6 +75,12 @@ int xbox_KeyboardSlotForKeyCode(unsigned short keycode);
 void xbox_KeyboardPressSlot(int slot);
 void xbox_KeyboardReleaseSlot(int slot);
 
+/* RECOMP_AUTOSTART support: nonzero while waiting for the title screen, and
+ * the call the presenter makes when it sees it (presses Start once and starts
+ * RECOMP_INPUT_SCRIPT's clock). */
+int  xbox_KeyboardAutostartPending(void);
+void xbox_KeyboardTitleSeen(void);
+
 #ifdef __cplusplus
 }
 #endif

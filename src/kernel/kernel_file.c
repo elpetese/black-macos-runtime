@@ -1199,6 +1199,13 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
+        /* FATX has no "." or ".." entries, and a title enumerating its save
+         * root takes every entry for a save folder: Black went looking for
+         * u:\.\SaveMeta.xbx. macOS's AppleDouble "._*" files and .DS_Store
+         * are host metadata the title must not see either. */
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..") ||
+            !strncmp(de->d_name, "._", 2) || !strcmp(de->d_name, ".DS_Store"))
+            continue;
         if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
             break;
     }

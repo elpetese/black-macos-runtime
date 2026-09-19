@@ -225,7 +225,7 @@ typedef struct {
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
-    uint16_t   idx[NV_MAX_INDICES];
+    uint32_t   idx[NV_MAX_INDICES];
     uint32_t   idx_count;
     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
      * instead of into a buffer the title points at. Same vertex format, a
@@ -1298,6 +1298,578 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
                     textured ? (const float (*)[2])uv : NULL);
 }
 
+/* ── Vertex transform ─────────────────────────────────────────────────────
+ *
+ * Everything above draws only batches whose positions already arrive in
+ * screen space. Black draws its title that way and everything after it -- the
+ * profile menu past "CHECKING XBOX HARD DISK", and every level -- through the
+ * transform stage, so those batches were counted as "not screen-space" and
+ * dropped, which is a black screen with the title still running underneath.
+ *
+ * This is that stage, on the CPU:
+ *
+ *   - program mode (SET_TRANSFORM_EXECUTION_MODE = 2): the title's own NV2A
+ *     vertex program, interpreted per vertex. Xbox D3D appends the viewport
+ *     transform and the perspective divide to every program it assembles
+ *     (mul/rcc/mad through c[-38]/c[-37]), so oPos.xyz leaves it already in
+ *     screen space and oPos.w is the clip w, kept for perspective-correct
+ *     interpolation;
+ *   - fixed-function mode: position times the composite matrix, which Xbox D3D
+ *     builds with the viewport folded in, then divided by w.
+ *
+ * The instruction layout is the NV2A one xemu documents (hw/xbox/nv2a/vsh.c):
+ * 128-bit words, a MAC and an ILU operation per word, inputs from temporaries,
+ * vertex attributes or constants, R12 aliased to oPos.
+ *
+ * ponytail: no clipping against the near plane (a triangle with any w <= 0 is
+ * dropped), no culling, no lighting in fixed-function mode, register combiners
+ * approximated as texture * diffuse, and a host-side depth buffer rather than
+ * the title's zeta surface. Enough to put menus and levels on screen; the
+ * upgrade path is still the GPU translator.
+ */
+#define NV097_SET_COMPOSITE_MATRIX          0x0680   /* 16 floats */
+#define NV097_SET_SURFACE_ZETA_OFFSET       0x0214
+#define NV097_SET_DEPTH_TEST_ENABLE         0x030C
+#define NV097_SET_DEPTH_FUNC                0x0354
+#define NV097_SET_DEPTH_MASK                0x035C
+#define NV097_SET_TRANSFORM_PROGRAM         0x0B00   /* 32-dword window */
+#define NV097_SET_TRANSFORM_CONSTANT        0x0B80   /* 32-dword window */
+#define NV097_SET_ZSTENCIL_CLEAR_VALUE      0x1D8C
+#define NV097_SET_TRANSFORM_EXECUTION_MODE  0x1E94
+#define NV097_SET_TRANSFORM_PROGRAM_LOAD    0x1E9C
+#define NV097_SET_TRANSFORM_PROGRAM_START   0x1EA0
+#define NV097_SET_TRANSFORM_CONSTANT_LOAD   0x1EA4
+#define NV097_ARRAY_ELEMENT32               0x1808
+#define NV097_DRAW_ARRAYS                   0x1810
+
+#define VSH_SLOTS  136
+#define VSH_CONSTS 192
+
+static struct {
+    uint32_t prog[VSH_SLOTS][4];
+    uint32_t prog_load, prog_word, prog_start;
+    float    c[VSH_CONSTS][4];
+    uint32_t const_load, const_word;
+    float    composite[16];
+    int      composite_set;
+    uint32_t exec_mode;                 /* 0 fixed, 2 program */
+    int      depth_test, depth_write;
+    uint32_t depth_func;
+    uint32_t zeta_offset, zclear;
+    uint32_t batches, tris, culled_w, prog_errors;
+} s_xf = { .depth_write = 1, .depth_func = 0x0203 };
+
+/* Host depth buffer for the current colour surface. */
+static float   *s_zbuf;
+static uint32_t s_zbuf_w, s_zbuf_h;
+
+static float *zbuf(void)
+{
+    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
+    if (!w || !h)
+        return NULL;
+    if (w != s_zbuf_w || h != s_zbuf_h) {
+        free(s_zbuf);
+        s_zbuf = (float *)malloc(sizeof(float) * w * h);
+        if (!s_zbuf) { s_zbuf_w = s_zbuf_h = 0; return NULL; }
+        s_zbuf_w = w; s_zbuf_h = h;
+        for (uint32_t i = 0; i < w * h; i++) s_zbuf[i] = INFINITY;
+    }
+    return s_zbuf;
+}
+
+static void zbuf_clear(void)
+{
+    float *z = zbuf();
+    /* D24S8 keeps depth in the top 24 bits, Z16 in the low 16. The usual clear
+     * is "farthest", which is kept farther than anything drawn. */
+    float v = (float)(s_xf.zclear >> 8);
+    if (!z)
+        return;
+    if ((s_xf.zclear >> 8) >= 0xFFFF00u || (s_xf.zclear & 0xFFFFu) == 0xFFFFu)
+        v = INFINITY;
+    for (uint32_t i = 0; i < s_zbuf_w * s_zbuf_h; i++) z[i] = v;
+}
+
+static int depth_passes(float z, float d)
+{
+    switch (s_xf.depth_func) {
+    case 0x0200: return 0;
+    case 0x0201: return z <  d;
+    case 0x0202: return z == d;
+    case 0x0203: return z <= d;
+    case 0x0204: return z >  d;
+    case 0x0205: return z != d;
+    case 0x0206: return z >= d;
+    default:     return 1;
+    }
+}
+
+static uint32_t vsh_field(const uint32_t *t, int dw, int pos, int bits)
+{
+    return (t[dw] >> pos) & ((1u << bits) - 1u);
+}
+
+typedef struct { float v[4]; } Vec4;
+
+typedef struct {
+    Vec4 r[13];          /* R0..R11, R12 == oPos */
+    Vec4 o[13];          /* oPos oD0.. by output address; see VSH_O_* */
+    int  a0;
+} VshState;
+
+#define VSH_O_POS 0
+#define VSH_O_D0  3
+#define VSH_O_T0  9
+
+static Vec4 vsh_input(const VshState *st, const Vec4 *in, const uint32_t *t,
+                      int mux, int reg, int neg, int sx, int sy, int sz, int sw)
+{
+    Vec4 src = {{0, 0, 0, 1}}, out;
+    int ci;
+
+    switch (mux) {
+    case 1:                                    /* temporary */
+        src = reg == 12 ? st->o[VSH_O_POS] : st->r[reg > 12 ? 0 : reg];
+        break;
+    case 2:                                    /* vertex attribute */
+        src = in[vsh_field(t, 1, 9, 4)];
+        break;
+    case 3:                                    /* constant */
+        ci = (int)vsh_field(t, 1, 13, 8);
+        if (vsh_field(t, 3, 1, 1))
+            ci += st->a0;
+        if (ci >= 0 && ci < VSH_CONSTS)
+            memcpy(src.v, s_xf.c[ci], sizeof src.v);
+        break;
+    default:
+        break;
+    }
+    out.v[0] = src.v[sx]; out.v[1] = src.v[sy];
+    out.v[2] = src.v[sz]; out.v[3] = src.v[sw];
+    if (neg)
+        for (int i = 0; i < 4; i++) out.v[i] = -out.v[i];
+    return out;
+}
+
+static void vsh_write(Vec4 *dst, const Vec4 *val, uint32_t mask)
+{
+    if (mask & 8) dst->v[0] = val->v[0];
+    if (mask & 4) dst->v[1] = val->v[1];
+    if (mask & 2) dst->v[2] = val->v[2];
+    if (mask & 1) dst->v[3] = val->v[3];
+}
+
+static float dot3(const Vec4 *a, const Vec4 *b)
+{
+    return a->v[0] * b->v[0] + a->v[1] * b->v[1] + a->v[2] * b->v[2];
+}
+
+/* Run the loaded program for one vertex. Returns 0 if it never reached a
+ * final instruction. */
+static int vsh_run(const Vec4 in[16], VshState *st)
+{
+    uint32_t pc;
+
+    memset(st, 0, sizeof *st);
+    for (int i = 0; i < 13; i++) st->o[i].v[3] = 1.0f;
+    for (pc = s_xf.prog_start; pc < VSH_SLOTS; pc++) {
+        const uint32_t *t = s_xf.prog[pc];
+        uint32_t ilu = vsh_field(t, 1, 25, 3), mac = vsh_field(t, 1, 21, 4);
+        Vec4 a = vsh_input(st, in, t, vsh_field(t, 2, 26, 2), vsh_field(t, 2, 28, 4),
+                           vsh_field(t, 1, 8, 1), vsh_field(t, 1, 6, 2),
+                           vsh_field(t, 1, 4, 2), vsh_field(t, 1, 2, 2), vsh_field(t, 1, 0, 2));
+        Vec4 b = vsh_input(st, in, t, vsh_field(t, 2, 11, 2), vsh_field(t, 2, 13, 4),
+                           vsh_field(t, 2, 25, 1), vsh_field(t, 2, 23, 2),
+                           vsh_field(t, 2, 21, 2), vsh_field(t, 2, 19, 2), vsh_field(t, 2, 17, 2));
+        Vec4 c = vsh_input(st, in, t, vsh_field(t, 3, 28, 2),
+                           (vsh_field(t, 2, 0, 2) << 2) | vsh_field(t, 3, 30, 2),
+                           vsh_field(t, 2, 10, 1), vsh_field(t, 2, 8, 2),
+                           vsh_field(t, 2, 6, 2), vsh_field(t, 2, 4, 2), vsh_field(t, 2, 2, 2));
+        Vec4 mr = {{0, 0, 0, 0}}, ir = {{0, 0, 0, 0}};
+        uint32_t mac_mask = vsh_field(t, 3, 24, 4), out_r = vsh_field(t, 3, 20, 4);
+        uint32_t ilu_mask = vsh_field(t, 3, 16, 4), o_mask = vsh_field(t, 3, 12, 4);
+        uint32_t orb = vsh_field(t, 3, 11, 1), oaddr = vsh_field(t, 3, 3, 8);
+        uint32_t omux = vsh_field(t, 3, 2, 1);
+        int i;
+
+        switch (mac) {
+        case 1: mr = a; break;                                           /* MOV */
+        case 2: for (i = 0; i < 4; i++) mr.v[i] = a.v[i] * b.v[i]; break; /* MUL */
+        case 3: for (i = 0; i < 4; i++) mr.v[i] = a.v[i] + c.v[i]; break; /* ADD */
+        case 4: for (i = 0; i < 4; i++) mr.v[i] = a.v[i] * b.v[i] + c.v[i]; break; /* MAD */
+        case 5: mr.v[0] = mr.v[1] = mr.v[2] = mr.v[3] = dot3(&a, &b); break; /* DP3 */
+        case 6: mr.v[0] = mr.v[1] = mr.v[2] = mr.v[3] = dot3(&a, &b) + b.v[3]; break; /* DPH */
+        case 7: mr.v[0] = mr.v[1] = mr.v[2] = mr.v[3] = dot3(&a, &b) + a.v[3] * b.v[3]; break; /* DP4 */
+        case 8: mr.v[0] = 1.0f; mr.v[1] = a.v[1] * b.v[1];               /* DST */
+                mr.v[2] = a.v[2]; mr.v[3] = b.v[3]; break;
+        case 9:  for (i = 0; i < 4; i++) mr.v[i] = a.v[i] < b.v[i] ? a.v[i] : b.v[i]; break;
+        case 10: for (i = 0; i < 4; i++) mr.v[i] = a.v[i] > b.v[i] ? a.v[i] : b.v[i]; break;
+        case 11: for (i = 0; i < 4; i++) mr.v[i] = a.v[i] <  b.v[i] ? 1.0f : 0.0f; break;
+        case 12: for (i = 0; i < 4; i++) mr.v[i] = a.v[i] >= b.v[i] ? 1.0f : 0.0f; break;
+        case 13: st->a0 = (int)floorf(a.v[0]); break;                     /* ARL */
+        default: break;
+        }
+        switch (ilu) {
+        case 1: ir = c; break;                                            /* MOV */
+        case 2: case 3: {                                                 /* RCP, RCC */
+            float x = c.v[0], r = x == 0.0f ? INFINITY : 1.0f / x;
+            if (ilu == 3) {
+                if (r > 0 && r < 5.42101e-20f) r = 5.42101e-20f;
+                if (r > 1.84467e+19f) r = 1.84467e+19f;
+                if (r < 0 && r > -5.42101e-20f) r = -5.42101e-20f;
+                if (r < -1.84467e+19f) r = -1.84467e+19f;
+            }
+            ir.v[0] = ir.v[1] = ir.v[2] = ir.v[3] = r;
+            break;
+        }
+        case 4: {                                                         /* RSQ */
+            float x = fabsf(c.v[0]);
+            ir.v[0] = ir.v[1] = ir.v[2] = ir.v[3] = x == 0.0f ? INFINITY : 1.0f / sqrtf(x);
+            break;
+        }
+        case 5: {                                                         /* EXP */
+            float x = c.v[0], f = floorf(x);
+            ir.v[0] = exp2f(f); ir.v[1] = x - f; ir.v[2] = exp2f(x); ir.v[3] = 1.0f;
+            break;
+        }
+        case 6: {                                                         /* LOG */
+            float x = fabsf(c.v[0]);
+            if (x == 0.0f) { ir.v[0] = ir.v[2] = -INFINITY; ir.v[1] = 1.0f; }
+            else { float e = floorf(log2f(x)); ir.v[0] = e; ir.v[1] = x / exp2f(e); ir.v[2] = log2f(x); }
+            ir.v[3] = 1.0f;
+            break;
+        }
+        case 7: {                                                         /* LIT */
+            float d = c.v[0] > 0 ? c.v[0] : 0, s = c.v[1] > 0 ? c.v[1] : 0;
+            float p = c.v[3]; if (p < -127.9961f) p = -127.9961f; if (p > 127.9961f) p = 127.9961f;
+            ir.v[0] = 1.0f; ir.v[1] = d; ir.v[2] = c.v[0] > 0 ? powf(s, p) : 0.0f; ir.v[3] = 1.0f;
+            break;
+        }
+        default: break;
+        }
+
+        /* Temporaries: the MAC writes R[out_r]; the ILU does too, unless the
+         * MAC is also writing, in which case the ILU's goes to R1. */
+        if (mac && mac != 13 && mac_mask) {
+            Vec4 *d = out_r == 12 ? &st->o[VSH_O_POS] : &st->r[out_r > 12 ? 0 : out_r];
+            vsh_write(d, &mr, mac_mask);
+        }
+        if (ilu && ilu_mask) {
+            uint32_t ri = mac ? 1 : out_r;
+            Vec4 *d = ri == 12 ? &st->o[VSH_O_POS] : &st->r[ri > 12 ? 0 : ri];
+            vsh_write(d, &ir, ilu_mask);
+        }
+        /* The output register file (orb == 1), or a constant write-back. */
+        if (o_mask) {
+            const Vec4 *val = omux ? &ir : &mr;
+            if (orb) {
+                if (oaddr < 13)
+                    vsh_write(&st->o[oaddr], val, o_mask);
+            } else if (oaddr < VSH_CONSTS) {
+                Vec4 cv; memcpy(cv.v, s_xf.c[oaddr], sizeof cv.v);
+                vsh_write(&cv, val, o_mask);
+                memcpy(s_xf.c[oaddr], cv.v, sizeof cv.v);
+            }
+        }
+        if (vsh_field(t, 3, 0, 1))                                       /* FINAL */
+            return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    float x, y, z, inv_w;
+    float u, v;           /* already divided by w */
+    float col[4];         /* r g b a, 0..1 */
+    int   ok;
+} XfVertex;
+
+static void transform_vertex(uint32_t index, XfVertex *out)
+{
+    Vec4 in[16];
+    float w;
+    uint32_t a;
+
+    memset(out, 0, sizeof *out);
+    for (a = 0; a < 16; a++) {
+        in[a].v[0] = in[a].v[1] = in[a].v[2] = 0.0f;
+        in[a].v[3] = 1.0f;
+        if (s_gpu.attr[a].size)
+            fetch_attr(&s_gpu.attr[a], index, in[a].v);
+    }
+
+    if (s_xf.exec_mode == 2) {
+        VshState st;
+        if (getenv("RECOMP_XF_DUMPPROG")) {
+            static int dumped;
+            if (s_xf.batches == 200 && !dumped++) {
+                fprintf(stderr, "  [XF] c190=(%g %g %g %g) c191=(%g %g %g %g)\n",
+                        s_xf.c[190][0], s_xf.c[190][1], s_xf.c[190][2], s_xf.c[190][3],
+                        s_xf.c[191][0], s_xf.c[191][1], s_xf.c[191][2], s_xf.c[191][3]);
+                fprintf(stderr, "  [XF] program from slot %u; v0=(%g %g %g %g) v3=(%g %g %g %g)\n",
+                        s_xf.prog_start, in[0].v[0], in[0].v[1], in[0].v[2], in[0].v[3],
+                        in[3].v[0], in[3].v[1], in[3].v[2], in[3].v[3]);
+                for (uint32_t pc = s_xf.prog_start; pc < VSH_SLOTS; pc++) {
+                    const uint32_t *t = s_xf.prog[pc];
+                    fprintf(stderr, "  [XF] %3u: %08X %08X %08X %08X ilu%u mac%u c%u v%u | A mux%u r%u | B mux%u r%u | C mux%u r%u |"
+                                    " macm%X r%u ilum%X om%X orb%u oaddr%u omux%u a0x%u final%u\n",
+                            pc, t[0], t[1], t[2], t[3], vsh_field(t,1,25,3), vsh_field(t,1,21,4),
+                            vsh_field(t,1,13,8), vsh_field(t,1,9,4),
+                            vsh_field(t,2,26,2), vsh_field(t,2,28,4), vsh_field(t,2,11,2), vsh_field(t,2,13,4),
+                            vsh_field(t,3,28,2), (vsh_field(t,2,0,2) << 2) | vsh_field(t,3,30,2),
+                            vsh_field(t,3,24,4), vsh_field(t,3,20,4), vsh_field(t,3,16,4), vsh_field(t,3,12,4),
+                            vsh_field(t,3,11,1), vsh_field(t,3,3,8), vsh_field(t,3,2,1), vsh_field(t,3,1,1),
+                            vsh_field(t,3,0,1));
+                    if (vsh_field(t, 3, 0, 1)) break;
+                }
+                if (vsh_run(in, &st))
+                    fprintf(stderr, "  [XF] oPos=(%g %g %g %g) oD0=(%g %g %g %g) oT0=(%g %g)\n",
+                            st.o[0].v[0], st.o[0].v[1], st.o[0].v[2], st.o[0].v[3],
+                            st.o[3].v[0], st.o[3].v[1], st.o[3].v[2], st.o[3].v[3], st.o[9].v[0], st.o[9].v[1]);
+            }
+        }
+        if (!vsh_run(in, &st)) {
+            s_xf.prog_errors++;
+            return;
+        }
+        w = st.o[VSH_O_POS].v[3];
+        /* Xbox D3D's program for pre-transformed (XYZRHW) vertices leaves
+         * oPos.w at 0, and the hardware rasterises that as w = 1 (xemu does
+         * the same). Black's menu text and icons arrive exactly this way. */
+        if (w == 0.0f || !isfinite(w))
+            w = 1.0f;
+        out->x = st.o[VSH_O_POS].v[0];
+        out->y = st.o[VSH_O_POS].v[1];
+        out->z = st.o[VSH_O_POS].v[2];
+        memcpy(out->col, st.o[VSH_O_D0].v, sizeof out->col);
+        out->u = st.o[VSH_O_T0].v[0];
+        out->v = st.o[VSH_O_T0].v[1];
+    } else {
+        const float *m = s_xf.composite;
+        float p[4];
+        if (!s_xf.composite_set)
+            return;
+        for (int j = 0; j < 4; j++)
+            p[j] = in[0].v[0] * m[4 * j] + in[0].v[1] * m[4 * j + 1]
+                 + in[0].v[2] * m[4 * j + 2] + in[0].v[3] * m[4 * j + 3];
+        w = p[3];
+        if (w <= 1e-6f)
+            return;
+        out->x = p[0] / w; out->y = p[1] / w; out->z = p[2] / w;
+        memcpy(out->col, in[3].v, sizeof out->col);
+        if (!s_gpu.attr[3].size)
+            out->col[0] = out->col[1] = out->col[2] = out->col[3] = 1.0f;
+        out->u = in[9].v[0];
+        out->v = in[9].v[1];
+    }
+    if (!(w > 1e-6f) || !isfinite(out->x) || !isfinite(out->y))
+        return;
+    if (tex_size_from_format(s_gpu.tex.color)) {
+        out->u *= (float)s_gpu.tex.width;
+        out->v *= (float)s_gpu.tex.height;
+    }
+    for (int k = 0; k < 4; k++) {
+        if (out->col[k] < 0) out->col[k] = 0;
+        if (out->col[k] > 1) out->col[k] = 1;
+    }
+    out->inv_w = 1.0f / w;
+    out->u *= out->inv_w;
+    out->v *= out->inv_w;
+    out->ok = 1;
+}
+
+static void raster_triangle_3d(const XfVertex *A, const XfVertex *B, const XfVertex *C)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = surface_bpp();
+    float *zb = (s_xf.depth_test || s_xf.depth_write) ? zbuf() : NULL;
+    int textured = s_gpu.tex.valid;
+    float area;
+    int minx, maxx, miny, maxy, x, y;
+
+    if ((bpp != 4 && bpp != 2) || !A->ok || !B->ok || !C->ok)
+        return;
+    area = (B->x - A->x) * (C->y - A->y) - (B->y - A->y) * (C->x - A->x);
+    if (area == 0.0f || !isfinite(area))
+        return;
+
+    minx = (int)floorf(fminf(A->x, fminf(B->x, C->x)));
+    maxx = (int)ceilf (fmaxf(A->x, fmaxf(B->x, C->x)));
+    miny = (int)floorf(fminf(A->y, fminf(B->y, C->y)));
+    maxy = (int)ceilf (fmaxf(A->y, fmaxf(B->y, C->y)));
+    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
+    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
+    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (minx >= maxx || miny >= maxy)
+        return;
+
+    for (y = miny; y < maxy; y++) {
+        for (x = minx; x < maxx; x++) {
+            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float w0 = (C->x - B->x) * (py - B->y) - (C->y - B->y) * (px - B->x);
+            float w1 = (A->x - C->x) * (py - C->y) - (A->y - C->y) * (px - C->x);
+            float w2 = (B->x - A->x) * (py - A->y) - (B->y - A->y) * (px - A->x);
+            float l0, l1, l2, iw, z, col[4];
+            uint32_t argb;
+
+            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                continue;
+            l0 = w0 / area; l1 = w1 / area; l2 = w2 / area;
+            z = l0 * A->z + l1 * B->z + l2 * C->z;
+            if (zb) {
+                float *d = &zb[(size_t)y * s_zbuf_w + x];
+                if (s_xf.depth_test && !depth_passes(z, *d))
+                    continue;
+                if (s_xf.depth_write)
+                    *d = z;
+            }
+            iw = l0 * A->inv_w + l1 * B->inv_w + l2 * C->inv_w;
+            if (iw == 0.0f)
+                continue;
+            for (int k = 0; k < 4; k++)
+                col[k] = (l0 * A->col[k] * A->inv_w + l1 * B->col[k] * B->inv_w
+                        + l2 * C->col[k] * C->inv_w) / iw;
+            argb = ((uint32_t)(col[3] * 255.0f) << 24) | ((uint32_t)(col[0] * 255.0f) << 16)
+                 | ((uint32_t)(col[1] * 255.0f) << 8) | (uint32_t)(col[2] * 255.0f);
+            if (textured) {
+                float su = (l0 * A->u + l1 * B->u + l2 * C->u) / iw;
+                float sv = (l0 * A->v + l1 * B->v + l2 * C->v) / iw;
+                uint32_t texel;
+                if (su < 0.0f) su = 0.0f;
+                if (sv < 0.0f) sv = 0.0f;
+                if (sample_texture((uint32_t)su, (uint32_t)sv, &texel))
+                    argb = modulate_argb(texel, argb);
+            }
+            if (alpha_passes(argb))
+                put_pixel(mem, bpp, x, y, blend_argb(argb, get_pixel(mem, bpp, x, y)));
+        }
+    }
+    s_xf.tris++;
+}
+
+/* A batch the screen-space path refused: transform it and draw it. Returns 0
+ * when there is no transform state to use, so the caller still counts it. */
+static int raster_batch_transformed(void)
+{
+    static XfVertex v[NV_MAX_INDICES];
+    uint32_t i, n = s_gpu.idx_count;
+
+    if (s_xf.exec_mode != 2 && !s_xf.composite_set)
+        return 0;
+    for (i = 0; i < n; i++)
+        transform_vertex(s_gpu.idx[i], &v[i]);
+    s_xf.batches++;
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) raster_triangle_3d(&v[i], &v[i+1], &v[i+2]);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) raster_triangle_3d(&v[i], &v[i+1], &v[i+2]);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) raster_triangle_3d(&v[0], &v[i], &v[i+1]);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            raster_triangle_3d(&v[i], &v[i+1], &v[i+2]);
+            raster_triangle_3d(&v[i], &v[i+2], &v[i+3]);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            raster_triangle_3d(&v[i], &v[i+1], &v[i+3]);
+            raster_triangle_3d(&v[i], &v[i+3], &v[i+2]);
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (getenv("RECOMP_XF_VERBOSE")) {
+        static int shown_attr;
+        if (shown_attr++ < 6 && n) {
+            for (uint32_t k = 0; k < 16; k++)
+                if (s_gpu.attr[k].size)
+                    fprintf(stderr, "  [XF]   attr%u off 0x%08X type %u size %u stride %u%s\n", k,
+                            s_gpu.attr[k].offset, s_gpu.attr[k].type, s_gpu.attr[k].size,
+                            s_gpu.attr[k].stride, s_gpu.inline_active ? " (inline)" : "");
+            if (s_gpu.inline_active) {
+                fprintf(stderr, "  [XF]   inline %u dwords:", s_gpu.inline_count);
+                for (uint32_t k = 0; k < 20 && k < s_gpu.inline_count; k++)
+                    fprintf(stderr, " %08X", s_gpu.inline_buf[k]);
+                fprintf(stderr, "\n");
+            }
+            for (uint32_t k = 0; k < n && k < 6; k++)
+                fprintf(stderr, "  [XF]   idx %u -> (%.2f, %.2f, %.3f) ok %d\n", s_gpu.idx[k],
+                        v[k].x, v[k].y, v[k].z, v[k].ok);
+        }
+    }
+    if (getenv("RECOMP_XF_VERBOSE")) {
+        static int shown;
+        if (shown++ < 12 && n) {
+            fprintf(stderr, "  [XF] mode %u start %u prim %u n %u v0 ok %d (%.1f,%.1f,%.3f w=%.3f)"
+                            " uv (%.2f,%.2f) col %.2f %.2f %.2f %.2f\n",
+                    s_xf.exec_mode, s_xf.prog_start, s_gpu.prim, n, v[0].ok, v[0].x, v[0].y,
+                    v[0].z, v[0].inv_w ? 1.0f / v[0].inv_w : 0.0f,
+                    v[0].inv_w ? v[0].u / v[0].inv_w : 0.0f, v[0].inv_w ? v[0].v / v[0].inv_w : 0.0f,
+                    v[0].col[0], v[0].col[1], v[0].col[2], v[0].col[3]);
+        }
+    }
+    return 1;
+}
+
+/* The transform-stage methods. Returns 1 if `method` was one of them. */
+static int xf_method(uint32_t method, uint32_t param)
+{
+    union { uint32_t u; float f; } cv;
+
+    cv.u = param;
+    if (method >= NV097_SET_COMPOSITE_MATRIX && method < NV097_SET_COMPOSITE_MATRIX + 64) {
+        s_xf.composite[(method - NV097_SET_COMPOSITE_MATRIX) / 4] = cv.f;
+        s_xf.composite_set = 1;
+        return 1;
+    }
+    /* The component comes from the method address, and the load slot
+     * advances when the fourth one is written -- as the hardware does it, so a
+     * write that does not start at the window's base lands where it should. */
+    if (method >= NV097_SET_TRANSFORM_PROGRAM && method < NV097_SET_TRANSFORM_PROGRAM + 128) {
+        uint32_t k = ((method - NV097_SET_TRANSFORM_PROGRAM) / 4) & 3;
+        if (s_xf.prog_load < VSH_SLOTS)
+            s_xf.prog[s_xf.prog_load][k] = param;
+        if (k == 3) s_xf.prog_load++;
+        return 1;
+    }
+    if (method >= NV097_SET_TRANSFORM_CONSTANT && method < NV097_SET_TRANSFORM_CONSTANT + 128) {
+        uint32_t k = ((method - NV097_SET_TRANSFORM_CONSTANT) / 4) & 3;
+        if (s_xf.const_load < VSH_CONSTS)
+            s_xf.c[s_xf.const_load][k] = cv.f;
+        if (k == 3) s_xf.const_load++;
+        return 1;
+    }
+    switch (method) {
+    case NV097_SET_TRANSFORM_EXECUTION_MODE: s_xf.exec_mode = param & 3; return 1;
+    case NV097_SET_TRANSFORM_PROGRAM_LOAD:   s_xf.prog_load = param; s_xf.prog_word = 0; return 1;
+    case NV097_SET_TRANSFORM_PROGRAM_START:  s_xf.prog_start = param; return 1;
+    case NV097_SET_TRANSFORM_CONSTANT_LOAD:
+        s_xf.const_load = param; s_xf.const_word = 0;
+        if (getenv("RECOMP_XF_DUMPPROG")) {
+            static int shown;
+            if (shown++ < 40) fprintf(stderr, "  [XF] CONSTANT_LOAD %u\n", param);
+        }
+        return 1;
+    case NV097_SET_DEPTH_TEST_ENABLE:        s_xf.depth_test = param != 0; return 1;
+    case NV097_SET_DEPTH_FUNC:               s_xf.depth_func = param; return 1;
+    case NV097_SET_DEPTH_MASK:               s_xf.depth_write = param != 0; return 1;
+    case NV097_SET_SURFACE_ZETA_OFFSET:      s_xf.zeta_offset = param; return 1;
+    case NV097_SET_ZSTENCIL_CLEAR_VALUE:     s_xf.zclear = param; return 1;
+    default:                                 return 0;
+    }
+}
+
 static void raster_batch(void)
 {
     uint32_t i;
@@ -1306,7 +1878,8 @@ static void raster_batch(void)
     if (s_gpu.idx_count < 3)
         return;
     if (!batch_is_screen_space()) {
-        s_gpu.batches_untransformed++;
+        if (!raster_batch_transformed())
+            s_gpu.batches_untransformed++;
         return;
     }
 
@@ -1546,7 +2119,7 @@ static void draw_inline_array(void)
             s_gpu.attr[a].stride = vsize;
 
     for (i = 0; i < count; i++)
-        s_gpu.idx[i] = (uint16_t)i;
+        s_gpu.idx[i] = i;
     s_gpu.idx_count = count;
 
     s_gpu.inline_active = 1;
@@ -1591,6 +2164,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.unhandled_total++;
         return;
     }
+    if (xf_method(method, param))
+        return;
     switch (method) {
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
@@ -1621,6 +2196,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.clear_color = param;
         break;
     case NV097_CLEAR_SURFACE:
+        if (param & 0x03)                  /* Z and/or stencil */
+            zbuf_clear();
         clear_surface(param);
         break;
     case NV097_SET_ALPHA_TEST_ENABLE:
@@ -1667,6 +2244,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.inline_buf[s_gpu.inline_count++] = param;
         break;
 
+    case NV097_ARRAY_ELEMENT32:
+        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
+            s_gpu.idx[s_gpu.idx_count++] = param;
+        break;
+    case NV097_DRAW_ARRAYS: {
+        /* A run of consecutive vertices: start in the low 24 bits, count-1 in
+         * the top 8. Several runs may share one BEGIN/END. */
+        uint32_t start = param & 0xFFFFFFu, count = (param >> 24) + 1u, k;
+        for (k = 0; k < count && s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES; k++)
+            s_gpu.idx[s_gpu.idx_count++] = start + k;
+        break;
+    }
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
@@ -2041,6 +2630,8 @@ void nv2a_pb_exec_report(void)
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one
      * of them means the rasteriser is broken. */
+    fprintf(stderr, "[GPU] transform: mode %u, %u batches, %u triangles drawn, %u program errors\n",
+            s_xf.exec_mode, s_xf.batches, s_xf.tris, s_xf.prog_errors);
     fprintf(stderr, "[GPU] rasterised %u triangles; %u batches skipped as not"
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,

@@ -79,11 +79,8 @@ extern uint32_t xbox_AllocThreadTib(void);
 #define HcRhDescriptorB         0x4C
 #define HcRhStatus              0x50
 #define HcRhPortStatus1         0x54
-/* Through port 4. The root hub here reports two downstream ports, and the
- * driver reads four status registers regardless -- so the file has to cover
- * them or the last one falls outside the array and is answered by the
- * not-a-register path instead of by an empty port. Same value either way,
- * reached honestly. */
+/* Through root port 4's status register (0x60): the root hub reports four
+ * downstream ports (see OHCI_PORTS). */
 #define OHCI_REG_MAX            0x64
 
 /* HcCommandStatus */
@@ -116,9 +113,16 @@ extern uint32_t xbox_AllocThreadTib(void);
 #define PORT_W_PPS_SET_POWER    0x00000100u   /* SetPortPower                */
 #define PORT_W_CLEAR_POWER      0x00000200u   /* ClearPortPower              */
 
-/* The MCPX gives each controller a small root hub. Two ports apiece covers
- * the console's four front sockets, which is what a title enumerates over. */
-#define OHCI_PORTS              2
+/* Root hub ports per controller. The console's four front sockets hang off
+ * the first controller's root ports 3, 4, 1 and 2 -- in that order for players
+ * 1 to 4, which is how XPP numbers them (xemu wires its pads the same way).
+ * With two ports the pad could only sit on root port 1, which XPP reports as
+ * player 3; Black opened it there and its title screen, waiting for player 1,
+ * never saw a press. */
+#define OHCI_PORTS              4
+
+/* Root port index (0-based) the emulated pad is plugged into: player 1. */
+#define OHCI_PAD_PORT           2
 
 typedef struct {
     uint32_t base;                      /* Xbox VA of the register block   */
@@ -237,7 +241,9 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
         return;
 
     case HcRhPortStatus1:
-    case HcRhPortStatus1 + 4: {
+    case HcRhPortStatus1 + 4:
+    case HcRhPortStatus1 + 8:
+    case HcRhPortStatus1 + 12: {
         /* Writes here are set/clear requests by bit position, not a value to
          * store. Getting that wrong looks like a port that will not enable. */
         unsigned port = (aligned - HcRhPortStatus1) / 4;
@@ -454,7 +460,11 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             if (n > len) n = len;
             if (s_trace) {
                 static unsigned reports;
-                if ((reports++ % 500u) == 0) {
+                static uint8_t last_btn, last_a;
+                int changed = rep[2] != last_btn || rep[4] != last_a;
+                last_btn = rep[2];
+                last_a = rep[4];
+                if ((reports++ % 500u) == 0 || changed) {
                     fprintf(stderr, "  [OHCI%d] IN ep%u report #%u, buttons "
                                     "%02X, A %02X\n", hc->index, endpoint,
                             reports, rep[2], rep[4]);
@@ -701,8 +711,8 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
      * A console detects the port change after the controller is running, so
      * that is what the controller thread does: it waits for operational with
      * the interrupt unmasked, and only then plugs the device in. */
-    hc->reg[HcRhPortStatus1 / 4]       = PORT_PPS;
-    hc->reg[(HcRhPortStatus1 + 4) / 4] = PORT_PPS;
+    for (int p = 0; p < OHCI_PORTS; p++)
+        hc->reg[(HcRhPortStatus1 + p * 4) / 4] = PORT_PPS;
 }
 
 /* The controller, running on its own thread.
@@ -773,11 +783,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * status, so a device that was always there is one that never
          * arrives. */
         if (!plugged && (enable & INTR_RHSC)) {
-            hc->reg[HcRhPortStatus1 / 4] |= PORT_CCS | PORT_CSC;
+            hc->reg[(HcRhPortStatus1 + OHCI_PAD_PORT * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n", waited * 20);
+                            "arriving on root port %d (player 1)\n",
+                    waited * 20, OHCI_PAD_PORT + 1);
             fflush(stderr);
         }
 
@@ -929,7 +940,7 @@ void xbox_OhciInit(void)
 #endif
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
-                    "%d ports each, one device on HC0 port 1\n",
+                    "%d ports each, one device on HC0 root port 3 (player 1)\n",
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
