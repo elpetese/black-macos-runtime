@@ -17,19 +17,74 @@
 #endif
 
 /* ============================================================================
- * IRQL Simulation
+ * IRQL
  *
  * Xbox uses IRQL (Interrupt Request Level) for synchronization:
  *   PASSIVE_LEVEL (0) - normal thread execution
  *   APC_LEVEL (1) - APC delivery
- *   DISPATCH_LEVEL (2) - scheduler/DPC level, no page faults allowed
+ *   DISPATCH_LEVEL (2) - scheduler/DPC level
  *
- * On Windows, we simulate IRQL with a thread-local variable. Raising to
- * DISPATCH_LEVEL doesn't actually prevent preemption, but the tracking
- * allows code that checks IRQL to function correctly.
+ * The Xbox has one CPU. Raising to DISPATCH_LEVEL there means nothing else
+ * runs until the IRQL comes back down -- no other thread, no DPC -- and code
+ * relies on exactly that to update what its DPCs also touch: DirectSound's
+ * voice lists, a title's sound-priority list. Here DPCs run on the timer
+ * thread and title threads on their own cores, all at the same time, so a
+ * level that was only tracked in a variable excluded nothing. Black's priority
+ * list came apart that way and its insertion walk looped forever.
+ *
+ * So DISPATCH_LEVEL is a lock: taken when a thread rises to it from below,
+ * released when it drops back, and held while a DPC runs. Recursive, since the
+ * same thread raises within a raise. Interrupt service routines stay outside
+ * it, as on hardware, where an interrupt preempts DISPATCH_LEVEL code.
  * ============================================================================ */
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
+
+#if defined(_WIN32)
+static CRITICAL_SECTION g_dispatch_lock;
+static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_dispatch_lock);
+    return TRUE;
+}
+static void dispatch_lock(void)
+{
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_lock_init, NULL, NULL);
+    EnterCriticalSection(&g_dispatch_lock);
+}
+static void dispatch_unlock(void) { LeaveCriticalSection(&g_dispatch_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t g_dispatch_lock;
+static pthread_once_t g_dispatch_once = PTHREAD_ONCE_INIT;
+static void dispatch_lock_init(void)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_dispatch_lock, &a);
+    pthread_mutexattr_destroy(&a);
+}
+static void dispatch_lock(void)
+{
+    pthread_once(&g_dispatch_once, dispatch_lock_init);
+    pthread_mutex_lock(&g_dispatch_lock);
+}
+static void dispatch_unlock(void) { pthread_mutex_unlock(&g_dispatch_lock); }
+#endif
+
+static void irql_move(KIRQL new_irql)
+{
+    KIRQL old = g_current_irql;
+
+    if (old < DISPATCH_LEVEL && new_irql >= DISPATCH_LEVEL)
+        dispatch_lock();
+    g_current_irql = new_irql;
+    if (old >= DISPATCH_LEVEL && new_irql < DISPATCH_LEVEL)
+        dispatch_unlock();
+}
 
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
@@ -43,9 +98,9 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfRaiseIrql: attempt to lower IRQL from %d to %d (use KfLowerIrql)",
             old, NewIrql);
+        return old;
     }
-
-    g_current_irql = NewIrql;
+    irql_move(NewIrql);
     return old;
 }
 
@@ -59,9 +114,9 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
             g_current_irql, NewIrql);
+        return;
     }
-
-    g_current_irql = NewIrql;
+    irql_move(NewIrql);
 }
 
 /*
@@ -70,7 +125,8 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
-    g_current_irql = DISPATCH_LEVEL;
+    if (old < DISPATCH_LEVEL)
+        irql_move(DISPATCH_LEVEL);
     return old;
 }
 

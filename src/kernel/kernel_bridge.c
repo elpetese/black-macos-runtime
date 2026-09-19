@@ -1242,17 +1242,17 @@ static void bridge_ExAllocatePoolWithTag(void)
 }
 
 /* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
+/* Both are __fastcall: the level is in cl, not on the stack. Reading
+ * STACK_ARG(0) took whatever the caller had there, so the tracked level was
+ * garbage -- harmless while IRQL excluded nothing, fatal once it does. */
 static void bridge_KfRaiseIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)new_irql);
+    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)(g_ecx & 0xFFu));
 }
 
 static void bridge_KfLowerIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    xbox_KfLowerIrql((UCHAR)new_irql);
-    g_eax = 0;
+    xbox_KfLowerIrql((UCHAR)(g_ecx & 0xFFu));
 }
 
 /* ── KeRaiseIrqlToDpcLevel (ordinal 129) ─────────────────── */
@@ -1810,12 +1810,18 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
 
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = arg2;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = arg1;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    /* At DISPATCH_LEVEL, which is what keeps it from running in the middle
+     * of title code that raised to exclude it (kernel_hal.c). */
+    {
+        KIRQL old = xbox_KfRaiseIrql(DISPATCH_LEVEL);
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = arg2;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = arg1;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+        fn();
+        xbox_KfLowerIrql(old);
+    }
     return 1;
 }
 
@@ -5328,8 +5334,274 @@ static void kernel_watch_arm_once(void)
         g_kernel_watch_va = (uint32_t)strtoul(env, NULL, 0);
 }
 
-/* Current dispatching slot */
-static int g_kernel_dispatch_slot = -1;
+/* ── Hang dump (RECOMP_HANG_DUMP=<seconds>) ───────────────────
+ *
+ * A frozen title leaves nothing behind: no crash, no last log line, and the
+ * native stacks only show which translated function a thread sits in. What a
+ * hang needs is, for every guest thread, the kernel call it is blocked in and
+ * the object it is blocked on -- recorded here at dispatch -- plus the state
+ * around them. A monitor thread watches presented frames and, when they stop
+ * for the given number of seconds, writes all of it once, and samples the
+ * native stacks next to the log.
+ */
+#define HANG_MAX_THREADS 48
+typedef struct {
+    volatile uint32_t ordinal, caller, in_call, esp;
+    volatile uint32_t arg[6];
+    volatile uint32_t eax, ebx, ecx, edx, esi, edi;
+    volatile DWORD since_ms;
+    volatile uint64_t calls;
+    /* The thread's own register variables (thread-local), so a thread that
+     * spins without calling the kernel can still be read where it is. */
+    volatile uint32_t *live[8];
+} HangThreadRec;
+static HangThreadRec g_hang_threads[HANG_MAX_THREADS];
+static volatile LONG g_hang_thread_count;
+static RECOMP_TLS HangThreadRec *t_hang_rec;
+static int g_hang_secs = -1;
+
+static const char *hang_ordinal_name(uint32_t o)
+{
+    switch (o) {
+    case 99:  return "KeDelayExecutionThread";
+    case 145: return "KeSetEvent";
+    case 158: return "KeWaitForMultipleObjects";
+    case 159: return "KeWaitForSingleObject";
+    case 187: return "NtClose";
+    case 190: return "NtCreateFile";
+    case 202: return "NtOpenFile";
+    case 219: return "NtReadFile";
+    case 225: return "NtSetEvent";
+    case 233: return "NtWaitForSingleObject";
+    case 234: return "NtWaitForSingleObjectEx";
+    case 235: return "NtWaitForMultipleObjectsEx";
+    case 238: return "NtYieldExecution";
+    case 277: return "RtlEnterCriticalSection";
+    case 294: return "RtlLeaveCriticalSection";
+    default:  return "?";
+    }
+}
+
+#if !defined(_MSC_VER)
+extern unsigned xnv2a_flip_count(void) __attribute__((weak));
+extern uint32_t xbox_ContiguousAllocatedBytes(void);
+
+static void hang_dump(unsigned secs)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    DWORD now = GetTickCount();
+    LONG n = g_hang_thread_count, i;
+
+    fprintf(stderr, "\n[HANG] ===== no frame presented for %us =====\n", secs);
+    fprintf(stderr, "[HANG] kernel calls %d, DPC queue head %ld tail %ld, "
+            "contiguous used %u KB\n", g_kernel_call_count, (long)g_dpc_head,
+            (long)g_dpc_tail, xbox_ContiguousAllocatedBytes() / 1024u);
+    for (i = 0; i < n && i < HANG_MAX_THREADS; i++) {
+        HangThreadRec *t = &g_hang_threads[i];
+        uint32_t k, shown = 0;
+        fprintf(stderr, "[HANG] thread %ld: %llu kernel calls; %s ordinal %u %s"
+                " from 0x%08X for %lu ms\n", (long)i, (unsigned long long)t->calls,
+                t->in_call ? "IN" : "last", t->ordinal, hang_ordinal_name(t->ordinal),
+                t->caller, t->in_call ? (unsigned long)(now - t->since_ms) : 0ul);
+        fprintf(stderr, "[HANG]   args %08X %08X %08X %08X %08X %08X  esp %08X\n",
+                t->arg[0], t->arg[1], t->arg[2], t->arg[3], t->arg[4], t->arg[5], t->esp);
+        fprintf(stderr, "[HANG]   regs eax %08X ebx %08X ecx %08X edx %08X esi %08X edi %08X\n",
+                t->eax, t->ebx, t->ecx, t->edx, t->esi, t->edi);
+        if (t->live[0]) {
+            static const char *nm[7] = { "eax", "ecx", "edx", "ebx", "esp", "esi", "edi" };
+            fprintf(stderr, "[HANG]   live:");
+            for (k = 0; k < 7; k++)
+                fprintf(stderr, " %s %08X", nm[k], *t->live[k]);
+            fprintf(stderr, "\n");
+            /* What the live pointers point at: the object a spinning loop is
+             * working on is almost always in one of them. */
+            for (k = 0; k < 7; k++) {
+                uint32_t p = *t->live[k], w;
+                if (k == 4 || !((p >= 0x10000u && p < 0x04000000u)
+                                || (p >= 0x80000000u && p < 0x84000000u)))
+                    continue;
+                fprintf(stderr, "[HANG]     [%s]:", nm[k]);
+                for (w = 0; w < 26; w++)
+                    fprintf(stderr, " %08X", *(const uint32_t *)(mem + p + w * 4));
+                fprintf(stderr, "\n");
+            }
+        }
+        /* The object a wait or a critical section is about: its first words
+         * are the dispatcher header / lock count, owner and recursion. */
+        if (t->in_call && t->arg[0] >= 0x10000u && t->arg[0] < 0x84000000u
+            && (t->arg[0] < 0x04000000u || t->arg[0] >= 0x80000000u)) {
+            fprintf(stderr, "[HANG]   *arg0:");
+            for (k = 0; k < 8; k++)
+                fprintf(stderr, " %08X", *(const uint32_t *)(mem + t->arg[0] + k * 4));
+            fprintf(stderr, "\n");
+        }
+        /* Return addresses on the guest stack: the call chain that got here. */
+        if (t->esp >= 0x10000u && t->esp < 0x04000000u) {
+            fprintf(stderr, "[HANG]   stack:");
+            for (k = 0; k < 512 && shown < 20; k++) {
+                uint32_t a = t->esp + k * 4, v;
+                if (a >= 0x04000000u)
+                    break;
+                v = *(const uint32_t *)(mem + a);
+                if (v >= 0x00011000u && v < 0x002A0000u) {
+                    fprintf(stderr, " %08X", v);
+                    shown++;
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    fprintf(stderr, "[HANG] recent indirect calls:");
+    {
+        extern volatile uint32_t g_icall_trace[16];
+        extern volatile uint32_t g_icall_trace_idx;
+        uint32_t k;
+        for (k = 0; k < 16; k++)
+            fprintf(stderr, " %08X", g_icall_trace[(g_icall_trace_idx + k) & 15]);
+    }
+    fprintf(stderr, "\n");
+    /* RECOMP_HANG_LIST=<head>,<next off>,<byte value off>: walk a circular
+     * doubly linked list from its head and say where it stops being one --
+     * a back link that does not point back, a value out of order, a cycle
+     * that never returns to the head. */
+    {
+        const char *spec = getenv("RECOMP_HANG_LIST");
+        if (spec) {
+            char *e1, *e2;
+            uint32_t head = (uint32_t)strtoul(spec, &e1, 0);
+            uint32_t noff = (uint32_t)strtoul(*e1 ? e1 + 1 : e1, &e2, 0);
+            uint32_t voff = (uint32_t)strtoul(*e2 ? e2 + 1 : e2, NULL, 0);
+            uint32_t node = head, steps = 0, prevv = 0x100;
+            fprintf(stderr, "[HANG] list at %08X (next +%u, value +0x%X):\n", head, noff, voff);
+            for (;;) {
+                uint32_t next, back, v;
+                if (node < 0x10000u || (node >= 0x04000000u && node < 0x80000000u)
+                    || node >= 0x84000000u) {
+                    fprintf(stderr, "[HANG]   node %08X out of range\n", node);
+                    break;
+                }
+                next = *(const uint32_t *)(mem + node + noff);
+                if (next == head) {
+                    fprintf(stderr, "[HANG]   back to head after %u nodes\n", steps);
+                    break;
+                }
+                if (next < 0x10000u || (next >= 0x04000000u && next < 0x80000000u)
+                    || next >= 0x84000000u) {
+                    fprintf(stderr, "[HANG]   %08X -> next %08X out of range\n", node, next);
+                    break;
+                }
+                back = *(const uint32_t *)(mem + next + (noff ? 0 : 4));
+                v = *(const uint8_t *)(mem + next + voff);
+                if (steps < 64 || back != node || v > prevv)
+                    fprintf(stderr, "[HANG]   #%u %08X value %3u%s%s\n", steps, next, v,
+                            back != node ? "  BACK LINK BROKEN" : "",
+                            v > prevv ? "  OUT OF ORDER" : "");
+                prevv = v;
+                node = next;
+                if (++steps > 4096) {
+                    fprintf(stderr, "[HANG]   more than 4096 nodes: cycle not through head\n");
+                    break;
+                }
+            }
+        }
+    }
+    fprintf(stderr, "[HANG] =====\n");
+    fflush(stderr);
+    {
+        const char *dir = getenv("RECOMP_HANG_DIR");
+        char cmd[1024];
+        snprintf(cmd, sizeof cmd, "/usr/bin/sample %d 3 -file '%s/hang_native_%d.txt'"
+                 " >/dev/null 2>&1 &", (int)getpid(), dir ? dir : "/tmp", (int)getpid());
+        if (system(cmd) != 0) {
+            fprintf(stderr, "[HANG] could not start sample\n");
+            fflush(stderr);
+        }
+    }
+}
+
+static DWORD WINAPI hang_monitor_thread(LPVOID unused)
+{
+    unsigned last = 0, still = 0, dumps = 0;
+    (void)unused;
+    for (;;) {
+        unsigned f;
+        Sleep(1000);
+        f = xnv2a_flip_count ? xnv2a_flip_count() : (unsigned)g_kernel_call_count;
+        if (f != last || !last) {
+            last = f;
+            still = 0;
+            continue;
+        }
+        if (++still == (unsigned)g_hang_secs && dumps < 3) {
+            hang_dump(still);
+            dumps++;
+        }
+    }
+    return 0;
+}
+#endif
+
+static void hang_record_start(ULONG ordinal)
+{
+    HangThreadRec *t = t_hang_rec;
+    int k;
+
+    if (g_hang_secs < 0) {
+        const char *e = getenv("RECOMP_HANG_DUMP");
+        static volatile LONG started;
+        g_hang_secs = e ? atoi(e) : 0;
+#if !defined(_MSC_VER)
+        if (g_hang_secs > 0 && !__atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL)) {
+            HANDLE h = CreateThread(NULL, 0, hang_monitor_thread, NULL, 0, NULL);
+            if (h)
+                CloseHandle(h);
+        }
+#endif
+    }
+    if (g_hang_secs <= 0)
+        return;
+    if (!t) {
+        LONG idx;
+#if defined(_MSC_VER)
+        idx = InterlockedIncrement(&g_hang_thread_count) - 1;
+#else
+        idx = __atomic_fetch_add(&g_hang_thread_count, 1, __ATOMIC_ACQ_REL);
+#endif
+        if (idx >= HANG_MAX_THREADS)
+            return;
+        t = t_hang_rec = &g_hang_threads[idx];
+        t->live[0] = &g_eax; t->live[1] = &g_ecx; t->live[2] = &g_edx;
+        t->live[3] = &g_ebx; t->live[4] = &g_esp; t->live[5] = &g_esi;
+        t->live[6] = &g_edi; t->live[7] = NULL;
+    }
+    t->ordinal = ordinal;
+    t->caller = g_xbox_kernel_caller;
+    t->esp = g_esp;
+    for (k = 0; k < 6; k++)
+        t->arg[k] = BRIDGE_MEM32(g_esp + (uint32_t)k * 4);
+    t->eax = g_eax; t->ebx = g_ebx; t->ecx = g_ecx;
+    t->edx = g_edx; t->esi = g_esi; t->edi = g_edi;
+    t->since_ms = GetTickCount();
+    t->in_call = 1;
+}
+
+static void hang_record_end(void)
+{
+    if (t_hang_rec) {
+        t_hang_rec->in_call = 0;
+        t_hang_rec->calls++;
+    }
+}
+
+/* Current dispatching slot.
+ *
+ * Per thread. recomp_lookup_kernel stores it and returns the dispatcher, which
+ * the same thread then calls; as one global, a kernel call on another thread
+ * in between replaced it, and the first thread ran the other's ordinal --
+ * a KeSetEvent that became an NtReadFile, a wait whose event was never set.
+ * Black runs its game, streaming and file threads through here at once and
+ * froze in its levels with every thread waiting. */
+static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
 static void kernel_thunk_dispatch(void)
 {
@@ -5437,6 +5709,7 @@ static void kernel_thunk_dispatch(void)
         }
     }
 
+    hang_record_start(ordinal);
     if (bridge) {
         bridge();
     } else {
@@ -5472,6 +5745,7 @@ static void kernel_thunk_dispatch(void)
      * and N bytes of arguments. We already popped the dummy return address
      * above; now pop the args. */
     g_esp += g_slot_arg_bytes[slot];
+    hang_record_end();
 
     if (g_kernel_watch_va) {
         uint32_t _after = BRIDGE_MEM32(g_kernel_watch_va);

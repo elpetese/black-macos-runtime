@@ -420,6 +420,12 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
     return n > 0 ? n : 1;
 }
 
+/* Frames presented so far; the hang monitor's sign of life. */
+unsigned xnv2a_flip_count(void)
+{
+    return s_flips;
+}
+
 void xnv2a_report(void)
 {
     fprintf(stderr, "[XNV2A] %llu methods, %llu RAMHT misses\n",
