@@ -622,13 +622,8 @@ static void clear_surface(uint32_t param)
     if (getenv("RECOMP_FB_WINDOW")) {
         uint32_t fb_va = dma_resolve(s_gpu.color_offset);
         uint32_t fb_pitch = s_gpu.pitch;
-        fprintf(stderr, "  [GPU] FBWIN check va=0x%08X pitch=%u\n", fb_va, fb_pitch);
-        if (fb_va && fb_pitch) {
-            fprintf(stderr, "  [GPU] FBWIN set va=0x%08X pitch=%u\n", fb_va, fb_pitch);
+        if (fb_va && fb_pitch)
             xbox_FramebufferWindowSet(fb_va, fb_pitch);
-        } else {
-            fprintf(stderr, "  [GPU] FBWIN skip va=0x%08X pitch=%u\n", fb_va, fb_pitch);
-        }
     }
 
     xbox_FramebufferWindowStart();

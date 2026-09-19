@@ -74,14 +74,20 @@ static uint64_t now_ms(void)
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     const char *pin = getenv("RECOMP_FB_VA");
-    const char *msg = "[FBWIN] xbox_FramebufferWindowSet CALLED\n";
-    write(STDERR_FILENO, msg, strlen(msg));
+    static int verbose = -1;
 
-    fprintf(stderr, "[FBWIN] before lock: va=0x%08X pitch=%u\n", fb_va, pitch);
-    fflush(stderr);
+    if (verbose < 0)
+        verbose = getenv("RECOMP_FBWIN_VERBOSE") != NULL;
+
+    /* Only a surface as wide as the display can be what it shows. Titles
+     * render into smaller targets every frame -- Black's depth-of-field pass
+     * goes through 160x120 and 80x60 buffers -- and following one of those
+     * left the window on a surface it cannot read: every refresh failed and
+     * the picture froze while the game carried on. */
+    if (!pin && pitch && pitch != s_width * 4u && pitch != s_width * 2u)
+        return;
+
     pthread_mutex_lock(&s_state_lock);
-    fprintf(stderr, "[FBWIN] after lock\n");
-    fflush(stderr);
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
     if (pitch)
         s_fb_pitch = pitch;
@@ -92,12 +98,12 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch_history[0] = s_fb_pitch;
     if (s_fb_history_count < FB_HISTORY)
         s_fb_history_count++;
-    fprintf(stderr, "[FBWIN] set va=0x%08X pitch=%u (result va=0x%08X pitch=%u)\n",
-            fb_va, pitch, s_fb_va, s_fb_pitch);
-    fflush(stderr);
+    if (verbose) {
+        fprintf(stderr, "[FBWIN] set va=0x%08X pitch=%u (result va=0x%08X pitch=%u)\n",
+                fb_va, pitch, s_fb_va, s_fb_pitch);
+        fflush(stderr);
+    }
     pthread_mutex_unlock(&s_state_lock);
-    fprintf(stderr, "[FBWIN] after unlock\n");
-    fflush(stderr);
 }
 
 static int ensure_pixels(void)
