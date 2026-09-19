@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 extern uint32_t xbox_VblankCount(void);
 
@@ -48,6 +49,13 @@ uint32_t recomp_port_in(uint32_t port, uint32_t size)
         uint8_t v = (uint8_t)(g_gpio_latch & ~GPIO_FIELD_BIT);
         if (xbox_VblankCount() & 1u)
             v |= GPIO_FIELD_BIT;
+        if (getenv("RECOMP_PORT_DEBUG")) {
+            static unsigned reads, set;
+            reads++; set += (v & GPIO_FIELD_BIT) != 0;
+            if ((reads % 200) == 0)
+                fprintf(stderr, "  [PORT] 0x80C0 reads=%u field-bit-set=%u vblank=%u\n",
+                        reads, set, xbox_VblankCount());
+        }
         return v;
     }
     report_unmodelled(port, size, 0, 0);

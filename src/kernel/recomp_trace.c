@@ -235,6 +235,23 @@ void recomp_trace_enter(const char *name, uint32_t va)
             *(const uint32_t *)((uintptr_t)g_esp + xbox_GetMemoryOffset()),
             g_esp, g_eax, g_ecx, g_esi, g_edi, g_ebx);
 
+    /* RECOMP_TRACE_ARG1_DUMP=<bytes>: the object the first stack argument
+     * points at, that many bytes. A decoder's state lives in fields well past
+     * the dozen dwords RECOMP_TRACE_DEREF shows. */
+    if (getenv("RECOMP_TRACE_ARG1_DUMP")) {
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t a1 = *(const uint32_t *)(mem + g_esp + 4);
+        int n = atoi(getenv("RECOMP_TRACE_ARG1_DUMP")) / 4, k;
+        if (looks_like_guest_data_ptr(a1)) {
+            for (k = 0; k < n; k++) {
+                if ((k & 7) == 0)
+                    fprintf(stderr, "%s         +%03X:", k ? "\n" : "", k * 4);
+                fprintf(stderr, " %08X", *(const uint32_t *)(mem + a1 + k * 4));
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     /* The stack arguments too, when asked. Registers alone do not say which
      * argument arrived null, and for a function with a long argument list,
      * counting pushes back from the call site is guesswork. */

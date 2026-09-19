@@ -2546,8 +2546,22 @@ static HANDLE bridge_resolve_handle(uint32_t token)
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
     }
-    /* Untagged: synthetic/dummy handle -- pass through unchanged. */
-    return (HANDLE)(uintptr_t)token;
+    /* Untagged: only the synthetic handles this bridge hands out mean
+     * anything. Anything else is a value the title never got from us -- a
+     * stale or uninitialised handle field -- and used to be passed through
+     * as a host pointer, which the file layer then dereferenced (Black,
+     * 0x00290D04 into w32_handle_fd, SIGSEGV). NULL makes the call fail with
+     * an invalid handle, which is what the Xbox kernel does. */
+    if (token == 0xDEAD0001u || token == 0xBEEF0001u || token == 0xBEEF0010u
+        || token == 0xFFFFFFFFu || token == 0xFFFFFFFEu || token == 0)
+        return (HANDLE)(uintptr_t)token;
+    {
+        static int said;
+        if (said++ < 8)
+            fprintf(stderr, "  [BRIDGE] handle 0x%08X was never issued; treating as invalid\n",
+                    token);
+    }
+    return NULL;
 }
 
 /* The Xbox path each open handle was opened with, so a later open relative

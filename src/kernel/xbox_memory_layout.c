@@ -64,6 +64,15 @@ void xbox_SetMapSize(size_t bytes)
  * underlying data. */
 static HANDLE g_mapping_handle = NULL;
 
+/* See xbox_SetTiledAliasesContig. */
+static int    g_tiled_aliases_contig;
+static HANDLE g_contig_mapping = NULL;
+
+void xbox_SetTiledAliasesContig(int on)
+{
+    g_tiled_aliases_contig = on;
+}
+
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
 static void *g_tiled_view = NULL;
@@ -479,17 +488,52 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
     return 0;
 }
 
+#define XBOX_MAX_FIELD_PARITIES 2
+static struct { uint32_t device_ptr_va, field_off; } g_field_parities[XBOX_MAX_FIELD_PARITIES];
+static int g_field_parity_count;
+
+int xbox_Nv2aFieldParity(uint32_t device_ptr_va, uint32_t field_off)
+{
+    if (g_field_parity_count >= XBOX_MAX_FIELD_PARITIES)
+        return -1;
+    g_field_parities[g_field_parity_count].device_ptr_va = device_ptr_va;
+    g_field_parities[g_field_parity_count].field_off = field_off;
+    g_field_parity_count++;
+    fprintf(stderr, "  Field parity: device at 0x%08X, field +0x%X alternates @ %d Hz\n",
+            device_ptr_va, field_off, 1000 / XBOX_FRAME_PERIOD_MS);
+    return 0;
+}
+
+static void field_parities_tick(uint32_t tick)
+{
+    for (int i = 0; i < g_field_parity_count; i++) {
+        uint32_t dev;
+        if (!fence_readable(g_field_parities[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_field_parities[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_field_parities[i].field_off, 4))
+            continue;
+        *(volatile uint32_t *)((uintptr_t)(dev + g_field_parities[i].field_off)
+                               + g_memory_offset) = tick & 1u;
+    }
+}
+
 static void frame_counters_tick(void)
 {
     DWORD now = GetTickCount();
     int i;
 
-    if (!g_frame_counter_count)
+    if (!g_frame_counter_count && !g_field_parity_count)
         return;
     if (g_frame_counter_last_ms
             && (now - g_frame_counter_last_ms) < XBOX_FRAME_PERIOD_MS)
         return;
     g_frame_counter_last_ms = now;
+    {
+        static uint32_t ticks;
+        field_parities_tick(++ticks);
+    }
 
     for (i = 0; i < g_frame_counter_count; i++) {
         uint32_t dev;
@@ -1635,12 +1679,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
-        g_contig_memory = VirtualAlloc(
-            (LPVOID)contig_native,
-            XBOX_CONTIG_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        if (g_tiled_aliases_contig) {
+            /* A shared mapping, so the tiled aperture below can be a second
+             * view of these same pages. */
+            g_contig_mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+                                                  PAGE_READWRITE, 0,
+                                                  XBOX_CONTIG_SIZE, NULL);
+            g_contig_memory = g_contig_mapping
+                ? MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+                                  XBOX_CONTIG_SIZE, (LPVOID)contig_native)
+                : NULL;
+        } else {
+            g_contig_memory = VirtualAlloc(
+                (LPVOID)contig_native,
+                XBOX_CONTIG_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE
+            );
+        }
         if (g_contig_memory) {
             fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
                     XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
@@ -1949,6 +2005,34 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     {
         uintptr_t tiled_native = XBOX_TILED_BASE + g_memory_offset;
         size_t tiled_size = xbox_TiledApertureSize();
+        if (g_tiled_aliases_contig && g_contig_mapping) {
+            /* Physical RAM is the contiguous window for this title (it
+             * addresses GPU memory as 0x80000000 + P), so that is what the
+             * tiled aperture has to show. D3D's LockRect hands out
+             * 0xF0000000 + P; aliasing low RAM instead sent every CPU write to
+             * a locked surface -- Black's XMV video frames among them -- into
+             * whatever the title kept at VA P, while the GPU read the untouched
+             * 0x80000000 + P. */
+            g_tiled_view = MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
+                                           0, 0, XBOX_CONTIG_SIZE,
+                                           (LPVOID)tiled_native);
+            if (g_tiled_view) {
+                volatile uint32_t *via_tiled = (volatile uint32_t *)
+                    ((uintptr_t)(XBOX_TILED_BASE + 0x1000) + g_memory_offset);
+                volatile uint32_t *via_contig = (volatile uint32_t *)
+                    ((uintptr_t)(XBOX_CONTIG_BASE + 0x1000) + g_memory_offset);
+                uint32_t saved = *via_contig;
+                *via_tiled = 0xA5C30F17u;
+                fprintf(stderr, "  Tiled aperture: %u MB at Xbox VA 0x%08X aliases the"
+                        " contiguous window%s\n", XBOX_CONTIG_SIZE / (1024 * 1024),
+                        XBOX_TILED_BASE,
+                        *via_contig == 0xA5C30F17u ? " (verified)" : " -- ALIAS FAILED");
+                *via_contig = saved;
+            } else {
+                fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"
+                        " (error %lu)\n", XBOX_TILED_BASE, GetLastError());
+            }
+        } else {
         g_tiled_view = MapViewOfFileEx(
             g_mapping_handle,
             FILE_MAP_ALL_ACCESS,
@@ -1988,6 +2072,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"
                     " (error %lu); rendering writes will fault\n",
                     XBOX_TILED_BASE, GetLastError());
+        }
         }
     }
 
@@ -2275,7 +2360,13 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * the GPU-instance bridge, so the two do not meet until the window is full.
  * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
  * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+/* Starts past physical page 0 and the fake kernel page at 0x80010000, which
+ * the kernel owns on hardware. Handing out physical 0 put Black's gamepad
+ * table at 0x80000040; with the tiled aperture aliasing this window, a write
+ * through 0xF0000040 (a surface whose data offset is still 0) then landed on
+ * it, and XInputGetState was called with the handle 0xCCCCCCCC. */
+#define XBOX_CONTIG_FIRST_FREE  0x00020000u
+static uint32_t g_contig_next = XBOX_CONTIG_BASE + XBOX_CONTIG_FIRST_FREE;
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {

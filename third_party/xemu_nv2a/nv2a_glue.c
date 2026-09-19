@@ -130,6 +130,7 @@ static RAMHTEntry ramht_lookup(NV2AState *d, uint32_t handle)
 static NV2AState *s_d;
 static bool s_thread_ready;
 static uint64_t s_methods, s_ramht_misses;
+static unsigned s_flips;
 
 void xnv2a_context_init_main_thread(void)
 {
@@ -186,6 +187,7 @@ static void complete_flip(NV2AState *d)
     SET_MASK(s, NV_PGRAPH_SURFACE_READ_3D, GET_MASK(s, NV_PGRAPH_SURFACE_WRITE_3D));
     pgraph_reg_w(pg, NV_PGRAPH_SURFACE, s);
     pg->waiting_for_flip = false;
+    s_flips++;
     {
         static int shown;
         if (shown < 6 && getenv("RECOMP_XEMU_VERBOSE")) {
@@ -251,6 +253,22 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
     }
     qemu_mutex_lock(&d->pgraph.lock);
     n = pgraph_method(d, subch, method, param, params, avail, avail, inc != 0);
+    /* RECOMP_XEMU_DRAWLOG=<flip>: PGRAPH's texture/shader state at each draw
+     * of that frame, as xemu sees it (all four stages). */
+    if (method == 0x17FC && param == 0 && getenv("RECOMP_XEMU_DRAWLOG")
+        && (int)s_flips == atoi(getenv("RECOMP_XEMU_DRAWLOG"))) {
+        PGRAPHState *pg = &d->pgraph;
+        static int idx;
+        fprintf(stderr, "  [XDRAW %d] shaderprog=%08X blend=%08X combctl=%08X",
+                idx++, pgraph_reg_r(pg, NV_PGRAPH_SHADERPROG),
+                pgraph_reg_r(pg, NV_PGRAPH_BLEND), pgraph_reg_r(pg, NV_PGRAPH_COMBINECTL));
+        for (int t = 0; t < 4; t++)
+            fprintf(stderr, " | t%d en=%d off=%08X fmt=%08X", t,
+                    (pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + t * 4) >> 30) & 1,
+                    pgraph_reg_r(pg, NV_PGRAPH_TEXOFFSET0 + t * 4),
+                    pgraph_reg_r(pg, NV_PGRAPH_TEXFMT0 + t * 4));
+        fprintf(stderr, "\n");
+    }
     /* Nothing services PGRAPH interrupts here -- on hardware the title's
      * driver acknowledges them from its ISR -- so acknowledge them now, and
      * say which method raised an error, once per method. */

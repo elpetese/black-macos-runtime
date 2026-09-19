@@ -1959,6 +1959,49 @@ static void raster_batch(void)
  * question is what space attribute 0 arrives in: a title running a vertex
  * program hands over object-space positions that mean nothing without running
  * it, while pre-transformed screen-space coordinates can be drawn directly. */
+/* RECOMP_PB_DRAWLOG=<flip>: list every draw of that frame -- screen bounds of
+ * attribute 0, texture stage 0 and the blend state -- to find which draw
+ * covers a region. */
+static void drawlog(void)
+{
+    static int target = -2;
+    float p[4], lo_x = 1e30f, hi_x = -1e30f, lo_y = 1e30f, hi_y = -1e30f;
+    uint32_t k;
+
+    if (target == -2) {
+        const char *e = getenv("RECOMP_PB_DRAWLOG");
+        target = e ? atoi(e) : -1;
+    }
+    if (target < 0 || (int)s_gpu.flips != target)
+        return;
+    for (k = 0; k < s_gpu.idx_count && k < 64; k++)
+        if (fetch_attr(&s_gpu.attr[0], s_gpu.idx[k], p)) {
+            if (p[0] < lo_x) lo_x = p[0];
+            if (p[0] > hi_x) hi_x = p[0];
+            if (p[1] < lo_y) lo_y = p[1];
+            if (p[1] > hi_y) hi_y = p[1];
+        }
+    fprintf(stderr, "  [DRAW] prim %u n %u%s x %.0f..%.0f y %.0f..%.0f tex off 0x%08X fmt 0x%02X %ux%u en %d"
+            " blend %d %04X/%04X atest %d vcolor %08X surf 0x%08X\n",
+            s_gpu.prim, s_gpu.idx_count, s_gpu.inline_active ? " inline" : "",
+            lo_x, hi_x, lo_y, hi_y, s_gpu.tex.offset, s_gpu.tex.color, s_gpu.tex.width,
+            s_gpu.tex.height, s_gpu.tex.enabled, s_gpu.blend_enable, s_gpu.blend_sfactor,
+            s_gpu.blend_dfactor, s_gpu.alpha_test_enable, vertex_color(s_gpu.idx[0]),
+            s_gpu.color_offset);
+    for (k = 0; k < s_gpu.idx_count && k < 6 && s_gpu.idx_count <= 8; k++) {
+        float c[4] = {0}, t[4] = {0};
+        fetch_attr(color_attr(), s_gpu.idx[k], c);
+        fetch_attr(texcoord_attr(), s_gpu.idx[k], t);
+        fetch_attr(&s_gpu.attr[0], s_gpu.idx[k], p);
+        fprintf(stderr, "         v%u pos %.1f,%.1f rgba %.2f %.2f %.2f %.2f uv %.3f %.3f\n",
+                k, p[0], p[1], c[0], c[1], c[2], c[3], t[0], t[1]);
+    }
+    for (k = 0; k < NV_VERTEX_ATTRS && s_gpu.idx_count <= 8; k++)
+        if (s_gpu.attr[k].size)
+            fprintf(stderr, "         attr%u type %u size %u stride %u\n", k,
+                    s_gpu.attr[k].type, s_gpu.attr[k].size, s_gpu.attr[k].stride);
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -1966,6 +2009,7 @@ static void draw_primitive(void)
 
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
+    drawlog();
     s_gpu.draws++;
     g_f7_nv2a_pgraph_draw_count++;
     if ((s_gpu.draws % 200) == 0)

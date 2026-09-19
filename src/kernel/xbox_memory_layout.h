@@ -175,6 +175,18 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
 
+/* Alternate a field-parity word inside the D3D device at ~60 Hz (0, 1, 0, ...).
+ *
+ * On an interlaced display D3D's vblank ISR latches the field being scanned
+ * (from MCPX GPIO bit 5) into the device, and D3DDevice_GetDisplayFieldStatus
+ * reports it. Here the ISR runs only when its DPC has re-armed it, so the latch
+ * changes far less often than the field does and a caller sampling once per
+ * frame sees one parity nearly every time. Black's XMV player starts its clock
+ * only on the other field (sub_0023F45C), so its videos never started and the
+ * texture they draw into stayed black. Writing the parity from the vblank
+ * clock gives every sampler both fields, as a real display does. */
+int xbox_Nv2aFieldParity(uint32_t device_ptr_va, uint32_t field_off);
+
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
@@ -439,6 +451,12 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * the RAM mapping rather than getting its own storage, because a title writes a
  * surface through the tiled address and reads it back through the normal one. */
 #define XBOX_TILED_BASE     0xF0000000u
+
+/* Make the tiled aperture a view of the contiguous window instead of low RAM.
+ * For titles whose GPU memory is the 0x80000000 window (Black): D3D's
+ * LockRect returns 0xF0000000 + P, and the GPU reads 0x80000000 + P. Must be
+ * called before xbox_MemoryLayoutInit. */
+void xbox_SetTiledAliasesContig(int on);
 
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.
