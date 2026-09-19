@@ -186,7 +186,7 @@ def test_arith_honors_operands():
     assert "fp_top() = MEMF(0xK) - fp_top()" in o, o
     # fdivrp st(1), st(0): st1 = st0 / st1, pop
     o = lift("fdivrp", [st1, st0], "st(1), st(0)")
-    assert "fp_st1() = fp_top() / fp_st1(); fp_pop();" in o, o
+    assert "fp_st1() = fp_pc(fp_top() / fp_st1()); fp_pop();" in o, o
 
 
 def test_fcom_pop_counts():

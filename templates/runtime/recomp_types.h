@@ -246,6 +246,20 @@ extern RECOMP_TLS int g_df;
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
 extern RECOMP_TLS uint16_t g_fp_control_word;
+
+/* x87 precision control (control word bits 8-9) applied to a result.
+ *
+ * The FPU stack is modelled in double, but the chip rounds the result of
+ * fadd/fsub/fmul/fdiv/fsqrt to the precision the control word selects, and
+ * titles set it: Black calls _controlfp(_PC_24, _MCW_PC) at startup, as
+ * Direct3D titles commonly do. Computing at 53 bits then made a value kept on
+ * the stack differ from the same value stored as a float -- 101/255 < 101/255
+ * -- and Black's sound-priority insertion walked between two nodes forever.
+ * 00 = 24-bit, 10 = 53-bit, 11 = 64-bit (kept at 53: the model's width). */
+static inline double fp_pc(double x)
+{
+    return (g_fp_control_word & 0x0300u) ? x : (double)(float)x;
+}
 extern RECOMP_TLS int g_fp_cmp;
 
 /* Result of an x87 compare, in the shape the status word wants:
