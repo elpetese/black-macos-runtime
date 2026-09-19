@@ -5530,12 +5530,15 @@ static DWORD WINAPI hang_monitor_thread(LPVOID unused)
         unsigned f;
         Sleep(1000);
         f = xnv2a_flip_count ? xnv2a_flip_count() : (unsigned)g_kernel_call_count;
-        if (f != last || !last) {
+        if (f != last) {
             last = f;
             still = 0;
             continue;
         }
-        if (++still == (unsigned)g_hang_secs && dumps < 3) {
+        /* No frame yet counts too: a title stuck in startup never presents
+         * one, and waiting for "frames stopped" missed exactly that (a white
+         * window with nothing in the log). Startup gets 30 s of grace. */
+        if (++still == (unsigned)(f ? g_hang_secs : g_hang_secs + 30) && dumps < 3) {
             hang_dump(still);
             dumps++;
         }
