@@ -160,6 +160,20 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
+/* A title-specific look at inline vertex data before anything consumes it.
+ * The runtime has no business editing a title's geometry; a game project that
+ * has to work around a specific draw registers this and the change stays in
+ * that project. Called with the primitive type of the enclosing BEGIN/END and
+ * the INLINE_ARRAY payload, which it may modify in place. */
+typedef void (*xbox_pb_inline_filter_fn)(uint32_t prim, uint32_t *words, uint32_t count);
+static xbox_pb_inline_filter_fn s_inline_filter;
+static uint32_t s_cur_prim;
+
+void xbox_PbSetInlineFilter(xbox_pb_inline_filter_fn fn)
+{
+    s_inline_filter = fn;
+}
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -198,6 +212,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
+            if (s_inline_filter && subch == 0 && method == 0x1818 && s_cur_prim
+                && (end_va <= va || (end_va - va) / 4 >= count))
+                s_inline_filter(s_cur_prim, (uint32_t *)(mem + va), count);
             for (uint32_t i = 0; i < count && va != end_va; ) {
                 uint32_t m = noninc ? method : method + i * 4;
                 uint32_t take = 1;
@@ -219,6 +236,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 #endif
                 for (uint32_t k = 0; k < take; k++) {
                     uint32_t mk = noninc ? method : method + (i + k) * 4;
+                    if (subch == 0 && mk == 0x17FC)
+                        s_cur_prim = *(const uint32_t *)(mem + va);
                     note(subch, mk);
                     /* Same walk, two consumers: the survey counts, the
                      * executor acts. With xemu rendering, the executor still

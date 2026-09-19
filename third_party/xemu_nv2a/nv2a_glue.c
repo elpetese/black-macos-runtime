@@ -267,7 +267,12 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
                     (pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + t * 4) >> 30) & 1,
                     pgraph_reg_r(pg, NV_PGRAPH_TEXOFFSET0 + t * 4),
                     pgraph_reg_r(pg, NV_PGRAPH_TEXFMT0 + t * 4));
-        fprintf(stderr, "\n");
+        fprintf(stderr, "\n        comb: ci0=%08X co0=%08X ai0=%08X ao0=%08X f0=%08X sf0=%08X sf1=%08X ci1=%08X ai1=%08X\n",
+                pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORI0), pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORO0),
+                pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAI0), pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAO0),
+                pgraph_reg_r(pg, NV_PGRAPH_COMBINEFACTOR0), pgraph_reg_r(pg, NV_PGRAPH_COMBINESPECFOG0),
+                pgraph_reg_r(pg, NV_PGRAPH_COMBINESPECFOG1), pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORI0 + 4),
+                pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAI0 + 4));
     }
     /* Nothing services PGRAPH interrupts here -- on hardware the title's
      * driver acknowledges them from its ISR -- so acknowledge them now, and
