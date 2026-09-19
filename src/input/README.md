@@ -7,7 +7,23 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 | File | LOC | Purpose |
 |------|-----|---------|
 | `xinput_xbox.h` | 189 | Public header — types, button constants, function prototypes |
-| `xinput_device.c` | 23 | Implementation (maps Xbox calls to Windows XInput) |
+| `xinput_device.c` | 23 | Implementation (Windows XInput; SDL2 GameController on POSIX) |
+| `keyboard_input.c` / `.h` | | POSIX: the terminal keyboard and `RECOMP_INPUT_SCRIPT` as port 0 |
+
+## Keyboard (POSIX)
+
+`xbox_InputInit()` also starts the keyboard source. With stdin a terminal (and
+`RECOMP_KEYBOARD` not `0`) keys press buttons on port 0, merged with any real
+pad: arrows D-pad, Enter Start, Tab/Backspace Back, Space or `z` A, `x` B,
+`c` X, `v` Y, `q`/`e` triggers, `1`/`2` White/Black, `wasd` left stick, `ijkl`
+right stick, `f`/`h` stick clicks. A terminal reports presses and auto-repeat
+but no releases, so each press holds for 150 ms.
+
+For unattended runs, `RECOMP_INPUT_SCRIPT` lists `ms:button[+button][:hold_ms]`
+entries counted from init, e.g. `RECOMP_INPUT_SCRIPT="110000:start:300"`.
+
+A title that drives the USB controller itself (XAPI linked in) reads this
+through the emulated pad in `src/usb` -- enable it with `RECOMP_USB=1`.
 
 ## Quick Start
 

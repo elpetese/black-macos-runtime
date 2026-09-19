@@ -135,8 +135,12 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            float left = mixbins[0][i];
-            float right = mixbins[1][i];
+            float left = 0.0f, right = 0.0f;
+            for (int b = 0; b < NUM_MIXBINS; b++) {
+                float s = mixbins[b][i];
+                if (b < 16) left += s;
+                else right += s;
+            }
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;

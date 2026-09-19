@@ -8,14 +8,16 @@
  * HcRevision out of an aperture backed by zeroed RAM, concludes there is a
  * host controller with no root hub ports, and enumerates nothing.
  *
- * This is the register half of the answer: a controller that reports a real
- * revision, a root hub with ports, and the handful of registers that have
- * behaviour rather than storage. It does not yet walk the endpoint and
- * transfer descriptor lists, which is what actually moves a report, so a
- * driver that gets this far will find a port and then have nothing to talk to.
- * That is deliberate -- the register trace is what says whether the driver
- * polls HcInterruptStatus or waits on the IRQ, and that answers how much of
- * the rest is needed before any of it is written.
+ * The model answers the registers, walks the control and periodic lists the
+ * driver builds in guest memory, keeps the frame clock (HcFmNumber and
+ * HccaFrameNumber) and delivers the controller interrupt from its own thread.
+ * One emulated XID gamepad sits on HC0 port 1 and reports port 0 of the host
+ * input layer: an SDL pad, the terminal keyboard, or RECOMP_INPUT_SCRIPT.
+ * Black enumerates it, reads its XID descriptor and polls its reports with
+ * this. Bulk transfers and isochronous endpoints are not modelled.
+ *
+ * Windows traps the registers with VirtualProtect and a VEH decoder; POSIX
+ * hosts get them through xbox_mmio_intercept.
  *
  * Written from the OHCI 1.0a specification and this title's own code.
  */

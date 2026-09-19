@@ -252,6 +252,12 @@ static struct {
     Texture  tex;
 } s_gpu;
 
+void pb_exec_get_surface(uint32_t *out_offset, uint32_t *out_pitch)
+{
+    if (out_offset) *out_offset = s_gpu.color_offset;
+    if (out_pitch) *out_pitch = s_gpu.pitch;
+}
+
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
  * them in. */
@@ -611,6 +617,7 @@ static void clear_surface(uint32_t param)
     if (getenv("RECOMP_FB_WINDOW")) {
         uint32_t fb_va = dma_resolve(s_gpu.color_offset);
         uint32_t fb_pitch = s_gpu.pitch;
+        fprintf(stderr, "  [GPU] FBWIN check va=0x%08X pitch=%u\n", fb_va, fb_pitch);
         if (fb_va && fb_pitch) {
             fprintf(stderr, "  [GPU] FBWIN set va=0x%08X pitch=%u\n", fb_va, fb_pitch);
             xbox_FramebufferWindowSet(fb_va, fb_pitch);
@@ -618,6 +625,8 @@ static void clear_surface(uint32_t param)
             fprintf(stderr, "  [GPU] FBWIN skip va=0x%08X pitch=%u\n", fb_va, fb_pitch);
         }
     }
+
+    xbox_FramebufferWindowStart();
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -1599,6 +1608,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
         s_gpu.color_offset = param;
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            static uint32_t last;
+            if (param != last) {
+                last = param;
+                fprintf(stderr, "  [GPU] SET_SURFACE_COLOR_OFFSET=0x%08X\n", param);
+                fflush(stderr);
+            }
+        }
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;
@@ -1667,14 +1684,38 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_FLIP_READ:
         s_gpu.flip_read = param;
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            static uint32_t last;
+            if (param != last) {
+                last = param;
+                fprintf(stderr, "  [GPU] SET_FLIP_READ=%u\n", param);
+                fflush(stderr);
+            }
+        }
         return;
 
     case NV097_SET_FLIP_WRITE:
         s_gpu.flip_write = param;
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            static uint32_t last;
+            if (param != last) {
+                last = param;
+                fprintf(stderr, "  [GPU] SET_FLIP_WRITE=%u\n", param);
+                fflush(stderr);
+            }
+        }
         return;
 
     case NV097_SET_FLIP_MODULO:
         s_gpu.flip_modulo = param;
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            static uint32_t last;
+            if (param != last) {
+                last = param;
+                fprintf(stderr, "  [GPU] SET_FLIP_MODULO=%u\n", param);
+                fflush(stderr);
+            }
+        }
         return;
 
     case NV097_FLIP_INCREMENT_WRITE:
@@ -1682,17 +1723,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            fprintf(stderr, "  [GPU] FLIP_INCREMENT_WRITE -> write=%u read=%u modulo=%u\n",
+                    s_gpu.flip_write, s_gpu.flip_read, s_gpu.flip_modulo);
+            fflush(stderr);
+        }
         return;
 
     case NV097_FLIP_STALL:
-        /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {
-                fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
-                        s_gpu.flips, s_gpu.flip_read, s_gpu.flip_write);
+                fprintf(stderr, "  [GPU] flip %u: read=%u write=%u modulo=%u\n",
+                        s_gpu.flips, s_gpu.flip_read, s_gpu.flip_write, s_gpu.flip_modulo);
                 fflush(stderr);
             }
         }
@@ -1738,6 +1782,36 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.tex.width  = param >> 16;
         s_gpu.tex.height = param & 0xFFFF;
         record_tex_reg(method, param);
+        break;
+
+    case 0x0848:
+    case 0x084C:
+    case 0x0850:
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            static int shown;
+            if (shown++ < 8)
+                fprintf(stderr, "  [GPU] surface base/pitch method 0x%04X param 0x%08X\n",
+                        method, param);
+        }
+        break;
+
+    case 0x09F8:
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            static int shown;
+            if (shown++ < 8)
+                fprintf(stderr, "  [GPU] surface/tiling method 0x%04X param 0x%08X\n",
+                        method, param);
+        }
+        break;
+
+    case 0x17BC:
+    case 0x17C4:
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            static int shown;
+            if (shown++ < 8)
+                fprintf(stderr, "  [GPU] vertex/begin method 0x%04X param 0x%08X\n",
+                        method, param);
+        }
         break;
 
     default:
@@ -1958,6 +2032,8 @@ void nv2a_pb_exec_report(void)
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
+    fprintf(stderr, "[GPU] flip read=%u write=%u modulo=%u flips=%u\n",
+            s_gpu.flip_read, s_gpu.flip_write, s_gpu.flip_modulo, s_gpu.flips);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
     dump_surface_bmp();

@@ -9,20 +9,17 @@
 #include "nv2a_state.h"
 #include <stdio.h>
 
-/* NV2A MMIO base in Xbox VA space */
-#define NV2A_MMIO_BASE  0xFD000000u
-#define NV2A_MMIO_SIZE  0x01000000u  /* 16MB */
-#define NV2A_VRAM_BASE  0xF0000000u
-#define NV2A_VRAM_SIZE  (64 * 1024 * 1024)  /* 64MB Xbox VRAM */
-#define NV2A_RAMIN_SIZE (1 * 1024 * 1024)   /* 1MB RAMIN */
-
 static ptrdiff_t g_mem_offset = 0;
 static uint8_t *g_nv2a_vram = NULL;
+static uint8_t *g_nv2a_ramin = NULL;
+static NV2AState *g_nv2a_state = NULL;
 
+#if defined(_WIN32)
 /* Statistics */
 static int g_mmio_read_count = 0;
 static int g_mmio_write_count = 0;
 static int g_mmio_decode_fail = 0;
+#endif
 
 /* Global APU state pointer is declared in apu.h and referenced from main.c
  * (regardless of whether the MMIO hook is active). Keep its definition
@@ -379,14 +376,14 @@ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
         return;
     }
 
-    uint8_t *ramin_ptr = g_nv2a_vram + NV2A_VRAM_SIZE;
+    g_nv2a_ramin = g_nv2a_vram + NV2A_VRAM_SIZE;
 
     /* Initialize NV2A state machine */
-    nv2a_init_standalone(g_nv2a_vram, NV2A_VRAM_SIZE,
-                         ramin_ptr, NV2A_RAMIN_SIZE);
+    g_nv2a_state = nv2a_init_standalone(g_nv2a_vram, NV2A_VRAM_SIZE,
+                                         g_nv2a_ramin, NV2A_RAMIN_SIZE);
 
     fprintf(stderr, "[NV2A] MMIO hook initialized: VRAM=%p RAMIN=%p\n",
-            (void*)g_nv2a_vram, (void*)ramin_ptr);
+            (void*)g_nv2a_vram, (void*)g_nv2a_ramin);
 }
 
 bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
@@ -417,16 +414,41 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
     return false;
 }
 
-#else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
+#else /* !_WIN32 -- generic POSIX MMIO interception lives in mcpx_mmio_posix.c */
 
-void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
-{ (void)xbox_mem_offset; }
-
-bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
-                           uint32_t fault_xbox_va, int is_write)
-{ (void)ctx; (void)fault_addr; (void)fault_xbox_va; (void)is_write; return false; }
+#include <stdlib.h>
 
 bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
-{ (void)fault_addr; (void)fault_xbox_va; return false; }
+{
+    /* The tiled aperture is mapped by xbox_MemoryLayoutInit and aliases RAM. */
+    (void)fault_addr;
+    (void)fault_xbox_va;
+    return false;
+}
 
-#endif /* _WIN32 */
+void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
+{
+    g_mem_offset = xbox_mem_offset;
+
+    /* NV2A physical VRAM is the first 64 MB of RAM, already exposed through
+     * the tiled aperture. Using that host mapping keeps DMA and guest writes
+     * coherent instead of giving the GPU a private, disconnected allocation. */
+    g_nv2a_vram = (uint8_t *)(uintptr_t)(xbox_mem_offset + NV2A_VRAM_BASE);
+    g_nv2a_ramin = (uint8_t *)calloc(1, NV2A_RAMIN_SIZE);
+    if (!g_nv2a_ramin) {
+        fprintf(stderr, "[NV2A] Failed to allocate RAMIN\n");
+        return;
+    }
+    g_nv2a_state = nv2a_init_standalone(g_nv2a_vram, NV2A_VRAM_SIZE,
+                                         g_nv2a_ramin, NV2A_RAMIN_SIZE);
+
+    fprintf(stderr, "[NV2A] Hook init: VRAM=%p RAMIN=%p state=%p\n",
+            (void *)g_nv2a_vram, (void *)g_nv2a_ramin, (void *)g_nv2a_state);
+}
+
+#endif /* !_WIN32 */
+
+NV2AState *nv2a_hook_get_state(void)
+{
+    return g_nv2a_state;
+}

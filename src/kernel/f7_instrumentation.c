@@ -10,6 +10,7 @@
 uint64_t g_f7_apu_frames_submitted;
 uint64_t g_f7_apu_frames_played;
 uint64_t g_f7_apu_mixbin_nonzero_samples;
+uint64_t g_f7_apu_vp_mixbin_nonzero_samples;
 uint64_t g_f7_apu_framebuf_rms_samples;
 uint64_t g_f7_apu_vp_voices_processed;
 uint64_t g_f7_apu_vp_nonzero_voices;
@@ -36,7 +37,7 @@ void f7_print_counts(void)
     fprintf(stderr, "\n"
         "===== F7.0 boundary counts =====\n"
         "[AUDIO] frames_submitted=%llu frames_played=%llu\n"
-        "[AUDIO] mixbin_nonzero_samples=%llu framebuf_rms_samples=%llu\n"
+        "[AUDIO] mixbin_nonzero_samples=%llu vp_mixbin_nonzero_samples=%llu framebuf_rms_samples=%llu\n"
         "[AUDIO] vp_voices_processed=%llu vp_nonzero_voices=%llu vp_nonzero_samples_read=%llu dsp_frames_processed=%llu\n"
         "[GRAPHICS] D3D8_CreateDevice=%llu DrawPrimitive=%llu DrawIndexedPrimitive=%llu Present=%llu\n"
         "[GRAPHICS] NV2A_clears=%llu DMA_PUT_changes=%llu DMA_GET_changes=%llu PGRAPH_methods=%llu draws=%llu\n"
@@ -45,6 +46,7 @@ void f7_print_counts(void)
         (unsigned long long)g_f7_apu_frames_submitted,
         (unsigned long long)g_f7_apu_frames_played,
         (unsigned long long)g_f7_apu_mixbin_nonzero_samples,
+        (unsigned long long)g_f7_apu_vp_mixbin_nonzero_samples,
         (unsigned long long)g_f7_apu_framebuf_rms_samples,
         (unsigned long long)g_f7_apu_vp_voices_processed,
         (unsigned long long)g_f7_apu_vp_nonzero_voices,

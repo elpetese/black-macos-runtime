@@ -20,6 +20,7 @@ extern "C" {
 extern uint64_t g_f7_apu_frames_submitted;
 extern uint64_t g_f7_apu_frames_played;
 extern uint64_t g_f7_apu_mixbin_nonzero_samples;
+extern uint64_t g_f7_apu_vp_mixbin_nonzero_samples;
 extern uint64_t g_f7_apu_framebuf_rms_samples;
 extern uint64_t g_f7_apu_vp_voices_processed;
 extern uint64_t g_f7_apu_vp_nonzero_voices;

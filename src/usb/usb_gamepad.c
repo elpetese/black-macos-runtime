@@ -47,6 +47,23 @@ static const uint8_t s_config_desc[32] = {
     7, 0x05, 0x02, 0x03, 0x20, 0x00, 0x04
 };
 
+/* XID descriptor, read with a vendor GET_DESCRIPTOR for type 0x42. */
+static const uint8_t s_xid_desc[16] = {
+    0x10,           /* bLength                                    */
+    0x42,           /* bDescriptorType: XID                       */
+    0x00, 0x01,     /* bcdXid 1.00                                */
+    0x01,           /* bType: gamepad                             */
+    0x02,           /* bSubType: gamepad S                        */
+    20,             /* bMaxInputReportSize                        */
+    6,              /* bMaxOutputReportSize                       */
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF  /* no alternates  */
+};
+
+#define XID_GET_CAPABILITIES   0x01
+#define XID_GET_DESCRIPTOR     0x06
+#define HID_GET_REPORT         0x01
+#define HID_SET_REPORT         0x09
+
 static uint8_t s_address;
 static uint8_t s_configuration;
 
@@ -130,8 +147,38 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         }
     }
 
-    /* Class requests. The Xbox pad answers a vendor-defined capabilities
-     * request on the interface; anything else is not ours to guess at. */
+    /* The XID requests, on the interface. XAPI's class driver reads the XID
+     * descriptor straight after SET_CONFIGURATION and disables the port if it
+     * stalls -- measured on Black. Values follow the pad xemu models (hw/xbox
+     * /xid.c): type gamepad, subtype S to match the 0x0289 product id, a
+     * 20-byte input report and a 6-byte rumble report. */
+    if (type == 2 && setup->bRequest == XID_GET_DESCRIPTOR
+            && setup->wValue == 0x4200)
+        return copy_out(out, max, s_xid_desc, (int)sizeof s_xid_desc,
+                        setup->wLength);
+
+    if (type == 2 && setup->bRequest == XID_GET_CAPABILITIES) {
+        /* Every bit the report can carry, set: "this pad has all of them". */
+        uint8_t caps[20];
+        int len = (setup->wValue == 0x0100) ? 20
+                : (setup->wValue == 0x0200) ? 6 : 0;
+        if (!len)
+            return -1;
+        memset(caps, 0xFF, sizeof caps);
+        caps[0] = 0;
+        caps[1] = (uint8_t)len;
+        return copy_out(out, max, caps, len, setup->wLength);
+    }
+
+    if (type == 1 && setup->bRequest == HID_GET_REPORT && is_in) {
+        uint8_t rep[20];
+        int n = usb_gamepad_report(rep, (int)sizeof rep);
+        return copy_out(out, max, rep, n, setup->wLength);
+    }
+
+    if (type == 1 && setup->bRequest == HID_SET_REPORT && !is_in)
+        return 0;                        /* rumble: accepted, not felt */
+
     return -1;
 }
 

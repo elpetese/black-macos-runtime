@@ -19,22 +19,23 @@
 # - el host recibe frames?
 # - el backend macOS los reproduce?
 #
-# Resultado: PARCIAL / NO DETERMINADO
-# Evidencia: xa2_submit_samples se llamó 5400 veces en 30s.
-#   frames_submitted=5400, frames_played=0
-#   mixbin_nonzero_samples=0, framebuf_rms_samples=0
+# Resultado: CONFIRMADO pipeline funcional
+# Evidencia:
+#   - VP voices procesadas: ~388,000
+#   - VP nonzero voices: detectadas
+#   - VP nonzero samples read: ~12.3M
+#   - DSP frames processed: ~40,320
+#   - mixbin nonzero samples: > 0
+#   - framebuf_rms_samples: > 0
+#   - SDL-AUDIO: first non-silent PCM buffer (peak=335)
 #
-# Interpretación:
-# - El pipeline SDL2 está activo y recibe frames del APU.
-# - Sin embargo, los mixbins NO contienen samples no nulos (mezcla silenciosa).
-# - El host (SDL2) no reproduce frames (frames_played=0).
-# - Esto sugiere que el VP/DSP no está generando contenido, o que
-#   frame_buf se llena con silencio. Requiere investigación en F7.1-F7.2.
+# Acción tomada:
+# - Corregido bug en apu_vp.c/apu_core.c: DSP-written frame_buf era sobrescrito
+# - Ahora frame_buf se preserva cuando dsp_wrote_frame está activo
 #
-# Siguiente paso: instrumentar VP (apu_vp.c) y DSP (apu_dsp.c) para
-# determinar si reciben/generan samples.
+# Estado: Audio pipeline CONFIRMADO como funcional desde juego.
 
-## Gráficos
+## Graphics
 
 # Preguntas:
 # - Black llama xbox_Direct3DCreate8?
@@ -47,24 +48,26 @@
 # - DMA_GET avanza?
 # - pgraph_method recibe metodos?
 #
-# Resultado: CONFIRMADO (push buffer directo)
-# Ruta identificada: Push buffer NV2A (NO D3D8 API)
+# Resultado: CONFIRMADO push buffer, doble buffer identificado
 # Evidencia:
-# - D3D8_CreateDevice=0, DrawPrimitive=0, DrawIndexedPrimitive=0, Present=0
-# - NV2A_clears=172, draws=941 (via nv2a_pb_exec)
-# - El juego escribe comandos NV2A directamente en guest RAM
-# - RECOMP_PB_EXEC consume el push buffer y produce clears/draws
-# - FBWIN se actualiza cada frame mostrando el resultado
+#   - Ruta D3D8 API: 0 llamadas (CONFIRMADO no usada)
+#   - Push buffer executor: ACTIVO
+#     - Clears: 221+
+#     - Draws: 1,466+ (1,345 con coordenadas)
+#     - Triangulos rasterizados: 8,482
+#     - Textured batches: 966
+#     - Batches con texcoords pero sin stage usable: 72
+#   - Metodos NV2A no manejados: 73 distintitos
+#   - Top: 0x17C4, 0x17BC, 0x0848, 0x084C, 0x0850, 0x09F8
 #
-# Implicación crítica:
-# - NO necesitamos implementar D3D8 API stubs para gráficos básicos
-# - El push buffer executor ya está funcionando
-# - Necesitamos expandir nv2a_pb_exec para manejar más comandos
-#   (texturas, matrices, vertex programs, etc.)
-# - O implementar el traductor D3D11 completo en nv2a_pgraph_d3d11.c
+# Surface discovery:
+#   - 0x82E50000 (executor surface) → score=357, ratio=32.46% → CON CONTENIDO
+#   - 0x82F7C000 (GPU summary back buffer) → score=0, ratio=0.00% → NEGRO
+#   - Doble buffer CONFIRMADO: separados por 0x12C000
+#   - Flip state: modulo=2, write alterna 0/1
 #
-# Siguiente paso: F7.1 expandir nv2a_pb_exec para consumir
-# texturas, matrices y shaders del push buffer.
+# Estado actual: F7.3 en investigación. Ventana transparente detectada después de rebuild.
+# Próximo paso: verificar si clear rojo/shader UV son visibles.
 
 ## Input
 
@@ -74,9 +77,51 @@
 # - se puede inyectar un estado de mando sin USB?
 #
 # Resultado: NO DETERMINADO
-# Evidencia: polls=0, nonzero_buttons=0 en 30s de loop de título.
-# El juego está en pantalla de título / modo demo.
-# El input puede no consultarse hasta que el usuario presione Start.
+# Evidencia:
+#   - SDL_GameController: implementado
+#   - Input polls durante title screen: 0
+#   - Non-zero buttons: 0
 #
-# Siguiente paso: probar con INPUT_SCRIPT o SDL_GameController
-# una vez que el juego llegue a gameplay.
+# Estado: Path implementado pero sin actividad detectada en frontend.
+
+## F7.6 - Input host - CONFIRMADO
+
+**Commit:** f7-06-input-host  
+**Fecha:** 14 de septiembre de 2026
+
+### Resultado
+
+Input host CONFIRMADO como funcional.
+
+### Medidas
+
+```text
+INPUT polls=2626
+INPUT nonzero_buttons=41
+```
+
+### Condiciones
+
+- `RECOMP_USB=1` es requerido para inicializar input
+- `RECOMP_INPUT_SCRIPT="0:start:300,2000:a:300"` funciona correctamente
+- Sin `RECOMP_USB=1`, `xbox_InputInit()` no se llama y el script no se carga
+
+### Archivos abiertos durante input test
+
+```text
+D:\Export\FrontEnd\InGameOn.bin
+D:\Export\FrontEnd\Loading.bin
+D:\videos\AK_N.xmv
+D:\Sound\Streams\AK47.bks
+```
+
+### GPU durante input test
+
+```text
+NV2A_clears=217
+draws=1431
+```
+
+### Veredicto
+
+Input host CONFIRMADO. El juego consulta el mando correctamente y responde al script. Siguiente paso: F7.7 (primer nivel completo).

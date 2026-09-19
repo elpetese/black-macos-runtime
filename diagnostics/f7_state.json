@@ -1,32 +1,25 @@
 {
-  "audio_host": "active",
-  "graphics_path": "push_buffer",
-  "first_draw": "confirmed",
-  "present": "n/a",
-  "input_host": "partial",
+  "audio_host": "confirmed_pipeline",
+  "graphics_path": "push_buffer_confirmed_double_buffer",
+  "first_draw": "confirmed_visible_with_scanner",
+  "present": "candidate_scanner_active",
+  "input_host": "confirmed_working",
   "first_level": "pending",
   "playable": false,
-  "f7_0_completed": true,
-  "f7_0_results": {
-    "audio": "PARTIAL - frames_submitted=5400 en 30s, pero frames_played=0 y mixbin_nonzero_samples=0. El pipeline SDL2 recibe frames pero el mix está silencioso. Requiere investigación VP/DSP.",
-    "graphics": "CONFIRMADO_PUSH_BUFFER - D3D8 API no se usa (todos los contadores D3D8=0). Black escribe comandos NV2A directamente en guest RAM. nv2a_pb_exec consume el push buffer: 172 clears, 941 draws en 30s.",
-    "input": "NO_DETERMINADO - polls=0, nonzero_buttons=0 en 30s de loop de título"
-  },
-  "f7_0_measurements": {
-    "audio_frames_submitted": 5400,
-    "audio_frames_played": 0,
-    "audio_mixbin_nonzero": 0,
-    "audio_framebuf_rms": 0,
-    "graphics_d3d8_create_device": 0,
-    "graphics_d3d8_draw_primitive": 0,
-    "graphics_d3d8_draw_indexed_primitive": 0,
-    "graphics_d3d8_present": 0,
-    "graphics_nv2a_clears": 172,
-    "graphics_nv2a_dma_put_changes": 0,
-    "graphics_nv2a_dma_get_changes": 0,
-    "graphics_nv2a_pgraph_methods": 0,
-    "graphics_nv2a_draws": 941,
-    "input_polls": 0,
-    "input_nonzero_buttons": 0
-  }
+  "f7_0_complete": true,
+  "f7_3a_complete": true,
+  "f7_3b_complete": true,
+  "f7_6_complete": true,
+  "next_step": "f7-07-first-level",
+  "key_findings": [
+    "Audio pipeline functional: DSP writes non-zero framebuf, SDL peak=335",
+    "Graphics uses NV2A push buffer exclusively, not D3D8 API",
+    "Double buffer confirmed: 0x82E50000 has 32% non-zero, 0x82F7C000 is black",
+    "Flip state: modulo=2, write alternates 0/1, executor surface is front buffer",
+    "73 unhandled NV2A methods; top 0x17C4 0x17BC 0x0848 0x084C 0x0850 0x09F8",
+    "Candidate scanner presents 0x82E50000 which has content",
+    "Input confirmed working: polls=2626, nonzero_buttons=41 with RECOMP_USB=1",
+    "Game advances beyond frontend: loads InGameOn.bin, Loading.bin, AK_N.xmv, AK47.bks",
+    "GPU active in gameplay: draws ~1430, clears=217"
+  ]
 }

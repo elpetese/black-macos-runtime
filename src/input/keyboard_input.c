@@ -9,6 +9,9 @@
 void xbox_KeyboardInit(void) {}
 int  xbox_KeyboardMergeState(XBOX_GAMEPAD *pad) { (void)pad; return 0; }
 void xbox_KeyboardRestoreTerminal(void) {}
+int  xbox_KeyboardSlotForKey(unsigned char c) { (void)c; return -1; }
+void xbox_KeyboardPressSlot(int slot) { (void)slot; }
+void xbox_KeyboardReleaseSlot(int slot) { (void)slot; }
 
 #else
 
@@ -21,14 +24,9 @@ void xbox_KeyboardRestoreTerminal(void) {}
 #include <time.h>
 #include <unistd.h>
 
-/* One slot per thing a key can press. */
-enum {
-    K_UP, K_DOWN, K_LEFT, K_RIGHT, K_START, K_BACK, K_LTHUMB, K_RTHUMB,
-    K_A, K_B, K_X, K_Y, K_BLACK, K_WHITE, K_LT, K_RT,
-    K_LS_UP, K_LS_DOWN, K_LS_LEFT, K_LS_RIGHT,
-    K_RS_UP, K_RS_DOWN, K_RS_LEFT, K_RS_RIGHT,
-    K_COUNT
-};
+/* Slot enumeration lives in keyboard_input.h: it is shared with the Cocoa key
+ * view in fb_present_posix.m so both the terminal reader and the window drive
+ * the same per-slot hold timers below. */
 
 static const struct { const char *name; int slot; } k_names[] = {
     {"up", K_UP}, {"down", K_DOWN}, {"left", K_LEFT}, {"right", K_RIGHT},
@@ -112,18 +110,18 @@ static int key_slot(unsigned char c)
     switch (c) {
     case '\r': case '\n':      return K_START;
     case '\t': case 0x7F: case 0x08: return K_BACK;
-    case ' ': case 'z': case 'Z': return K_A;
+    case ' ':                  return K_A;
     case 'x': case 'X':        return K_B;
-    case 'c': case 'C':        return K_X;
-    case 'v': case 'V':        return K_Y;
-    case 'q': case 'Q':        return K_LT;
-    case 'e': case 'E':        return K_RT;
+    case 'q': case 'Q':        return K_X;
+    case 'e': case 'E':        return K_Y;
+    case 'v': case 'V':        return K_LT;
+    case 'c': case 'C':        return K_RT;
     case '1':                  return K_WHITE;
     case '2':                  return K_BLACK;
-    case 'w': case 'W':        return K_LS_UP;
-    case 's': case 'S':        return K_LS_DOWN;
-    case 'a': case 'A':        return K_LS_LEFT;
-    case 'd': case 'D':        return K_LS_RIGHT;
+    case 'w': case 'W':        return K_LS_UP;   /* left stick up    */
+    case 'a': case 'A':        return K_LS_LEFT; /* left stick left  */
+    case 's': case 'S':        return K_LS_DOWN; /* left stick down  */
+    case 'd': case 'D':        return K_LS_RIGHT;/* left stick right */
     case 'i': case 'I':        return K_RS_UP;
     case 'k': case 'K':        return K_RS_DOWN;
     case 'j': case 'J':        return K_RS_LEFT;
@@ -178,8 +176,9 @@ static void start_tty(void)
     }
     pthread_detach(th);
     s_active = 1;
-    fprintf(stderr, "  Keyboard: controller port 0 (arrows d-pad, Enter start, "
-                    "Space/z A, x B, c X, v Y, Tab back, wasd stick)\n");
+    fprintf(stderr, "  Keyboard: port 0 (arrows d-pad, WASD left stick, IJKL right "
+                    "stick, Space A, x B, q X, e Y, v/c LT/RT, 1/2 White/Black, "
+                    "f/h L3/R3, Enter Start, Tab Back)\n");
 }
 
 static int slot_named(const char *name, size_t len)
@@ -314,6 +313,49 @@ int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
     if (down[K_RS_LEFT])  pad->sThumbRX = -32768;
     if (down[K_RS_RIGHT]) pad->sThumbRX = 32767;
     return 1;
+}
+
+int xbox_KeyboardSlotForKey(unsigned char c)
+{
+    return key_slot(c);
+}
+
+#if defined(__APPLE__)
+/* macOS virtual key codes (kVK_*) for the arrow keys, so the Cocoa key view
+ * can drive the d-pad without relying on the terminal. Values are stable
+ * across SDKs; matched by numeric literal to avoid pulling HIToolbox into the
+ * keyboard_input.c translation unit. */
+int xbox_KeyboardSlotForKeyCode(unsigned short keycode)
+{
+    switch (keycode) {
+    case 0x7E: return K_UP;    /* kVK_UpArrow    */
+    case 0x7F: return K_DOWN;  /* kVK_DownArrow  */
+    case 0x7B: return K_LEFT;  /* kVK_LeftArrow  */
+    case 0x7C: return K_RIGHT; /* kVK_RightArrow */
+    default:   return -1;
+    }
+}
+#endif
+
+void xbox_KeyboardPressSlot(int slot)
+{
+    if (slot < 0 || slot >= K_COUNT)
+        return;
+    /* Held until the matching release; key repeat keeps re-pressing. */
+    s_active = 1;
+    pthread_mutex_lock(&s_lock);
+    s_until[slot] = UINT64_MAX;
+    pthread_mutex_unlock(&s_lock);
+}
+
+void xbox_KeyboardReleaseSlot(int slot)
+{
+    if (slot < 0 || slot >= K_COUNT)
+        return;
+    s_active = 1;
+    pthread_mutex_lock(&s_lock);
+    s_until[slot] = now_ms();   /* expire any held press immediately */
+    pthread_mutex_unlock(&s_lock);
 }
 
 #endif

@@ -394,14 +394,10 @@ static void dsp_ack_tick(void)
             *heartbeat = DSP_HEARTBEAT;
     }
     {
-        /* GPSADDR sits in the voice-processor block a host may have handed to
-         * an APU model; read it through the model instead of faulting on
-         * every poll. */
         uint64_t v;
-        if (xbox_mmio_read(XBOX_MCPX_BASE + APU_GPSADDR, 4, &v))
-            sg = (uint32_t)v;
-        else
-            sg = *(volatile uint32_t *)((char *)g_mcpx_regs + APU_GPSADDR);
+        if (!xbox_mmio_read(XBOX_MCPX_BASE + APU_GPSADDR, 4, &v))
+            return;
+        sg = (uint32_t)v;
     }
     if (!sg || !fence_readable(sg, 4))
         return;
@@ -744,6 +740,39 @@ static void xbox_Nv2aAckStart(void)
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
     }
 }
+
+#if !defined(_WIN32)
+#include <pthread.h>
+
+static void *dsp_ack_thread(void *arg)
+{
+    (void)arg;
+    while (!g_nv2a_ack_stop) {
+        dsp_ack_tick();
+        usleep(1000);  /* 1 kHz */
+    }
+    return NULL;
+}
+
+static pthread_t g_dsp_ack_thread;
+
+static void xbox_DspAckStart(void)
+{
+    g_nv2a_ack_stop = 0;
+    if (pthread_create(&g_dsp_ack_thread, NULL, dsp_ack_thread, NULL) == 0) {
+        fprintf(stderr, "  DSP ack thread started (POSIX)\n");
+    }
+}
+
+static void xbox_DspAckStop(void)
+{
+    g_nv2a_ack_stop = 1;
+    if (g_dsp_ack_thread) {
+        pthread_join(g_dsp_ack_thread, NULL);
+        g_dsp_ack_thread = 0;
+    }
+}
+#endif
 
 /* Separate allocation for Xbox kernel address space (0x80010000+).
  * Some RenderWare code reads the kernel PE header to detect features. */
@@ -1787,6 +1816,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         xbox_Nv2aAckStart();
     }
 
+#if !defined(_WIN32)
+    xbox_DspAckStart();
+#endif
+
     /*
      * Allocate a page at Xbox kernel address space (0x80010000).
      *
@@ -1992,6 +2025,10 @@ void xbox_MemoryLayoutShutdown(void)
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
     }
+
+#if !defined(_WIN32)
+    xbox_DspAckStop();
+#endif
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
         g_nv2a_memory = NULL;

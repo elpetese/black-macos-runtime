@@ -250,10 +250,17 @@ int xbox_mmio_intercept(uint32_t guest_va, uint32_t size,
     }
     host = (uintptr_t)xbox_GetMemoryOffset() + guest_va;
     len = ((size_t)size + (size_t)ps - 1) & ~((size_t)ps - 1);
-    if (mprotect((void *)host, len, PROT_NONE) != 0) {
-        perror("[MMIO] mprotect");
-        return 0;
-    }
+
+    /* Register the handler BEFORE making the page PROT_NONE. Host code reads
+     * the guest address space directly (xbox_mmio_read, and the NV2A/APU/AC97
+     * ack threads dereference the guest window as an ordinary pointer), so a
+     * page may be made inaccessible only once xbox_mmio_read is able to route
+     * accesses to this handler. Doing mprotect first leaves a window in which
+     * the page faults but no handler is registered yet, so a direct touch
+     * faults instead of being emulated. Observed as a SIGBUS in nv2a_ack_thread
+     * on the APU GP counter at 0xFE820010 during boot: g_apu_mmio_trapped is
+     * Windows-only, so the ack thread's "leave device registers alone" guard
+     * never trips on POSIX, and its check-then-poke hit the unmapped page. */
     g_regions[g_region_count].host_base = host;
     g_regions[g_region_count].len       = len;
     g_regions[g_region_count].guest_va  = guest_va;
@@ -262,6 +269,13 @@ int xbox_mmio_intercept(uint32_t guest_va, uint32_t size,
     g_regions[g_region_count].ctx       = ctx;
     g_regions[g_region_count].name      = name;
     g_region_count++;
+    if (mprotect((void *)host, len, PROT_NONE) != 0) {
+        perror("[MMIO] mprotect");
+        /* Roll the partial registration back so the plain-RAM fallback below
+         * reads the zeroed backing store instead of dangling callbacks. */
+        g_region_count--;
+        return 0;
+    }
     fprintf(stderr, "  %s: 0x%08X..0x%08X intercepted\n", name, guest_va,
             guest_va + (uint32_t)len);
     return 1;

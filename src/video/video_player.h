@@ -61,5 +61,8 @@ int  video_dump_frame_bmp(const char *path);
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
+#if defined(__APPLE__)
+void xbox_FramebufferWindowStop(void);
+#endif
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

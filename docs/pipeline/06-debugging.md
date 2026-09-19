@@ -337,6 +337,8 @@ following, in this order; they are generic XDK behaviour, not Black-specific.
 | D3D waits for push-buffer space | GPU completion fence never advances | `xbox_Nv2aMirrorFence(device_ptr_va, put_off, get_ptr_off)` from the host (Black: 0x27BFF8, 0x2C, 0x30) |
 | Video waits for "the other field" | interlaced field comes from port 0x80C0 bit 5 | `src/kernel/port_io.c` alternates it per vblank |
 | Streams "play" but never advance; a video paced by its soundtrack freezes | DirectSound's Play writes voice methods to the VP PIO space (0xFE820000+) and completes packets from the APU interrupt; plain memory does neither | host hands 0xFE800000-0xFE830000 (core + VP) to `src/apu` with `xbox_mmio_intercept` and registers the APU vector (Black: 5) with `xbox_RegisterInterruptSource` -- see `black-recomp/src/main_posix.c` `apu_init` |
+| XAPI never touches 0xFED00000; no pad however input is wired | `XInitDevices` came out as an unresolved stub: the XPP section opens with driver tables, the sweep lands one byte out of phase, and a data byte there was seeded as a "function" that swallowed the real entry | `tools/disasm` realigns undecoded tail-jump targets and drops immediates the code also uses as memory operands (`test_tail_jump_realign.py`). The class-driver callbacks named only by that table are gap-after-`ret` functions and need seeds (Black: `black-recomp/seeds/hand_seeds.json`) |
+| Pad arrives, then the port is disabled or enumeration restarts | OHCI model gaps, in the order Black hit them: descriptors live in the contiguous window (0x83xxxxxx); the driver times delays with SOF and `HccaFrameNumber`; the configuration data stage is split over several 8-byte TDs with a short packet at the end; the XID descriptor (`C1 06 4200`) must not stall | `src/usb/ohci.c` + `usb_gamepad.c` under `RECOMP_USB=1`, trace with `RECOMP_USB_TRACE=1`: `SETUP`, `IN ep0 n of m`, `IN ep1 report #` |
 
 The Win32 VEH APU hook (`src/apu/apu_mmio_hook.c`) is Windows-only; on other
 hosts the APU aperture stays plain memory, and the game host's SIGSEGV/SIGBUS
@@ -345,6 +347,10 @@ handler must call `xbox_mcpx_mmio_fault()` first (see
 
 ### Tools that find these quickly
 
+- `RECOMP_INPUT_SCRIPT="ms:button[+button][:hold],..."` (with `RECOMP_USB=1`):
+  scripted pad presses for runs nobody types into; compare the `[FILE] open ok`
+  sequence with and without them. Interactive runs read the terminal
+  keyboard instead (`src/input/keyboard_input.h`).
 - `sample <pid> 3` (macOS): host stack of every thread with the generated
   `sub_XXXXXXXX` names -- a hang is located in seconds.
 - `lldb -p <pid> --batch -o "memory read -s4 -fx -c<N> <addr>"`: guest memory

@@ -463,6 +463,35 @@ static void se_frame(MCPXAPUState *d)
     d->monitor.dsp_wrote_frame = 0;
 
     mcpx_apu_vp_frame(d, mixbins);
+
+    int mixbin_nonzero = 0;
+    int mixbin_bin_usage[32] = {0};
+    for (int b = 0; b < NUM_MIXBINS; b++) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            if (mixbins[b][i] != 0.0f) {
+                mixbin_nonzero++;
+                mixbin_bin_usage[b]++;
+            }
+        }
+    }
+    if (mixbin_nonzero > 0) {
+        g_f7_apu_vp_mixbin_nonzero_samples += mixbin_nonzero;
+        static int shown = 0;
+        if (!shown) {
+            fprintf(stderr, "[SE] frame %d: vp_mixbin_nonzero=%d bins_0_7=%d,%d,%d,%d,%d,%d,%d,%d bins_8_15=%d,%d,%d,%d,%d,%d,%d,%d bins_16_31=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                d->frame_count, mixbin_nonzero,
+                mixbin_bin_usage[0], mixbin_bin_usage[1], mixbin_bin_usage[2], mixbin_bin_usage[3],
+                mixbin_bin_usage[4], mixbin_bin_usage[5], mixbin_bin_usage[6], mixbin_bin_usage[7],
+                mixbin_bin_usage[8], mixbin_bin_usage[9], mixbin_bin_usage[10], mixbin_bin_usage[11],
+                mixbin_bin_usage[12], mixbin_bin_usage[13], mixbin_bin_usage[14], mixbin_bin_usage[15],
+                mixbin_bin_usage[16], mixbin_bin_usage[17], mixbin_bin_usage[18], mixbin_bin_usage[19],
+                mixbin_bin_usage[20], mixbin_bin_usage[21], mixbin_bin_usage[22], mixbin_bin_usage[23],
+                mixbin_bin_usage[24], mixbin_bin_usage[25], mixbin_bin_usage[26], mixbin_bin_usage[27],
+                mixbin_bin_usage[28], mixbin_bin_usage[29], mixbin_bin_usage[30], mixbin_bin_usage[31]);
+            shown = 1;
+        }
+    }
+
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d, mixbins);
 

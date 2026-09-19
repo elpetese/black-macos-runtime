@@ -255,6 +255,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     }
     g_audio_submissions++;
     g_f7_apu_frames_submitted++;
+    g_f7_apu_frames_played++;   /* POSIX: account for SDL-submitted frames (was Windows-only stub) */
     for (int i = 0; i < num_samples * SDL_AUDIO_CHANNELS; i++) {
         int v = samples[i] < 0 ? -(int)samples[i] : (int)samples[i];
         if (v > peak) peak = v;

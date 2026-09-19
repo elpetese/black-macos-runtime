@@ -500,6 +500,7 @@ struct MCPXAPUState {
         int16_t frame_buf[256][2];
         void *stream; /* SDL_AudioStream* - stubbed */
         int queued_bytes_low, queued_bytes_high;
+        bool dsp_wrote_frame;
     } monitor;
 };
 

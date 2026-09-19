@@ -78,7 +78,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 | **AV pack / video mode detection** | ADDED | Returns HDTV/component, 480p capable |
 | **SMBus / SMC** | ADDED | Version, tray state, AV pack, temperature |
 | Xbox Live / network | Stub | PhyGetLinkState returns "no link" |
-| USB/OHCI gamepad | N/A | Bypassed via XInput |
+| USB/OHCI gamepad | PARTIAL | Bypassed via XInput where XPP is shimmed; titles with XAPI linked in drive `src/usb` (OHCI + XID pad, `RECOMP_USB=1`), fed by SDL pads or the terminal keyboard |
 | DVD/disc drive | N/A | Host filesystem instead |
 
 ## Audio

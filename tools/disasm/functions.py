@@ -546,14 +546,23 @@ class FunctionDetector:
         def in_code_section(addr: int) -> bool:
             return any(lo <= addr < hi for lo, hi in code_ranges)
 
+        # An address the code reads or writes as a memory operand is data, even
+        # in a section flagged executable. Black's XPP section keeps a status
+        # byte at 0x0027D028 (`mov byte ptr [27D028h], 2`) that the driver also
+        # passes by address; probed as code it ran on into the real function
+        # after it and swallowed that function's entry.
+        data_addrs = set()
         targets = set()
         for insn in self.engine.instructions.values():
+            if insn.memory_ref is not None:
+                data_addrs.add(insn.memory_ref)
             target = insn.imm_ref
             if target is None or target in self.functions:
                 continue
             if inside_a_function(target) or not in_code_section(target):
                 continue
             targets.add(target)
+        targets -= data_addrs
 
         found = 0
         for target in sorted(targets):
@@ -596,13 +605,12 @@ class FunctionDetector:
         starts = [b[0] for b in bodies]
         added = False
 
-        for insn in self.engine.instructions.values():
+        # A snapshot: realigning a target below adds instructions.
+        for insn in list(self.engine.instructions.values()):
             if not insn.is_jump or insn.is_cond_jump:
                 continue
             target = insn.jump_target
             if target is None or target in self._candidates:
-                continue
-            if target not in self.engine.instructions:
                 continue
 
             # The jump is a tail jump only if it leaves its own function.
@@ -618,6 +626,17 @@ class FunctionDetector:
             section = self.image.get_section_at_va(target)
             if section is None or not section.executable:
                 continue
+
+            # A target the sweep stepped over is still a target. Black's
+            # XInitDevices (0x0027D058) follows a run of data that the sweep
+            # leaves one byte out of phase, so the only jump to it -- the thunk
+            # every caller goes through -- was dropped here, the function became
+            # a stub that returns at once, and the title's USB stack never
+            # started. Realign, but only where the bytes decode as a body.
+            if target not in self.engine.instructions:
+                if not (self.engine.probes_as_function_body(target)
+                        and self.engine.decode_at(target)):
+                    continue
 
             # Does the target land inside some *other* function? The CRT does
             # this constantly -- _startOneArgErrorHandling jumps into the middle
