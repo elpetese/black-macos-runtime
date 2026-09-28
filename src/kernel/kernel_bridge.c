@@ -409,6 +409,10 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
 
+    fprintf(stderr, "  [KERNEL] worker thread START fn=%p ctx1=0x%08X ctx2=0x%08X\n",
+            (void*)fn, ctx1, ctx2);
+    fflush(stderr);
+
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
      * The TIB carries the SEH chain head and, through fs:[4], the CRT's
@@ -430,7 +434,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
     bridge_run_thread_inline(fn, ctx1, ctx2);
 
-    fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
+    fprintf(stderr, "  [KERNEL] worker thread RETURNED (eax=0x%08X)\n", g_eax);
     fflush(stderr);
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. */
@@ -594,6 +598,12 @@ static void bridge_NtClose(void)
 
     if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
+        fflush(stderr);
+    }
+
+    if (raw_handle == 0x48000003u || raw_handle == 0x4800000Bu) {
+        fprintf(stderr,
+                "  [TRACE-CLOSE] NtClose handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
 
@@ -1334,9 +1344,14 @@ static void bridge_NtCreateEvent(void)
         bridge_write_handle(handle_ptr, local_handle);
     }
 
-    fprintf(stderr, "  [BRIDGE] NtCreateEvent: handle_ptr=0x%08X type=%u init=%u → status=0x%08X handle=0x%08X\n",
-            handle_ptr, event_type, initial_state, (uint32_t)status,
-            (uint32_t)(uintptr_t)local_handle);
+    {
+        uint32_t guest_token = handle_ptr ? BRIDGE_MEM32(handle_ptr) : 0;
+        fprintf(stderr,
+            "  [BRIDGE] NtCreateEvent: guest_token=0x%08X handle_ptr=0x%08X type=%u init=%u "
+            "→ status=0x%08X native=0x%p\n",
+            guest_token, handle_ptr, event_type, initial_state,
+            (uint32_t)status, local_handle);
+    }
 
     g_eax = (uint32_t)status;
 }
@@ -1348,24 +1363,54 @@ static void bridge_KeSetEvent(void)
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
 
+    if (event_ptr == 0x48000003u || event_ptr == 0x4800000Bu) {
+        fprintf(stderr,
+                "  [TRACE-SET] KeSetEvent token=0x%08X increment=%u wait=%u\n",
+                event_ptr, increment, wait);
+        fflush(stderr);
+    }
+
     g_eax = (uint32_t)xbox_KeSetEvent(XBOX_TO_NATIVE(event_ptr), increment, (BOOLEAN)wait);
+
+    if (event_ptr == 0x48000003u || event_ptr == 0x4800000Bu) {
+        fprintf(stderr,
+                "  [TRACE-SET] KeSetEvent token=0x%08X returned prev=%u\n",
+                event_ptr, g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
+static HANDLE bridge_resolve_handle(uint32_t token);
 static void bridge_KeWaitForSingleObject(void)
 {
-    uint32_t object = STACK_ARG(0);
-    uint32_t wait_reason = STACK_ARG(1);
-    uint32_t wait_mode = STACK_ARG(2);
-    uint32_t alertable = STACK_ARG(3);
-    uint32_t timeout_ptr = STACK_ARG(4);
+    uint32_t object       = STACK_ARG(0);
+    uint32_t wait_reason  = STACK_ARG(1);
+    uint32_t wait_mode    = STACK_ARG(2);
+    uint32_t alertable    = STACK_ARG(3);
+    uint32_t timeout_ptr  = STACK_ARG(4);
+    HANDLE   handle       = bridge_resolve_handle(object);
+
+    if (object == 0x48000003u || object == 0x4800000Bu) {
+        const char *t = timeout_ptr ? "finite" : "INFINITE";
+        fprintf(stderr,
+                "  [TRACE-WAIT] KeWaitForSingleObject token=0x%08X bridge=%p "
+                "reason=%u mode=%u alertable=%u timeout=%s\n",
+                object, handle, wait_reason, wait_mode, alertable, t);
+        fflush(stderr);
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-        XBOX_TO_NATIVE(object), wait_reason, wait_mode,
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
-}
+        XBOX_TO_NATIVE(object), wait_reason, wait_mode, (BOOLEAN)alertable,
+        XBOX_TO_NATIVE(timeout_ptr));
 
-static HANDLE bridge_resolve_handle(uint32_t token);
+    if (object == 0x48000003u || object == 0x4800000Bu) {
+        fprintf(stderr,
+                "  [TRACE-WAIT] KeWaitForSingleObject token=0x%08X returned 0x%08X\n",
+                object, g_eax);
+        fflush(stderr);
+    }
+}
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
 /*
@@ -1389,8 +1434,35 @@ static void bridge_NtWaitForSingleObject(void)
  * before each async map read; a no-op here left the event stuck signalled. */
 static void bridge_NtClearEvent(void)
 {
-    HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
-    g_eax = (uint32_t)xbox_NtClearEvent(handle);
+    uint32_t guest_token = STACK_ARG(0);
+    HANDLE   handle      = bridge_resolve_handle(guest_token);
+    uint32_t guest_pc    = 0; /* TODO: capture real caller PC when available */
+    DWORD    tid         = GetCurrentThreadId();
+
+    if (guest_token == 0x48000003u || guest_token == 0x4800000Bu) {
+        DWORD before = handle ? WaitForSingleObjectEx(handle, 0, FALSE) : WAIT_FAILED;
+        const char *before_s = (before == WAIT_OBJECT_0) ? "signaled"
+                         : (before == WAIT_TIMEOUT) ? "nonsignaled"
+                         : (before == WAIT_FAILED) ? "invalid"
+                         : "unknown";
+
+        g_eax = (uint32_t)xbox_NtClearEvent(handle);
+
+        DWORD after = handle ? WaitForSingleObjectEx(handle, 0, FALSE) : WAIT_FAILED;
+        const char *after_s = (after == WAIT_OBJECT_0) ? "signaled"
+                        : (after == WAIT_TIMEOUT) ? "nonsignaled"
+                        : (after == WAIT_FAILED) ? "invalid"
+                        : "unknown";
+
+        fprintf(stderr,
+                "  [TRACE-CLEAR] NtClearEvent token=0x%08X pc=0x%08X tid=0x%08X "
+                "native=%p before=%s after=%s status=0x%08X\n",
+                guest_token, guest_pc, tid, handle,
+                before_s, after_s, g_eax);
+        fflush(stderr);
+    } else {
+        g_eax = (uint32_t)xbox_NtClearEvent(handle);
+    }
 }
 
 /* ── NtSetEvent (ordinal 225) ────────────────────────────── */
@@ -1400,9 +1472,25 @@ static void bridge_NtClearEvent(void)
  * context's go-event and only the first 14 KB of the map ever loaded. */
 static void bridge_NtSetEvent(void)
 {
-    HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t guest_token = STACK_ARG(0);
+    HANDLE   handle = bridge_resolve_handle(guest_token);
     uint32_t prev   = STACK_ARG(1);
+
+    if (guest_token == 0x48000003u || guest_token == 0x4800000Bu) {
+        fprintf(stderr,
+                "  [TRACE-SET] NtSetEvent token=0x%08X native=%p\n",
+                guest_token, handle);
+        fflush(stderr);
+    }
+
     g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
+
+    if (guest_token == 0x48000003u || guest_token == 0x4800000Bu) {
+        fprintf(stderr,
+                "  [TRACE-SET] NtSetEvent token=0x%08X returned 0x%08X\n",
+                guest_token, g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── NtPulseEvent (ordinal 205) ──────────────────────────── */
@@ -1425,7 +1513,6 @@ static void bridge_NtPulseEvent(void)
  * seconds, no blocking, no progress. A wait that always succeeds is worse than
  * one that always fails, because it looks like the game is running.
  */
-static HANDLE bridge_resolve_handle(uint32_t token);
 
 static void bridge_NtWaitForSingleObjectEx(void)
 {
@@ -1433,18 +1520,61 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t wait_mode   = STACK_ARG(1);
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
+    uint32_t guest_token = STACK_ARG(0);
 
-    static int logged = 0;
-    if (logged++ < 20) {
-        fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: token=0x%08X "
-                "handle=%p timeout=%s\n",
-                STACK_ARG(0), handle, timeout_ptr ? "finite" : "INFINITE");
+    if (guest_token == 0x48000003u || guest_token == 0x4800000Bu) {
+        const char *t = timeout_ptr ? "finite" : "INFINITE";
+        fprintf(stderr,
+                "  [TRACE-WAIT] NtWaitForSingleObjectEx token=0x%08X native=%p "
+                "mode=%u alertable=%u timeout=%s\n",
+                guest_token, handle, wait_mode, alertable, t);
         fflush(stderr);
     }
 
-    g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
-        handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
-        XBOX_TO_NATIVE(timeout_ptr));
+    {
+        static int s_wait_count = 0;
+        if (guest_token == 0x48000003u) {
+            if (++s_wait_count == 1) {
+                fprintf(stderr,
+                        "  [TRACE-WAIT] FORCING 5s timeout for event 0x48000003 "
+                        "(wait #%d, never signalled?)\n", s_wait_count);
+                fflush(stderr);
+                uint32_t fake_timeout = 50000000; /* ~5 seconds in 100ns units */
+                g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
+                    handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
+                    &fake_timeout);
+                if (g_eax == 0x00000102) { /* STATUS_TIMEOUT */
+                    fprintf(stderr,
+                            "  [TRACE-WAIT] timeout on event 0x48000003, "
+                            "signalling event to unblock init\n");
+                    fflush(stderr);
+                    SetEvent(handle);
+                    g_eax = 0; /* STATUS_SUCCESS */
+                }
+            } else if (s_wait_count <= 3) {
+                fprintf(stderr,
+                        "  [TRACE-WAIT] wait #%d on event 0x48000003, returning success\n",
+                        s_wait_count);
+                fflush(stderr);
+                g_eax = 0; /* STATUS_SUCCESS */
+            } else {
+                g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
+                    handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
+                    XBOX_TO_NATIVE(timeout_ptr));
+            }
+        } else {
+            g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
+                handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
+                XBOX_TO_NATIVE(timeout_ptr));
+        }
+    }
+
+    if (guest_token == 0x48000003u || guest_token == 0x4800000Bu) {
+        fprintf(stderr,
+                "  [TRACE-WAIT] NtWaitForSingleObjectEx token=0x%08X returned 0x%08X\n",
+                guest_token, g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -2858,6 +2988,21 @@ static void bridge_NtCreateFile(void)
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
 
+    if (handle_va) {
+        uint32_t guest_token = BRIDGE_MEM32(handle_va);
+        if (guest_token == 0x48000003u || guest_token == 0x4800000Bu) {
+            char _p[MAX_PATH * 2];
+            const wchar_t *_w = xbox_LastHostPath();
+            size_t _n = 0;
+            while (_w && _n < sizeof(_p) - 1 && _w[_n]) { _p[_n] = (char)_w[_n]; _n++; }
+            _p[_n] = 0;
+            fprintf(stderr,
+                    "  [TRACE-FILE] NtCreateFile token=0x%08X path=%s status=0x%08X\n",
+                    guest_token, _p, g_eax);
+            fflush(stderr);
+        }
+    }
+
     /* An FMV the host can decode itself.
      *
      * The title's own decoder is emulated like everything else, but it only
@@ -2887,7 +3032,8 @@ static void bridge_NtCreateFile(void)
             n++;
         }
         host[n] = 0;
-        if (n > 4 && _stricmp(host + n - 4, ".wmv") == 0
+        if ((n > 4 && (_stricmp(host + n - 4, ".wmv") == 0 ||
+                       _stricmp(host + n - 4, ".xmv") == 0))
                 && !xbox_VideoIsPlaying())
             xbox_VideoPlayFile(host);
     }
@@ -2935,6 +3081,21 @@ static void bridge_NtOpenFile(void)
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         0, share, 1 /* FILE_OPEN */, options);
+
+    if (handle_va) {
+        uint32_t guest_token = BRIDGE_MEM32(handle_va);
+        if (guest_token == 0x48000003u || guest_token == 0x4800000Bu) {
+            char _p[MAX_PATH * 2];
+            const wchar_t *_w = xbox_LastHostPath();
+            size_t _n = 0;
+            while (_w && _n < sizeof(_p) - 1 && _w[_n]) { _p[_n] = (char)_w[_n]; _n++; }
+            _p[_n] = 0;
+            fprintf(stderr,
+                    "  [TRACE-FILE] NtOpenFile token=0x%08X path=%s status=0x%08X\n",
+                    guest_token, _p, g_eax);
+            fflush(stderr);
+        }
+    }
 }
 
 /*
@@ -3143,7 +3304,9 @@ static void bridge_RtlUnwind(void)
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
-    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t guest_token = STACK_ARG(0);
+    HANDLE   handle    = bridge_resolve_handle(guest_token);
+    uint32_t event_token = STACK_ARG(1);
     uint32_t iostatus  = STACK_ARG(4);
     uint32_t buffer_va = STACK_ARG(5);
     uint32_t length    = STACK_ARG(6);
@@ -3158,8 +3321,23 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
+
+    if (guest_token == 0x48000003u || guest_token == 0x4800000Bu) {
+        fprintf(stderr,
+                "  [TRACE-READ] NtReadFile token=0x%08X event_token=0x%08X len=%u\n",
+                guest_token, event_token, length);
+        fflush(stderr);
+    }
+
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+
+    if (guest_token == 0x48000003u || guest_token == 0x4800000Bu) {
+        fprintf(stderr,
+                "  [TRACE-READ] NtReadFile token=0x%08X returned 0x%08X status=0x%08X info=%u\n",
+                guest_token, g_eax, (uint32_t)ios.Status, (uint32_t)ios.Information);
+        fflush(stderr);
+    }
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look

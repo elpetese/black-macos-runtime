@@ -63,7 +63,18 @@ void nv2a_update_irq(NV2AState *d)
 
 DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address)
 {
-    assert(dma_obj_address < memory_region_size(&d->ramin));
+    /* Defensive: a DMA object instance/handle installed via an (unhandled)
+     * NV2A METHOD can be garbage (e.g. 0x70bf800000) -> ramin_ptr+off is OOB
+     * and the ldl below raises SIGBUS. Return a zeroed object instead so the
+     * caller (nv_dma_map) gracefully no-ops (limit 0) rather than crashing.
+     * The real fix is dispatching the missing DMA-object METHOD (one of the
+     * 82 unhandled NV2A methods). */
+    if (dma_obj_address >= memory_region_size(&d->ramin)) {
+        fprintf(stderr, "[NV2A] nv_dma_load: object addr 0x%llx out of RAMIN (size 0x%llx) -> zeroed (unhandled METHOD?)\n",
+                (unsigned long long)dma_obj_address,
+                (unsigned long long)memory_region_size(&d->ramin));
+        return (DMAObject){0};
+    }
 
     uint32_t *dma_obj = (uint32_t *)(d->ramin_ptr + dma_obj_address);
     uint32_t flags = ldl_le_p(dma_obj);

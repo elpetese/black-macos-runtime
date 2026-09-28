@@ -33,6 +33,26 @@ void xbox_KeyboardReleaseAll(void);
 int  xbox_KeyboardAutostartPending(void);
 void xbox_KeyboardTitleSeen(void);
 
+/* Mouse input (CoD-style). */
+enum {
+    K_MOUSE_LEFT = 0,
+    K_MOUSE_RIGHT,
+    K_MOUSE_WHEEL_UP,
+    K_MOUSE_WHEEL_DOWN,
+    K_MOUSE_BUTTON_COUNT
+};
+enum {
+    K_UP, K_DOWN, K_LEFT, K_RIGHT, K_START, K_BACK, K_LTHUMB, K_RTHUMB,
+    K_A, K_B, K_X, K_Y, K_BLACK, K_WHITE, K_LT, K_RT,
+    K_LS_UP, K_LS_DOWN, K_LS_LEFT, K_LS_RIGHT,
+    K_RS_UP, K_RS_DOWN, K_RS_LEFT, K_RS_RIGHT,
+    K_COUNT
+};
+void xbox_MouseSetDelta(int dx, int dy);
+void xbox_MousePressButton(int button);
+void xbox_MouseReleaseButton(int button);
+void xbox_MouseReleaseAll(void);
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int xbox_IsXboxAddress(uintptr_t);
 extern void pb_exec_get_surface(uint32_t *out_offset, uint32_t *out_pitch);
@@ -582,7 +602,7 @@ static int update_pixels(void)
     {
         static uint32_t last_first;
         const uint32_t *first = (const uint32_t *)s_pixels;
-        if (first[0] != last_first) {
+        if (s_fb_debug && first[0] != last_first) {
             fprintf(stderr, "[FBWIN] first_pixel CHANGED 0x%08X -> 0x%08X\n",
                     last_first, first[0]);
             fflush(stderr);
@@ -732,32 +752,9 @@ static void init_keycode_slots(void)
 @interface XBFrameKeyView : NSView
 @end
 @implementation XBFrameKeyView
-- (BOOL)acceptsFirstResponder { return YES; }
-- (BOOL)becomeFirstResponder { return YES; }
-- (BOOL)resignFirstResponder
-{
-    xbox_KeyboardReleaseAll();
-    return YES;
-}
-/* Losing the focus any other way -- Cmd-Tab, a click on another window, a
- * screenshot shortcut -- also takes the keyUps with it. */
-- (void)viewDidMoveToWindow
-{
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc removeObserver:self];
-    if (!self.window)
-        return;
-    [nc addObserver:self selector:@selector(xek_focusLost:)
-               name:NSWindowDidResignKeyNotification object:self.window];
-    [nc addObserver:self selector:@selector(xek_focusLost:)
-               name:NSApplicationDidResignActiveNotification object:nil];
-}
-- (void)xek_focusLost:(NSNotification *)note
-{
-    (void)note;
-    xbox_KeyboardReleaseAll();
-    memset(s_keycode_slot, 0xFF, sizeof s_keycode_slot);
-}
+
+/* ── Keyboard input ─────────────────────────────────────────── */
+
 - (void)keyDown:(NSEvent *)event  { [self xek_handleKey:event down:YES]; }
 - (void)keyUp:(NSEvent *)event    { [self xek_handleKey:event down:NO]; }
 - (void)xek_handleKey:(NSEvent *)event down:(BOOL)down
@@ -769,6 +766,19 @@ static void init_keycode_slots(void)
     /* RECOMP_BACKGROUND: scripted runs take input from RECOMP_INPUT_SCRIPT only. */
     if (getenv("RECOMP_BACKGROUND"))
         return;
+
+    /* Ctrl + key: map Ctrl to crouch (B). */
+    if (down && ([event modifierFlags] & NSEventModifierFlagControl)) {
+        unichar u = [chars characterAtIndex:0];
+        if (u == 'c' || u == 'C') {
+            xbox_KeyboardPressSlot(K_B);
+            return;
+        }
+    }
+    if (!down && ([event modifierFlags] & NSEventModifierFlagControl)) {
+        xbox_KeyboardReleaseSlot(K_B);
+        return;
+    }
 
     /* A key comes up as the slot it went down as. Mapping the keyUp by its
      * character again lost it whenever a modifier changed in between -- L
@@ -801,6 +811,85 @@ static void init_keycode_slots(void)
     } else if (down) {
         [super keyDown:event];   /* let unbound keys fall through to defaults */
     }
+}
+
+/* ── Mouse input (CoD-style) ─────────────────────────────────── */
+
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)becomeFirstResponder { return YES; }
+- (BOOL)resignFirstResponder
+{
+    xbox_KeyboardReleaseAll();
+    xbox_MouseReleaseAll();
+    [NSCursor unhide];
+    return YES;
+}
+- (void)viewDidMoveToWindow
+{
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc removeObserver:self];
+    if (!self.window)
+        return;
+    [nc addObserver:self selector:@selector(xek_focusLost:)
+               name:NSWindowDidResignKeyNotification object:self.window];
+    [nc addObserver:self selector:@selector(xek_focusLost:)
+               name:NSApplicationDidResignActiveNotification object:nil];
+}
+- (void)xek_focusLost:(NSNotification *)note
+{
+    (void)note;
+    xbox_KeyboardReleaseAll();
+    xbox_MouseReleaseAll();
+    memset(s_keycode_slot, 0xFF, sizeof s_keycode_slot);
+    [NSCursor unhide];
+}
+- (void)mouseMoved:(NSEvent *)event
+{
+    if (getenv("RECOMP_BACKGROUND"))
+        return;
+    static NSPoint last;
+    NSPoint pt = [event locationInWindow];
+    if (last.x != 0 || last.y != 0) {
+        int dx = (int)(pt.x - last.x);
+        int dy = (int)(pt.y - last.y);
+        if (dx != 0 || dy != 0)
+            xbox_MouseSetDelta(dx, dy);
+    }
+    last = pt;
+}
+- (void)mouseDown:(NSEvent *)event   { xbox_MousePressButton(K_MOUSE_LEFT); }
+- (void)rightMouseDown:(NSEvent *)event { xbox_MousePressButton(K_MOUSE_RIGHT); }
+- (void)otherMouseDown:(NSEvent *)event
+{
+    if ([event buttonNumber] == 2)
+        xbox_MousePressButton(K_MOUSE_WHEEL_UP);
+    else if ([event buttonNumber] == 3)
+        xbox_MousePressButton(K_MOUSE_WHEEL_DOWN);
+}
+- (void)mouseUp:(NSEvent *)event     { xbox_MouseReleaseButton(K_MOUSE_LEFT); }
+- (void)rightMouseUp:(NSEvent *)event { xbox_MouseReleaseButton(K_MOUSE_RIGHT); }
+- (void)otherMouseUp:(NSEvent *)event
+{
+    if ([event buttonNumber] == 2)
+        xbox_MouseReleaseButton(K_MOUSE_WHEEL_UP);
+    else if ([event buttonNumber] == 3)
+        xbox_MouseReleaseButton(K_MOUSE_WHEEL_DOWN);
+}
+- (void)scrollWheel:(NSEvent *)event
+{
+    if (getenv("RECOMP_BACKGROUND"))
+        return;
+    CGFloat dy = [event scrollingDeltaY];
+    if (dy > 0)
+        xbox_MousePressButton(K_MOUSE_WHEEL_DOWN);
+    else if (dy < 0)
+        xbox_MousePressButton(K_MOUSE_WHEEL_UP);
+    /* brief press: release on next event loop iteration */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(50 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        xbox_MouseReleaseButton(K_MOUSE_WHEEL_DOWN);
+        xbox_MouseReleaseButton(K_MOUSE_WHEEL_UP);
+    });
 }
 @end
 
@@ -1044,6 +1133,7 @@ void xbox_FramebufferWindowStart(void)
         [s_window center];
         [s_window setLevel:NSFloatingWindowLevel];
         [s_window setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorTransient];
+        [s_window setAcceptsMouseMovedEvents:YES];
         s_layer = [CAMetalLayer layer];
         s_layer.device = s_device;
         s_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -1072,6 +1162,7 @@ void xbox_FramebufferWindowStart(void)
         } else {
             [s_window makeKeyAndOrderFront:nil];
             [NSApp activateIgnoringOtherApps:YES];
+            [NSCursor hide];
         }
         s_dump_at = now_ms() + 4000u;
         s_dumped = 0;

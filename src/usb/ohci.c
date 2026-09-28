@@ -477,9 +477,16 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                     fflush(stderr);
                 }
                 if ((reports++ % 500u) == 0 || changed) {
+                    /* len is what the driver's descriptor asked for. Anything
+                     * under 20 truncates the report, and the sticks (bytes
+                     * 12..19) are what falls off the end: buttons keep
+                     * working while aiming does not. */
                     fprintf(stderr, "  [OHCI%d] IN ep%u report #%u, buttons "
-                                    "%02X, A %02X\n", hc->index, endpoint,
-                            reports, rep[2], rep[4]);
+                                    "%02X, A %02X, td_len %d delivered %d%s\n",
+                            hc->index, endpoint, reports, rep[2], rep[4],
+                            len, n,
+                            guest_ptr(cbp, (uint32_t)(n > 0 ? n : 1))
+                                ? "" : " [BUFFER FUERA DE RANGO]");
                     fflush(stderr);
                 }
             }

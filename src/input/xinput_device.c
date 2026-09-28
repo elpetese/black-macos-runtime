@@ -120,11 +120,34 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ======================================================================== */
 
 #include <SDL.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
 #include "keyboard_input.h"
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+
+/* Reposo del host (PS4 ≠ 0). El DualShock reposa RIGHTY ≈ 5011 (eje 3, tu
+ * medida) y Black no aplica deadzone propia: restar el reposo → RY=0 en reposo
+ * → el normalize 1/sqrt(len) del gen no recibe vector degenerado → sin suelo
+ * ni crash al mover el stick. xemu no necesita esto (su guest aplica su
+ * deadzone sobre el reposo); aquí centramos en host para espejarlo.
+  * Semilla RY=5011 (dz=3200 la cubre desde frame 1) + calib. adaptativa
+ * (64 polls tras (re)open) -> offset REAL ~3715. Override:
+ * RECOMP_PAD_CENTER_LX/LY/RX/RY (semilla) o RECOMP_PAD_DEADZONE. */
+#define PAD_CENTER_DEFAULT_LX  0
+#define PAD_CENTER_DEFAULT_LY  0
+#define PAD_CENTER_DEFAULT_RX  0
+#define PAD_CENTER_DEFAULT_RY  5011
+static SHORT    g_center[XBOX_MAX_CONTROLLERS][4];     /* offset reposo/eje (semilla o calibrado) */
+static int       g_center_sum[XBOX_MAX_CONTROLLERS][4]; /* 32-bit: evita overflow SHORT*64 samples */
+static int      g_center_n[XBOX_MAX_CONTROLLERS];      /* samples tomados */
+static uint32_t g_center_t0[XBOX_MAX_CONTROLLERS];     /* inicio sampleo */
+static int      g_center_done[XBOX_MAX_CONTROLLERS];   /* 1 = offset bloqueado */
+#define CENTER_SAMPLE_MAX  64
+#define CENTER_SAMPLE_MS   2000
 
 /* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
 static void open_controllers(void)
@@ -149,6 +172,27 @@ static void open_controllers(void)
         if (!g_pads[slot]) {
             g_pads[slot] = SDL_GameControllerOpen(i);
             g_controller_connected[slot] = (g_pads[slot] != NULL);
+            if (g_pads[slot]) {
+                /* Semilla reposo + arranca calibración (samplea tras conectar). */
+                g_center[slot][0] = PAD_CENTER_DEFAULT_LX;
+                g_center[slot][1] = PAD_CENTER_DEFAULT_LY;
+                g_center[slot][2] = PAD_CENTER_DEFAULT_RX;
+                g_center[slot][3] = PAD_CENTER_DEFAULT_RY;
+                memset(g_center_sum[slot], 0, sizeof(g_center_sum[slot]));
+                g_center_n[slot]    = 0;
+                g_center_done[slot] = 0;
+                g_center_t0[slot]   = SDL_GetTicks();
+                fprintf(stderr, "  [INPUT] pad %d center: seeding + sampling\n", slot);
+            }
+            /* Which mapping SDL picked decides every value below; print it
+             * once, because a pad that reads wrong in here but right outside
+             * is a mapping difference, not a wiring one. */
+            if (g_pads[slot] && getenv("RECOMP_INPUT_DEBUG")) {
+                char *map = SDL_GameControllerMapping(g_pads[slot]);
+                fprintf(stderr, "  [INPUT] mapping: %s\n", map ? map : "(none)");
+                if (map) SDL_free(map);
+                fflush(stderr);
+            }
         }
         slot++;
     }
@@ -226,6 +270,33 @@ void xbox_InputInit(void)
     xbox_KeyboardInit();
 }
 
+/* Radial deadzone, in counts of the 32767 range (default ~10%). */
+static void pad_deadzone(SHORT *x, SHORT *y)
+{
+    static int dz = -1;
+    if (dz < 0) {
+        const char *e = getenv("RECOMP_PAD_DEADZONE");
+        /* xemu deja que el guest aplique su propia deadzone sobre el reposo del
+         * host; aquí el DualShock reposa ≠ 0 (p.ej RIGHTY ≈ 5011) y Black no
+         * tiene deadzone propia, así que centramos (abajo) y aplicamos dz radial
+         * para cortar el drift residual. 3200 (no 0) corta ~10%: suficiente para
+         * el reposo recen-trado sin tostar deflexión útil. */
+        dz = e ? atoi(e) : 3200;
+        if (dz < 0) dz = 0;
+    }
+    double fx = *x, fy = *y;
+    double mag = sqrt(fx * fx + fy * fy);
+    if (mag <= dz) {
+        *x = 0; *y = 0;
+        return;
+    }
+    /* Rescale what is left so the stick still reaches full travel. */
+    double scale = (mag - dz) / (32767.0 - dz) * 32767.0 / mag;
+    double nx = fx * scale, ny = fy * scale;
+    *x = (SHORT)(nx > 32767 ? 32767 : nx < -32768 ? -32768 : nx);
+    *y = (SHORT)(ny > 32767 ? 32767 : ny < -32768 ? -32768 : ny);
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
@@ -297,19 +368,86 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     /* SDL's Y axes grow downward, the Xbox's upward; -1 - v keeps the full
      * range without overflowing at -32768. */
-    pState->Gamepad.sThumbLX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
-    pState->Gamepad.sThumbLY =
-        (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY));
-    pState->Gamepad.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
-    pState->Gamepad.sThumbRY =
-        (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+    SHORT raw_lx = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
+    SHORT raw_ly = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY);
+    SHORT raw_rx = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
+    SHORT raw_ry = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY);
+
+    /* Calibracion de reposo tras (re)open: samplea CENTER_SAMPLE_MAX polls (o
+     * el timeout) -> promedio = offset REAL (tu 5011 varia; adapta al reposo
+     * actual ~3715). No depende de idle ni de RECOMP_PAD_DEADZONE: con offset
+     * exacto RY~0 aun con dz=0. Semilla 5011 + dz radial (3200) lo cubren hasta
+     * que la calib lo refine. */
+    if (!g_center_done[dwPort]) {
+        uint32_t ms = SDL_GetTicks();
+        if (g_center_n[dwPort] < CENTER_SAMPLE_MAX
+                && (int)(ms - g_center_t0[dwPort]) < CENTER_SAMPLE_MS) {
+            g_center_sum[dwPort][0] += raw_lx;
+            g_center_sum[dwPort][1] += raw_ly;
+            g_center_sum[dwPort][2] += raw_rx;
+            g_center_sum[dwPort][3] += raw_ry;
+            g_center_n[dwPort]++;
+        }
+        if (g_center_n[dwPort] >= CENTER_SAMPLE_MAX
+                || ((int)(ms - g_center_t0[dwPort]) >= CENTER_SAMPLE_MS && g_center_n[dwPort] > 0)) {
+            if (g_center_n[dwPort] > 0) {
+                g_center[dwPort][0] = (SHORT)(g_center_sum[dwPort][0] / g_center_n[dwPort]);
+                g_center[dwPort][1] = (SHORT)(g_center_sum[dwPort][1] / g_center_n[dwPort]);
+                g_center[dwPort][2] = (SHORT)(g_center_sum[dwPort][2] / g_center_n[dwPort]);
+                g_center[dwPort][3] = (SHORT)(g_center_sum[dwPort][3] / g_center_n[dwPort]);
+                if (getenv("RECOMP_INPUT_DEBUG"))
+                    fprintf(stderr, "  [INPUT] center[%u] L(%d,%d) R(%d,%d)\n",
+                            (unsigned)dwPort, g_center[dwPort][0], g_center[dwPort][1],
+                            g_center[dwPort][2], g_center[dwPort][3]);
+            }
+            g_center_done[dwPort] = 1;
+        }
+    }
+
+    /* Recenter en espacio raw (antes del -1-v) + deadzone radial por stick. */
+    SHORT lx = (SHORT)(raw_lx - g_center[dwPort][0]);
+    SHORT ly = (SHORT)(-1 - (raw_ly - g_center[dwPort][1]));
+    SHORT rx = (SHORT)(raw_rx - g_center[dwPort][2]);
+    SHORT ry = (SHORT)(-1 - (raw_ry - g_center[dwPort][3]));
+    /* A used pad rests a few hundred counts off centre and Black applies no
+     * deadzone of its own, so the view drifts or spins with nobody touching
+     * the stick. Cut a radial deadzone per stick, not per axis, so a diagonal
+     * hold is not clipped. RECOMP_PAD_DEADZONE overrides the default. */
+    pad_deadzone(&lx, &ly);
+    pad_deadzone(&rx, &ry);
+    pState->Gamepad.sThumbLX = lx;
+    pState->Gamepad.sThumbLY = ly;
+    {
+        const int cap = 6000; /* ~18% del rango Xbox; evita clavar +/-90 */
+        if (rx >  cap) rx =  cap;
+        if (rx < -cap) rx = -cap;
+        if (ry >  cap) ry =  cap;
+        if (ry < -cap) ry = -cap;
+        pState->Gamepad.sThumbRX = (short)rx;
+        pState->Gamepad.sThumbRY = (short)ry;
+    }
 
     if (btn || any_analog) g_f7_input_nonzero_buttons++;
 
     if (getenv("RECOMP_INPUT_DEBUG")) {
-        static uint32_t shown;
-        if (shown++ < 50) {
+        /* Printing the first 50 polls only ever showed the pad at rest during
+         * boot. What matters is whether a press reaches the game, so print
+         * whenever the state changes. */
+        static WORD  last_btn;
+        static BYTE  last_an[8];
+        static SHORT last_ax[4];
+        SHORT ax[4] = { pState->Gamepad.sThumbLX, pState->Gamepad.sThumbLY,
+                        pState->Gamepad.sThumbRX, pState->Gamepad.sThumbRY };
+        int changed = (btn != last_btn);
+        for (int i = 0; i < 8; i++)
+            changed |= (pState->Gamepad.bAnalogButtons[i] != last_an[i]);
+        for (int i = 0; i < 4; i++)
+            changed |= (abs(ax[i] - last_ax[i]) > 2000);
+        if (changed) {
             const XBOX_GAMEPAD *g = &pState->Gamepad;
+            last_btn = btn;
+            memcpy(last_an, g->bAnalogButtons, 8);
+            memcpy(last_ax, ax, sizeof ax);
             fprintf(stderr, "  [INPUT] pad btn=0x%04X A=%u B=%u X=%u Y=%u Blk=%u Wht=%u LT=%u RT=%u "
                     "LX=%d LY=%d RX=%d RY=%d\n",
                     btn, g->bAnalogButtons[XBOX_BUTTON_A], g->bAnalogButtons[XBOX_BUTTON_B],
@@ -317,14 +455,28 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
                     g->bAnalogButtons[XBOX_BUTTON_BLACK], g->bAnalogButtons[XBOX_BUTTON_WHITE],
                     g->bAnalogButtons[XBOX_BUTTON_LTRIGGER], g->bAnalogButtons[XBOX_BUTTON_RTRIGGER],
                     g->sThumbLX, g->sThumbLY, g->sThumbRX, g->sThumbRY);
+            /* The same poll, unmapped: if these disagree with the axes above,
+             * the mapping is the problem; if they agree, the pad is. */
+            SDL_Joystick *j = SDL_GameControllerGetJoystick(c);
+            fprintf(stderr, "  [INPUT]   raw axes:");
+            for (int a = 0; a < SDL_JoystickNumAxes(j); a++)
+                fprintf(stderr, " %d:%d", a, SDL_JoystickGetAxis(j, a));
+            fprintf(stderr, "  raw buttons:");
+            for (int b = 0; b < SDL_JoystickNumButtons(j); b++)
+                if (SDL_JoystickGetButton(j, b))
+                    fprintf(stderr, " %d", b);
+            fprintf(stderr, "\n");
             fflush(stderr);
         }
     }
 
-    /* A pad and the keyboard together: either one presses the button. */
-    if (dwPort == 0)
-        xbox_KeyboardMergeState(&pState->Gamepad);
-
+    /* Teclado: fuente alternativa SOLO cuando el pad no está conectado
+     * (véase la rama !c arriba). No se suma al pad: paridad xemu. Las
+     * trazas [PAD] son para comparar byte-a-byte con el tracer de xemu. */
+    if (getenv("RECOMP_PAD_TRACE"))
+        fprintf(stderr, "[PAD] %u L(%6d,%6d) R(%6d,%6d)\n", g_packet[dwPort],
+                pState->Gamepad.sThumbLX, pState->Gamepad.sThumbLY,
+                pState->Gamepad.sThumbRX, pState->Gamepad.sThumbRY);
     return ERROR_SUCCESS;
 }
 

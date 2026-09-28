@@ -2047,6 +2047,43 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
+     * NV2A PCI-MMIO (NV_PMC register block).
+     *
+     * Distinct from the 0xFD000000 aperture above: on real hardware the NV2A
+     * registers are ALSO reachable at 0xBF800000 (the PCI MMIO base the kernel
+     * HAL pokes while bringing the GPU up during level load -- sub_00053630
+     * writes NV_PMC @ 0xBF800000). That VA was never reserved/committed, so a
+     * write fell through the reserved guest space to an unbacked host page
+     * (0x70_bf80_0000) and raised SIGBUS. Back it as zeroed RAM using the same
+     * philosophy applied to the 0xFD000000 aperture: reads of zero are benign
+     * for the status/capability registers the kernel probes here, and writes we
+     * do not model are survivable. (Deeper fix: bridge these offsets through
+     * nv2a_mmio; until something spins on a register that stays zero, plain RAM
+     * is enough to get into the level.)
+     */
+    {
+        uintptr_t nv2a_pci_native = 0xBF800000u + g_memory_offset;
+        void *nv2a_pci = VirtualAlloc(
+            (LPVOID)nv2a_pci_native,
+            0x30800000u,             /* ~776 MB: 0xBF800000..0xF0000000 (entire PCI-MMIO
+                                     * gap below the tiled aperture at 0xF0000000). The
+                                     * kernel HAL sweeps it during GPU init at level load
+                                     * (0xBF800000 NV_PMC, then 0xC2522232, ...). One shot
+                                     * ending at the tiled base: no overlap. */
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        if (nv2a_pci) {
+            fprintf(stderr, "  NV2A PCI-MMIO 0x%08X: %u MB zeroed (kernel GPU-init sweep,\n"
+                    "       incl 0xBF800000 NV_PMC + 0xC2522232; was SIGBUS)\n",
+                    0xBF800000u, 0x30800000u / (1024 * 1024));
+        } else {
+            fprintf(stderr, "  WARNING: NV2A PCI-MMIO at 0x%08X failed (err %lu)\n",
+                    0xBF800000u, GetLastError());
+        }
+    }
+
+    /*
      * MCPX device apertures.
      *
      * The NV2A block above is not the only hardware the title touches

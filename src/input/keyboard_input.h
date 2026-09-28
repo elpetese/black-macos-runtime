@@ -46,6 +46,15 @@ enum {
     K_COUNT
 };
 
+/* Mouse button indices for mouse-as-controller support. */
+enum {
+    K_MOUSE_LEFT = 0,
+    K_MOUSE_RIGHT,
+    K_MOUSE_WHEEL_UP,
+    K_MOUSE_WHEEL_DOWN,
+    K_MOUSE_BUTTON_COUNT
+};
+
 /* Start the terminal reader and load the script. Safe to call more than once. */
 void xbox_KeyboardInit(void);
 
@@ -75,6 +84,12 @@ int xbox_KeyboardSlotForKeyCode(unsigned short keycode);
 void xbox_KeyboardPressSlot(int slot);
 void xbox_KeyboardReleaseSlot(int slot);
 void xbox_KeyboardReleaseAll(void);
+
+/* Mouse as controller input (CoD-style). Called from the window event handler. */
+void xbox_MouseSetDelta(int dx, int dy);
+void xbox_MousePressButton(int button);
+void xbox_MouseReleaseButton(int button);
+void xbox_MouseReleaseAll(void);
 
 /* RECOMP_AUTOSTART support: nonzero while waiting for the title screen, and
  * the call the presenter makes when it sees it (presses Start once and starts

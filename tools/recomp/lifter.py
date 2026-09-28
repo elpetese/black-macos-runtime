@@ -2592,7 +2592,11 @@ class Lifter:
                 return [_sse_write(ops[0], f"{_sse_read(ops[0])} * {_sse_read(ops[1])}") + f" /* {m} */"]
         if m in ("divss", "divsd"):
             if nops >= 2:
-                return [_sse_write(ops[0], f"{_sse_read(ops[0])} / {_sse_read(ops[1])}") + f" /* {m} */"]
+                _expr = f"{_sse_read(ops[0])} / {_sse_read(ops[1])}"
+                _out = [_sse_write(ops[0], _expr) + f" /* {m} */"]
+                if __import__("os").environ.get("F7_FIX_NORMALIZE"):
+                    _out.insert(0, "if (MEMF(esp + 8) < 1e-9f) MEMF(esp + 8) = 1e-9f; /* F7 normalize guard */")
+                return _out
         if m in ("sqrtss", "sqrtsd"):
             if nops >= 2:
                 return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})") + f" /* {m} */"]

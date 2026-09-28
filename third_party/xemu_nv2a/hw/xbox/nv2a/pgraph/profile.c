@@ -59,8 +59,14 @@ static void xboxrecomp_profile_report(void)
     if (!every || (++seen % every))
         return;
 
-    fprintf(stderr, "[PROF] frame %lld  %lld ms", (long long)seen,
-            (long long)g_nv2a_stats.frame_working.mspf);
+    /* mspf comes from last_flip_time, which this host does not maintain, so
+     * time the reported window here instead: ms per frame over the interval. */
+    static int64_t last_report_us;
+    int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    double mspf = last_report_us ? (now_us - last_report_us) / (1000.0 * every) : 0.0;
+    last_report_us = now_us;
+
+    fprintf(stderr, "[PROF] frame %lld  %.1f ms/frame", (long long)seen, mspf);
     for (unsigned int i = 0; i < NV2A_PROF__COUNT; i++) {
         int v = g_nv2a_stats.frame_working.counters[i];
         if (v)

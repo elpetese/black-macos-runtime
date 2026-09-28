@@ -397,6 +397,10 @@ void xbox_kernel_init(void)
     ULONG unresolved = 0;
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
+    clock_t t0 = clock();
+
+    fprintf(stderr, "[KERNEL_INIT] start\n");
+    fflush(stderr);
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
@@ -413,6 +417,9 @@ void xbox_kernel_init(void)
         if (g_log_level > XBOX_LOG_TRACE) g_log_level = XBOX_LOG_TRACE;
     }
 
+    fprintf(stderr, "[KERNEL_INIT] logging initialized\n");
+    fflush(stderr);
+
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "=== Xbox Kernel Replacement Layer initializing ===");
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
@@ -420,13 +427,12 @@ void xbox_kernel_init(void)
         xbox_KrnlVersion.Major, xbox_KrnlVersion.Minor,
         xbox_KrnlVersion.Build, xbox_KrnlVersion.Qfe);
 
-    /* Fill thunk table.
-     *
-     * The slot->ordinal mapping normally comes from the in-memory thunk table
-     * of the loaded XBE (0x80000000|ordinal per entry, same source the kernel
-     * bridge reads). That makes the table match any title's import order.
-     * Without a mapped XBE, fall back to the static reference list below. */
+    /* Fill thunk table. */
     xbox_kernel_get_thunk_address(&thunk_base, &thunk_count);
+
+    fprintf(stderr, "[KERNEL_INIT] thunk_base=0x%08X thunk_count=%u\n",
+            (unsigned)thunk_base, (unsigned)thunk_count);
+    fflush(stderr);
 
     /* A title imports only the slots its own thunk table names -- Black names
      * 115 of the kernel's 378 export slots. Walking the whole export space and
@@ -466,9 +472,14 @@ void xbox_kernel_init(void)
         if (ptr) {
             xbox_kernel_thunk_table[i] = ptr;
             resolved++;
+            if (i < 5 || i >= slots - 5 || (ordinal >= 255 && ordinal <= 259))
+                fprintf(stderr, "[KERNEL_INIT] slot %u -> ordinal %u\n",
+                        (unsigned)i, (unsigned)ordinal);
         } else {
             /* Already points at the error handler; just count it. */
             unresolved++;
+            fprintf(stderr, "[KERNEL_INIT] UNRESOLVED slot %u ordinal %u\n",
+                    (unsigned)i, (unsigned)ordinal);
         }
     }
 
@@ -477,6 +488,10 @@ void xbox_kernel_init(void)
         resolved, slots, unresolved,
         have_table ? "from the title's thunk table" : "from the reference list");
 
+    fprintf(stderr, "[KERNEL_INIT] resolved=%u unresolved=%u slots=%u have_table=%d\n",
+            (unsigned)resolved, (unsigned)unresolved, (unsigned)slots, have_table);
+    fflush(stderr);
+
     if (unresolved > 0) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
             "WARNING: %u kernel imports are unresolved - game may crash!", unresolved);
@@ -484,6 +499,13 @@ void xbox_kernel_init(void)
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "=== Xbox Kernel Replacement Layer ready ===");
+
+    {
+        clock_t t1 = clock();
+        double secs = (double)(t1 - t0) / CLOCKS_PER_SEC;
+        fprintf(stderr, "[KERNEL_INIT] done in %.3f s\n", secs);
+        fflush(stderr);
+    }
 }
 
 /* ============================================================================

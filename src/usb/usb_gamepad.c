@@ -26,7 +26,7 @@ static const uint8_t s_device_desc[18] = {
     0x00,           /* bDeviceProtocol                            */
     0x08,           /* bMaxPacketSize0: 8                         */
     0x5E, 0x04,     /* idVendor  0x045E Microsoft                 */
-    0x89, 0x02,     /* idProduct 0x0289 Controller S              */
+    0x02, 0x02,     /* idProduct 0x0202 Controller (Duke) */
     0x21, 0x01,     /* bcdDevice                                  */
     0x00,           /* iManufacturer: none                        */
     0x00,           /* iProduct: none                             */
@@ -53,7 +53,7 @@ static const uint8_t s_xid_desc[16] = {
     0x42,           /* bDescriptorType: XID                       */
     0x00, 0x01,     /* bcdXid 1.00                                */
     0x01,           /* bType: gamepad                             */
-    0x02,           /* bSubType: gamepad S                        */
+    0x01,           /* bSubType: Duke (match xemu desc_xid_xbox_gamepad) */
     20,             /* bMaxInputReportSize                        */
     6,              /* bMaxOutputReportSize                       */
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF  /* no alternates  */

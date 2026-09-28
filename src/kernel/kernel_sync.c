@@ -224,6 +224,8 @@ NTSTATUS __stdcall xbox_NtCreateEvent(
     ULONG EventType,
     BOOLEAN InitialState)
 {
+    static volatile LONG s_event_id = 1;
+    LONG id = InterlockedIncrement(&s_event_id);
     HANDLE hEvent;
     BOOL bManualReset;
 
@@ -232,7 +234,6 @@ NTSTATUS __stdcall xbox_NtCreateEvent(
     if (!EventHandle)
         return STATUS_INVALID_PARAMETER;
 
-    /* XboxNotificationEvent = manual-reset, XboxSynchronizationEvent = auto-reset */
     bManualReset = (EventType == XboxNotificationEvent) ? TRUE : FALSE;
 
     hEvent = CreateEventW(NULL, bManualReset, InitialState, NULL);
@@ -245,16 +246,20 @@ NTSTATUS __stdcall xbox_NtCreateEvent(
     *EventHandle = hEvent;
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_SYNC,
-        "NtCreateEvent: handle=%p, type=%s, initial=%d",
-        hEvent, bManualReset ? "notification" : "synchronization", InitialState);
+        "EVENT-CREATE id=%lu handle=%p type=%s init=%d",
+        (unsigned long)id, hEvent, bManualReset ? "notification" : "synchronization", InitialState);
 
     return STATUS_SUCCESS;
 }
 
 NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
 {
+    static volatile LONG s_set_count = 0;
+    LONG id = InterlockedIncrement(&s_set_count);
+    (void)id;
+
     if (PreviousState)
-        *PreviousState = 0; /* We don't track previous state */
+        *PreviousState = 0;
 
     if (!SetEvent(EventHandle)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
@@ -263,17 +268,17 @@ NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
         return STATUS_INVALID_HANDLE;
     }
 
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_SYNC,
+        "EVENT-SET id=%lu handle=%p", (unsigned long)id, EventHandle);
     return STATUS_SUCCESS;
 }
 
-/*
- * KeSetEvent - kernel-mode event signal.
- * On Xbox, this is the kernel-mode equivalent of NtSetEvent.
- * The Object parameter is treated as a Win32 event HANDLE.
- * Returns the previous signal state.
- */
 LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
 {
+    static volatile LONG s_ke_set_count = 0;
+    LONG id = InterlockedIncrement(&s_ke_set_count);
+    (void)id;
+
     HANDLE hEvent = xbox_dispatcher_handle(Event);
     LONG previous = 0;
 
@@ -286,13 +291,13 @@ LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
         return 0;
     }
 
-    /* For an object the title owns we can report the real previous state:
-     * it is the field the title itself initialised. */
     if (Event && is_guest_pointer(Event))
         previous = DISP_SIGNAL_STATE(Event);
 
     SetEvent(hEvent);
     xbox_dispatcher_publish(Event, 1);
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_SYNC,
+        "KE-SET id=%lu handle=%p previous=%ld", (unsigned long)id, hEvent, previous);
     return previous;
 }
 
@@ -433,8 +438,12 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     HANDLE hObject = xbox_dispatcher_handle(Object);
     if (!hObject) {
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
-            "KeWaitForSingleObject: no object for %p", Object);
+        static int s_null_count;
+        if (s_null_count++ < 10) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
+                "KeWaitForSingleObject: no object for %p (call %d)",
+                Object, s_null_count);
+        }
         return STATUS_INVALID_HANDLE;
     }
 
@@ -801,11 +810,16 @@ BOOLEAN __stdcall xbox_KeSynchronizeExecution(
 
 NTSTATUS __stdcall xbox_NtClearEvent(HANDLE EventHandle)
 {
-    if (!ResetEvent(EventHandle)) {
+    DWORD before = WaitForSingleObjectEx(EventHandle, 0, FALSE);
+    BOOL ok = ResetEvent(EventHandle);
+    DWORD after = WaitForSingleObjectEx(EventHandle, 0, FALSE);
+
+    if (!ok) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
             "NtClearEvent: ResetEvent failed (error %u)", GetLastError());
         return STATUS_INVALID_HANDLE;
     }
+
     return STATUS_SUCCESS;
 }
 

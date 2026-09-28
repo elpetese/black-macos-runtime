@@ -52,6 +52,11 @@ static uint64_t s_until[K_COUNT];      /* monotonic ms the slot is down until */
 static int      s_active;
 static uint64_t s_epoch;
 
+/* Mouse state for CoD-style look/aim. */
+static int s_mouse_dx, s_mouse_dy;
+static int s_mouse_buttons;
+static int s_mouse_sens;
+
 #define MAX_SCRIPT 64
 static struct { uint64_t at, until; int slot; } s_script[MAX_SCRIPT];
 static int s_script_len;
@@ -122,22 +127,20 @@ static int key_slot(unsigned char c)
     case '\t': case 0x7F: case 0x08: return K_BACK;
     case ' ':                  return K_A;
     case 'x': case 'X':        return K_B;
-    case 'q': case 'Q':        return K_X;
+    case 'r': case 'R':        return K_X;
     case 'e': case 'E':        return K_Y;
+    case 'q': case 'Q':        return K_BLACK;
     case 'v': case 'V':        return K_LT;
     case 'c': case 'C':        return K_RT;
     case '1':                  return K_WHITE;
     case '2':                  return K_BLACK;
-    case 'w': case 'W':        return K_LS_UP;   /* left stick up    */
-    case 'a': case 'A':        return K_LS_LEFT; /* left stick left  */
-    case 's': case 'S':        return K_LS_DOWN; /* left stick down  */
-    case 'd': case 'D':        return K_LS_RIGHT;/* left stick right */
-    case 'i': case 'I':        return K_RS_UP;
-    case 'k': case 'K':        return K_RS_DOWN;
-    case 'j': case 'J':        return K_RS_LEFT;
-    case 'l': case 'L':        return K_RS_RIGHT;
-    case 'f': case 'F':        return K_LTHUMB;
-    case 'h': case 'H':        return K_RTHUMB;
+    case 'w': case 'W':        return K_LS_UP;
+    case 'a': case 'A':        return K_LS_LEFT;
+    case 's': case 'S':        return K_LS_DOWN;
+    case 'd': case 'D':        return K_LS_RIGHT;
+    case 'f': case 'F':        return K_RTHUMB;
+    case 'h': case 'H':        return K_LTHUMB;
+    case '\x1B':               return K_BACK;
     default:                   return -1;
     }
 }
@@ -186,9 +189,10 @@ static void start_tty(void)
     }
     pthread_detach(th);
     s_active = 1;
-    fprintf(stderr, "  Keyboard: port 0 (arrows d-pad, WASD left stick, IJKL right "
-                    "stick, Space A, x B, q X, e Y, v/c LT/RT, 1/2 White/Black, "
-                    "f/h L3/R3, Enter Start, Tab Back)\n");
+    fprintf(stderr, "  Keyboard: arrows d-pad, WASD move, mouse look, "
+                    "Space jump, Ctrl crouch, R reload, E use, Q grenade, "
+                    "F melee, H sprint, Enter Start, Esc Back, "
+                    "V/C aim/fire, 1/2 weapons\n");
 }
 
 static int slot_named(const char *name, size_t len)
@@ -256,6 +260,12 @@ void xbox_KeyboardInit(void)
     done = 1;
     s_epoch = now_ms();
     s_autostart = getenv("RECOMP_AUTOSTART") != NULL;
+    {
+        const char *e = getenv("RECOMP_MOUSE_SENSITIVITY");
+        s_mouse_sens = e ? atoi(e) : 4;
+        if (s_mouse_sens < 1) s_mouse_sens = 1;
+        if (s_mouse_sens > 20) s_mouse_sens = 20;
+    }
     load_script();
     if (s_autostart) {
         s_active = 1;
@@ -355,21 +365,32 @@ int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
             pad->bAnalogButtons[analog[i]] = 255;
 
     g_f7_input_poll_count++;
-    /* Buttons only: a host pad's resting stick drift is never exactly 0, and
-     * counting it made every poll look like a press. */
-    if (pad->wButtons || pad->bAnalogButtons[0] || pad->bAnalogButtons[1] ||
-        pad->bAnalogButtons[2] || pad->bAnalogButtons[3]) {
-        g_f7_input_nonzero_buttons++;
-    }
+
+    /* Mouse buttons: left = fire (RT), right = aim (LT). */
+    if (s_mouse_buttons & (1 << K_MOUSE_LEFT))
+        pad->bAnalogButtons[XBOX_BUTTON_RTRIGGER] = 255;
+    if (s_mouse_buttons & (1 << K_MOUSE_RIGHT))
+        pad->bAnalogButtons[XBOX_BUTTON_LTRIGGER] = 255;
 
     if (down[K_LS_UP])    pad->sThumbLY = 32767;
     if (down[K_LS_DOWN])  pad->sThumbLY = -32768;
     if (down[K_LS_LEFT])  pad->sThumbLX = -32768;
     if (down[K_LS_RIGHT]) pad->sThumbLX = 32767;
-    if (down[K_RS_UP])    pad->sThumbRY = 32767;
-    if (down[K_RS_DOWN])  pad->sThumbRY = -32768;
-    if (down[K_RS_LEFT])  pad->sThumbRX = -32768;
-    if (down[K_RS_RIGHT]) pad->sThumbRX = 32767;
+
+    /* Mouse look: right stick from accumulated mouse delta. */
+    if (s_mouse_dx != 0 || s_mouse_dy != 0) {
+        int sens = s_mouse_sens > 0 ? s_mouse_sens : 4;
+        int rx = s_mouse_dx * sens;
+        int ry = -s_mouse_dy * sens;
+        if (rx > 32767) rx = 32767;
+        if (rx < -32768) rx = -32768;
+        if (ry > 32767) ry = 32767;
+        if (ry < -32768) ry = -32768;
+        pad->sThumbRX = (short)rx;
+        pad->sThumbRY = (short)ry;
+        s_mouse_dx = s_mouse_dy = 0;
+    }
+
     return 1;
 }
 
@@ -428,6 +449,43 @@ void xbox_KeyboardReleaseSlot(int slot)
     s_active = 1;
     pthread_mutex_lock(&s_lock);
     s_until[slot] = now_ms();   /* expire any held press immediately */
+    pthread_mutex_unlock(&s_lock);
+}
+
+/* ── Mouse input (CoD-style) ─────────────────────────────────── */
+
+void xbox_MouseSetDelta(int dx, int dy)
+{
+    pthread_mutex_lock(&s_lock);
+    s_mouse_dx += dx;
+    s_mouse_dy += dy;
+    pthread_mutex_unlock(&s_lock);
+}
+
+void xbox_MousePressButton(int button)
+{
+    if (button < 0 || button >= K_MOUSE_BUTTON_COUNT)
+        return;
+    s_active = 1;
+    pthread_mutex_lock(&s_lock);
+    s_mouse_buttons |= (1 << button);
+    pthread_mutex_unlock(&s_lock);
+}
+
+void xbox_MouseReleaseButton(int button)
+{
+    if (button < 0 || button >= K_MOUSE_BUTTON_COUNT)
+        return;
+    pthread_mutex_lock(&s_lock);
+    s_mouse_buttons &= ~(1 << button);
+    pthread_mutex_unlock(&s_lock);
+}
+
+void xbox_MouseReleaseAll(void)
+{
+    pthread_mutex_lock(&s_lock);
+    s_mouse_buttons = 0;
+    s_mouse_dx = s_mouse_dy = 0;
     pthread_mutex_unlock(&s_lock);
 }
 
