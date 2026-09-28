@@ -2439,8 +2439,9 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None):
+                 icall_sites_json_path=None, weak_feedback_seeds=False):
         self.xbe_path = xbe_path
+        self.weak_feedback_seeds = weak_feedback_seeds
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
         self.icall_sites = {}
@@ -2551,6 +2552,17 @@ class BatchTranslator:
         self.translator.lifter.LONGJMP_FN = longjmp_fn
         if not coalesce_json_paths:
             self.translator.discover_static_indirect_targets()
+        if self.weak_feedback_seeds:
+            # Runtime icall feedback records whatever address a tail jump
+            # reached, and a switch arm reached through the fallback of a
+            # split function looks exactly like a call target. Seeded back,
+            # those arms are tagged seed_vtable_thunk; counted as strong they
+            # keep the owner split and its jump table degrades to an indirect
+            # tail jump into an address with no entry (Black's memcpy,
+            # 0x000A24E0, table at 0x000A262C). Weak, they stay entries unless
+            # the owner's recovered CFG reaches them, as before v0.12.
+            self.translator.STRONG_ENTRY_METHODS = (
+                self.translator.STRONG_ENTRY_METHODS - {"seed_vtable_thunk"})
         self.translator.discover_cfg_ownership()
         self.translator.discover_jump_table_entries()
 

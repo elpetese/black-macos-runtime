@@ -253,6 +253,10 @@ def main():
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
+    parser.add_argument("--weak-feedback-seeds", action="store_true",
+                        help="Treat seed_vtable_thunk entries (runtime icall "
+                             "feedback) as weak: a split owner's recovered "
+                             "CFG may absorb them, as before v0.12")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -318,6 +322,7 @@ def main():
         trace_functions=_load_addrs(args.trace_functions),
         force_returns=_parse_force_returns(args.force_return),
         coalesce_json_paths=args.coalesce_functions,
+        weak_feedback_seeds=args.weak_feedback_seeds,
         protected_function_starts=protected_function_starts,
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,

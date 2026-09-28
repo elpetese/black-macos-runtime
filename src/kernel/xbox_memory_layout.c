@@ -1231,6 +1231,9 @@ RECOMP_TLS int g_fp_top = 0;
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
+/* x87 condition codes C0-C3 (FXAM, FCOM): the lifter since upstream v0.12
+ * keeps them here. 0x4000 is C3 set, the power-on value. */
+RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
 /* Defined below, with the other guest registers. */
 extern RECOMP_TLS uint32_t g_ebp;
