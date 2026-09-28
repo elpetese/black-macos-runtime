@@ -46,8 +46,10 @@ class FlagClobberTest(unittest.TestCase):
             "C3"))            # 11: ret
         je = [l for l in code.splitlines() if "/* je" in l]
         self.assertEqual(len(je), 1, code)
-        self.assertIn("_fr == 0", je[0].replace("(", "").replace(")", ""), code)
-        snap = code.index("_fr = (uint32_t)(eax)")
+        # The branch reads the result saved at the sub, not eax after the load.
+        self.assertIn("_fa == 0", je[0].replace("(", "").replace(")", ""), code)
+        self.assertNotIn("eax == 0", je[0].replace("(", "").replace(")", ""), code)
+        snap = code.index("_fa = (uint32_t)(eax)")
         self.assertLess(snap, code.index("MEM32(0x56F02C)"), code)
 
     def test_unrelated_mov_leaves_condition_alone(self):
@@ -59,7 +61,7 @@ class FlagClobberTest(unittest.TestCase):
             "C3"))            # 12: ret
         je = [l for l in code.splitlines() if "/* je" in l]
         self.assertEqual(len(je), 1, code)
-        self.assertIn("(eax == 0)", je[0], code)
+        self.assertIn("_fa == 0", je[0].replace("(", "").replace(")", ""), code)
         self.assertNotIn("_fr = (uint32_t)", code)
 
     def test_byte_setter_keeps_its_width(self):
@@ -71,7 +73,10 @@ class FlagClobberTest(unittest.TestCase):
             "C3"))            # 11: ret
         js = [l for l in code.splitlines() if "/* js" in l]
         self.assertEqual(len(js), 1, code)
-        self.assertIn("(int8_t)_fr8", js[0], code)
+        # Sign of the 8-bit result, saved at the dec before ecx is reloaded.
+        self.assertIn("_fas < 0", js[0], code)
+        snap = code.index("_fas = (int32_t)(int8_t)(_fa)")
+        self.assertLess(snap, code.index("MEM32(0x56F02C)"), code)
 
 
 if __name__ == "__main__":

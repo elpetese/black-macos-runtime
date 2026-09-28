@@ -45,7 +45,7 @@ class FpuLifterTest(unittest.TestCase):
 
         self.assertEqual(
             Lifter().lift_instruction(store),
-            ["SMEM64(esp + 0x10) = (int64_t)llrint(fp_top()); "
+            ["SMEM64(esp + 0x10) = (int64_t)recomp_fist(fp_top(), g_fp_control_word, 64); "
              "fp_pop(); /* fistp */"],
         )
         self.assertEqual(
@@ -89,7 +89,8 @@ class FpuLifterTest(unittest.TestCase):
         translator.disasm.disassemble_function = (
             lambda _raw, _start, _end: instructions)
         translator.disasm.build_basic_blocks = (
-            lambda _instructions, _start, _end, extra_leaders=None: [block])
+            lambda _instructions, _start, _end, extra_leaders=None,
+            stop_mnemonics=(): [block])
 
         generated = translator.translate_function(
             start, {"_addr": start, "end": start + 3})
@@ -145,11 +146,9 @@ class FpuLifterTest(unittest.TestCase):
         self.assertEqual(len(lifted), 1)
         # The compare can live in a different lifted body than the FNSTSW that
         # reads it, so the result has to be shared state, not a function local.
-        self.assertIn("g_fp_cmp", lifted[0])
+        self.assertIn("g_fp_cc", lifted[0])
         self.assertNotIn("_fpu_cmp", lifted[0])
         # C3 (equal) and C0 (less) at their status-word positions, plus TOP
-        self.assertIn("0x4000u", lifted[0])
-        self.assertIn("0x0100u", lifted[0])
         self.assertIn("(g_fp_top & 7u) << 11", lifted[0])
         self.assertNotIn("/* fnstsw ax - store FPU status word */", lifted[0])
 

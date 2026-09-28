@@ -64,6 +64,17 @@ class _Engine:
     def probes_as_vcall_thunk(self, addr):
         return False
 
+    # Upstream's immediate-reference pass asks these before splitting a
+    # decoded instruction; nothing in these fixtures is inside one.
+    def instruction_covering(self, addr):
+        return None
+
+    def probes_as_prologue(self, addr):
+        return False
+
+    def probes_as_constant_stub(self, addr):
+        return False
+
     def decode_at(self, addr):
         self.decoded.append(addr)
         self.instructions[addr] = _Insn(addr)
