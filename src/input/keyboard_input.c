@@ -140,6 +140,12 @@ static int key_slot(unsigned char c)
     case 'd': case 'D':        return K_LS_RIGHT;
     case 'f': case 'F':        return K_RTHUMB;
     case 'h': case 'H':        return K_LTHUMB;
+    /* Right stick from the keyboard (look up/left/down/right), for playing
+     * without a mouse. The mouse still overrides it while it is moving. */
+    case 'i': case 'I':        return K_RS_UP;
+    case 'j': case 'J':        return K_RS_LEFT;
+    case 'k': case 'K':        return K_RS_DOWN;
+    case 'l': case 'L':        return K_RS_RIGHT;
     case '\x1B':               return K_BACK;
     default:                   return -1;
     }
@@ -376,6 +382,13 @@ int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
     if (down[K_LS_DOWN])  pad->sThumbLY = -32768;
     if (down[K_LS_LEFT])  pad->sThumbLX = -32768;
     if (down[K_LS_RIGHT]) pad->sThumbLX = 32767;
+
+    /* The right-stick slots were named ("rsup"...) and mapped from keys but
+     * never applied, so only the mouse could look around. */
+    if (down[K_RS_UP])    pad->sThumbRY = 32767;
+    if (down[K_RS_DOWN])  pad->sThumbRY = -32768;
+    if (down[K_RS_LEFT])  pad->sThumbRX = -32768;
+    if (down[K_RS_RIGHT]) pad->sThumbRX = 32767;
 
     /* Mouse look: right stick from accumulated mouse delta. */
     if (s_mouse_dx != 0 || s_mouse_dy != 0) {

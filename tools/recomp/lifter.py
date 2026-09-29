@@ -608,23 +608,35 @@ def _make_condition(jcc, flag_setter, flag_ops):
         )
         desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
         a, b = "_fca", "_fcb"
-        # comiss uses unsigned condition codes (CF, ZF)
+        # comiss/ucomiss set ZF, PF, CF as
+        #     greater 000   less 001   equal 100   unordered (a NaN) 111
+        # and the branch reads them as unsigned condition codes. In C every
+        # ordered comparison with a NaN is false, so the plain spelling of
+        # jb/jbe/je (a < b, a <= b, a == b) falls through where the hardware
+        # jumps, and a != b is TRUE for a NaN where jne falls through. Only
+        # ja/jae agree with C. Spell each one from the flag it reads:
+        #     jb  CF        = !(a >= b)          jbe CF|ZF = !(a > b)
+        #     je  ZF        = !(a < b || a > b)  jne !ZF   =  (a < b || a > b)
+        #     jp  PF        = unordered          jnp        = ordered
+        # (a NaN arrives in these games as the guard the code takes when a
+        # normalisation or sqrt went wrong; taking the wrong side of it lets
+        # the NaN through.)
         if jcc in ("ja", "jnbe"):
             return f"({a} > {b})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({a} >= {b})", desc
         if jcc in ("jb", "jnae", "jc"):
-            return f"({a} < {b})", desc
+            return f"(!({a} >= {b}))", desc
         if jcc in ("jbe", "jna"):
-            return f"({a} <= {b})", desc
+            return f"(!({a} > {b}))", desc
         if jcc in ("je", "jz"):
-            return f"({a} == {b})", desc
+            return f"(!({a} < {b} || {a} > {b}))", desc
         if jcc in ("jne", "jnz"):
-            return f"({a} != {b})", desc
+            return f"({a} < {b} || {a} > {b})", desc
         if jcc == "jp":
-            return f"0 /* {jcc}: unordered/NaN */", desc
+            return f"({a} != {a} || {b} != {b}) /* {jcc}: unordered */", desc
         if jcc == "jnp":
-            return f"1 /* {jcc}: ordered */", desc
+            return f"({a} == {a} && {b} == {b}) /* {jcc}: ordered */", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
@@ -3331,26 +3343,20 @@ class Lifter:
                 return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}") + " /* rcpss */"]
 
         # ── Packed sqrt / reciprocal / rsqrt ──
-        # The SSE model here tracks only the low lane as a single float, so
-        # these compute the low lane like their scalar ...ss forms rather than
-        # all four. That is the same low-lane approximation the packed
-        # arithmetic ops (addps/mulps) already use -- but computing the low lane
-        # is strictly better than the TODO no-op these used to hit, which left
-        # the destination stale and fed garbage into vector normalisation.
-        # rsqrtps/sqrtps are the workhorse of 3D vector normalize; some titles
-        # use them heavily, which is why this surfaced on those binaries.
-        if m == "sqrtps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})")
-                        + " /* sqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rsqrtps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / sqrtf({_sse_read(ops[1])})")
-                        + " /* rsqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rcpps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}")
-                        + " /* rcpps (low lane; 4-lane model TODO) */"]
+        # All four lanes. These used to compute lane 0 only ("4-lane model
+        # TODO"), from when the register model was a single float; it is a
+        # RecompXmm now and mulps/addps/shufps were already four-wide. The
+        # result was a vector normalise that scaled lane 0 by 1/|v| and the
+        # other three by the untouched |v|^2 the shuffles had left there:
+        # Black's sub_0009C8D0 (normalise a vec4 behind a length guard) fed
+        # skewed direction vectors to everything that aims.
+        _PACKED_UNARY = {"sqrtps": "XMM_SQRT", "rsqrtps": "XMM_RSQRT",
+                         "rcpps": "XMM_RCP"}
+        if m in _PACKED_UNARY and nops >= 2:
+            src = _packed_read(ops[1])
+            wr = _packed_write(ops[0], f"{_PACKED_UNARY[m]}({src})") if src else None
+            if wr is not None:
+                return [wr + f" /* {m} */"]
 
         # ── Scalar comparison ──
         # Lane 0 becomes an all-ones or all-zero mask, the other lanes keep

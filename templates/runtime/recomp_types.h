@@ -537,6 +537,19 @@ RECOMP_XMM_LANEWISE(XMM_ADD, a.f[i] + b.f[i])
 RECOMP_XMM_LANEWISE(XMM_SUB, a.f[i] - b.f[i])
 RECOMP_XMM_LANEWISE(XMM_MUL, a.f[i] * b.f[i])
 RECOMP_XMM_LANEWISE(XMM_DIV, a.f[i] / b.f[i])
+
+/* Unary packed ops, all four lanes. SQRTPS is exact; RSQRTPS and RCPPS are
+ * ~12-bit approximations on the hardware, and the exact value is within what
+ * their callers (vector normalise, reciprocal-multiply) already tolerate. */
+#define RECOMP_XMM_UNARY(name, expr)                                      \
+    static inline RecompXmm name(RecompXmm a) {                           \
+        RecompXmm r; int i;                                               \
+        for (i = 0; i < 4; ++i) r.f[i] = (expr);                          \
+        return r;                                                         \
+    }
+RECOMP_XMM_UNARY(XMM_SQRT,  sqrtf(a.f[i]))
+RECOMP_XMM_UNARY(XMM_RSQRT, 1.0f / sqrtf(a.f[i]))
+RECOMP_XMM_UNARY(XMM_RCP,   1.0f / a.f[i])
 /* MINPS/MAXPS return the second operand when the lanes are unordered or
  * equal -- that is the hardware's tie-break, not a C fmin/fmax. */
 RECOMP_XMM_LANEWISE(XMM_MIN, (a.f[i] < b.f[i]) ? a.f[i] : b.f[i])
