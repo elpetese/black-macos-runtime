@@ -749,12 +749,69 @@ static void init_keycode_slots(void)
     memset(s_keycode_slot, 0xFF, sizeof s_keycode_slot);
 }
 
+/* Mouse look wants raw motion: with the pointer still tied to the cursor it
+ * stops at the window edge and shows over the picture. Disassociating it
+ * gives unbounded deltas, and hiding the cursor keeps it out of the frame.
+ * Released whenever the window loses focus so the desktop stays usable, and
+ * taken again by a click in the window. */
+static BOOL s_mouse_captured;
+
+/* Hand the pointer back. Callable from a signal handler or atexit (it only
+ * makes the one call), so a crash, Ctrl+C or a normal exit cannot leave the
+ * cursor frozen. */
+void xbox_FramebufferReleaseMouse(void)
+{
+    if (s_mouse_captured) {
+        s_mouse_captured = NO;
+        CGAssociateMouseAndMouseCursorPosition(true);
+    }
+}
+
+extern void xbox_KeyboardRestoreTerminal(void);
+
+static void xek_release_on_signal(int sig)
+{
+    xbox_FramebufferReleaseMouse();
+    xbox_KeyboardRestoreTerminal();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void xek_capture_mouse(BOOL on)
+{
+    static BOOL registered;
+    if (on == s_mouse_captured)
+        return;
+    if (on && !registered) {
+        registered = YES;
+        atexit(xbox_FramebufferReleaseMouse);
+        signal(SIGINT, xek_release_on_signal);
+        signal(SIGTERM, xek_release_on_signal);
+        signal(SIGHUP, xek_release_on_signal);
+    }
+    s_mouse_captured = on;
+    CGAssociateMouseAndMouseCursorPosition(on ? false : true);
+    if (on) [NSCursor hide]; else [NSCursor unhide];
+}
+
 @interface XBFrameKeyView : NSView
 @end
 @implementation XBFrameKeyView
 
 /* ── Keyboard input ─────────────────────────────────────────── */
 
+/* Shift is a modifier: it produces flagsChanged, not keyDown. Left or right
+ * Shift is the left-stick click (run), held for as long as it is down. */
+- (void)flagsChanged:(NSEvent *)event
+{
+    unsigned short code = [event keyCode];
+    if (getenv("RECOMP_BACKGROUND") || (code != 56 && code != 60))
+        return;
+    if ([event modifierFlags] & NSEventModifierFlagShift)
+        xbox_KeyboardPressSlot(K_LTHUMB);
+    else
+        xbox_KeyboardReleaseSlot(K_LTHUMB);
+}
 - (void)keyDown:(NSEvent *)event  { [self xek_handleKey:event down:YES]; }
 - (void)keyUp:(NSEvent *)event    { [self xek_handleKey:event down:NO]; }
 - (void)xek_handleKey:(NSEvent *)event down:(BOOL)down
@@ -766,6 +823,17 @@ static void init_keycode_slots(void)
     /* RECOMP_BACKGROUND: scripted runs take input from RECOMP_INPUT_SCRIPT only. */
     if (getenv("RECOMP_BACKGROUND"))
         return;
+
+    /* Esc: hand the mouse back and pause (Start), as in Critical Hour. */
+    if (code == 53) {
+        if (down) {
+            xek_capture_mouse(NO);
+            xbox_KeyboardPressSlot(K_START);
+        } else {
+            xbox_KeyboardReleaseSlot(K_START);
+        }
+        return;
+    }
 
     /* Ctrl + key: map Ctrl to crouch (B). */
     if (down && ([event modifierFlags] & NSEventModifierFlagControl)) {
@@ -821,7 +889,7 @@ static void init_keycode_slots(void)
 {
     xbox_KeyboardReleaseAll();
     xbox_MouseReleaseAll();
-    [NSCursor unhide];
+    xek_capture_mouse(NO);
     return YES;
 }
 - (void)viewDidMoveToWindow
@@ -841,23 +909,43 @@ static void init_keycode_slots(void)
     xbox_KeyboardReleaseAll();
     xbox_MouseReleaseAll();
     memset(s_keycode_slot, 0xFF, sizeof s_keycode_slot);
-    [NSCursor unhide];
+    xek_capture_mouse(NO);
+}
+/* Raw motion (deltaX grows to the right, deltaY grows DOWN on screen, which
+ * is the convention xbox_KeyboardMergeState's `ry = -dy * sens` expects).
+ * Dragged events are the same motion with a button held -- firing while
+ * turning -- and arrive as a different event type. */
+- (void)xek_motion:(NSEvent *)event
+{
+    int dx = (int)[event deltaX];
+    int dy = (int)[event deltaY];
+    if (dx != 0 || dy != 0) {
+        static int traced, want = -1;
+        if (want < 0)
+            want = getenv("RECOMP_MOUSE_TRACE") ? 1 : 0;
+        if (want && traced++ < 20)
+            fprintf(stderr, "  [MOUSE] dx=%d dy=%d\n", dx, dy);
+        xbox_MouseSetDelta(dx, dy);
+    }
 }
 - (void)mouseMoved:(NSEvent *)event
 {
-    if (getenv("RECOMP_BACKGROUND"))
+    if (getenv("RECOMP_BACKGROUND") || !s_mouse_captured)
         return;
-    static NSPoint last;
-    NSPoint pt = [event locationInWindow];
-    if (last.x != 0 || last.y != 0) {
-        int dx = (int)(pt.x - last.x);
-        int dy = (int)(pt.y - last.y);
-        if (dx != 0 || dy != 0)
-            xbox_MouseSetDelta(dx, dy);
-    }
-    last = pt;
+    [self xek_motion:event];
 }
-- (void)mouseDown:(NSEvent *)event   { xbox_MousePressButton(K_MOUSE_LEFT); }
+- (void)mouseDragged:(NSEvent *)event      { [self mouseMoved:event]; }
+- (void)rightMouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
+- (void)otherMouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
+- (void)mouseDown:(NSEvent *)event
+{
+    /* The first click takes the mouse (Esc gives it back); it does not fire. */
+    if (!getenv("RECOMP_BACKGROUND") && !s_mouse_captured) {
+        xek_capture_mouse(YES);
+        return;
+    }
+    xbox_MousePressButton(K_MOUSE_LEFT);
+}
 - (void)rightMouseDown:(NSEvent *)event { xbox_MousePressButton(K_MOUSE_RIGHT); }
 - (void)otherMouseDown:(NSEvent *)event
 {
@@ -1152,6 +1240,39 @@ void xbox_FramebufferWindowStart(void)
             kv.layer = s_layer;
             [s_window setContentView:kv];
             [s_window makeFirstResponder:kv];
+            /* RECOMP_MOUSE_SELFTEST="secs,dx,dy,frames": after `secs`, feed
+             * `frames` mouse-moved events of (dx,dy) through the view, one per
+             * 16 ms, exactly as the window server would (a CGEvent carrying
+             * the deltas, converted to an NSEvent) -- for testing mouse look
+             * without touching the real pointer. */
+            {
+                /* RECOMP_MOUSE_SELFTEST="secs,dx,dy,frames[;secs,dx,dy,frames...]" */
+                const char *env = getenv("RECOMP_MOUSE_SELFTEST");
+                char *dup = env ? strdup(env) : NULL, *save = NULL;
+                for (char *seg = dup ? strtok_r(dup, ";", &save) : NULL; seg;
+                     seg = strtok_r(NULL, ";", &save)) {
+                    double at = 0; int tdx = 0, tdy = 0, tn = 60;
+                    if (sscanf(seg, "%lf,%d,%d,%d", &at, &tdx, &tdy, &tn) < 3)
+                        continue;
+                    for (int i = 0; i < tn; i++) {
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                (int64_t)((at + i * 0.016) * NSEC_PER_SEC)),
+                                dispatch_get_main_queue(), ^{
+                            CGEventRef ce = CGEventCreateMouseEvent(NULL,
+                                kCGEventMouseMoved, CGPointMake(0, 0),
+                                kCGMouseButtonLeft);
+                            CGEventSetIntegerValueField(ce, kCGMouseEventDeltaX, tdx);
+                            CGEventSetIntegerValueField(ce, kCGMouseEventDeltaY, tdy);
+                            NSEvent *ne = [NSEvent eventWithCGEvent:ce];
+                            CFRelease(ce);
+                            [kv xek_motion:ne];
+                        });
+                    }
+                    fprintf(stderr, "  [MOUSE] selftest: %d events of (%d,%d) from +%.0fs\n",
+                            tn, tdx, tdy, at);
+                }
+                free(dup);
+            }
             [kv release];
         }
         /* RECOMP_BACKGROUND: show the window without taking focus, so an
@@ -1162,7 +1283,7 @@ void xbox_FramebufferWindowStart(void)
         } else {
             [s_window makeKeyAndOrderFront:nil];
             [NSApp activateIgnoringOtherApps:YES];
-            [NSCursor hide];
+            [s_window setAcceptsMouseMovedEvents:YES];
         }
         s_dump_at = now_ms() + 4000u;
         s_dumped = 0;

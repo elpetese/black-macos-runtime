@@ -96,9 +96,13 @@ void xbox_KeyboardRestoreTerminal(void)
     }
 }
 
+extern void xbox_FramebufferReleaseMouse(void) __attribute__((weak));
+
 static void on_terminate(int sig)
 {
     xbox_KeyboardRestoreTerminal();
+    if (xbox_FramebufferReleaseMouse)
+        xbox_FramebufferReleaseMouse();   /* never leave the cursor frozen */
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -125,23 +129,32 @@ static int key_slot(unsigned char c)
     switch (c) {
     case '\r': case '\n':      return K_START;
     case '\t': case 0x7F: case 0x08: return K_BACK;
+    /* The layout the Critical Hour port used, so both games play the same:
+     *   Space / E  A          C  B          R  X (reload)     Q  Y (weapon)
+     *   F  Black   G  White   Z  right-stick click
+     *   1 2 3 4    d-pad up / right / down / left
+     * plus V = left trigger and X = B kept as extras (no clash), WASD left
+     * stick, I/J/K/L right stick, H left-stick click, Shift = left-stick click
+     * (run; handled by the window), arrows d-pad, Enter Start, Tab Back. */
     case ' ':                  return K_A;
+    case 'e': case 'E':        return K_A;
+    case 'c': case 'C':        return K_B;
     case 'x': case 'X':        return K_B;
     case 'r': case 'R':        return K_X;
-    case 'e': case 'E':        return K_Y;
-    case 'q': case 'Q':        return K_BLACK;
+    case 'q': case 'Q':        return K_Y;
+    case 'f': case 'F':        return K_BLACK;
+    case 'g': case 'G':        return K_WHITE;
     case 'v': case 'V':        return K_LT;
-    case 'c': case 'C':        return K_RT;
-    case '1':                  return K_WHITE;
-    case '2':                  return K_BLACK;
+    case 'z': case 'Z':        return K_RTHUMB;
+    case '1':                  return K_UP;
+    case '2':                  return K_RIGHT;
+    case '3':                  return K_DOWN;
+    case '4':                  return K_LEFT;
     case 'w': case 'W':        return K_LS_UP;
     case 'a': case 'A':        return K_LS_LEFT;
     case 's': case 'S':        return K_LS_DOWN;
     case 'd': case 'D':        return K_LS_RIGHT;
-    case 'f': case 'F':        return K_RTHUMB;
     case 'h': case 'H':        return K_LTHUMB;
-    /* Right stick from the keyboard (look up/left/down/right), for playing
-     * without a mouse. The mouse still overrides it while it is moving. */
     case 'i': case 'I':        return K_RS_UP;
     case 'j': case 'J':        return K_RS_LEFT;
     case 'k': case 'K':        return K_RS_DOWN;
@@ -195,10 +208,10 @@ static void start_tty(void)
     }
     pthread_detach(th);
     s_active = 1;
-    fprintf(stderr, "  Keyboard: arrows d-pad, WASD move, mouse look, "
-                    "Space jump, Ctrl crouch, R reload, E use, Q grenade, "
-                    "F melee, H sprint, Enter Start, Esc Back, "
-                    "V/C aim/fire, 1/2 weapons\n");
+    fprintf(stderr, "  Keyboard: WASD move, mouse or IJKL look, click = fire, "
+                    "right click = aim, wheel = weapon, Space/E A, C B, "
+                    "R reload, Q weapon, F Black, G White, Shift run, "
+                    "1-4 d-pad, Enter Start, Esc = release mouse + Start\n");
 }
 
 static int slot_named(const char *name, size_t len)
@@ -267,10 +280,17 @@ void xbox_KeyboardInit(void)
     s_epoch = now_ms();
     s_autostart = getenv("RECOMP_AUTOSTART") != NULL;
     {
-        const char *e = getenv("RECOMP_MOUSE_SENSITIVITY");
-        s_mouse_sens = e ? atoi(e) : 4;
-        if (s_mouse_sens < 1) s_mouse_sens = 1;
-        if (s_mouse_sens > 20) s_mouse_sens = 20;
+        /* Stick counts (of 32767) per pixel of mouse motion. The old default,
+         * 4, made a 10-pixel flick 0.1% of the stick -- no visible turn.
+         * RECOMP_MOUSE_SENS gives the value directly; the older
+         * RECOMP_MOUSE_SENSITIVITY (1..20) still works, scaled so that its
+         * old default 4 is the new default. 1800 is what Critical Hour used. */
+        const char *direct = getenv("RECOMP_MOUSE_SENS");
+        const char *legacy = getenv("RECOMP_MOUSE_SENSITIVITY");
+        s_mouse_sens = direct ? atoi(direct)
+                     : legacy ? atoi(legacy) * 450 : 1800;
+        if (s_mouse_sens < 50) s_mouse_sens = 50;
+        if (s_mouse_sens > 12000) s_mouse_sens = 12000;
     }
     load_script();
     if (s_autostart) {
@@ -377,6 +397,9 @@ int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
         pad->bAnalogButtons[XBOX_BUTTON_RTRIGGER] = 255;
     if (s_mouse_buttons & (1 << K_MOUSE_RIGHT))
         pad->bAnalogButtons[XBOX_BUTTON_LTRIGGER] = 255;
+    /* Wheel = Y (change weapon), a brief press per notch, as in Critical Hour. */
+    if (s_mouse_buttons & ((1 << K_MOUSE_WHEEL_UP) | (1 << K_MOUSE_WHEEL_DOWN)))
+        pad->bAnalogButtons[XBOX_BUTTON_Y] = 255;
 
     if (down[K_LS_UP])    pad->sThumbLY = 32767;
     if (down[K_LS_DOWN])  pad->sThumbLY = -32768;
@@ -392,7 +415,7 @@ int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
 
     /* Mouse look: right stick from accumulated mouse delta. */
     if (s_mouse_dx != 0 || s_mouse_dy != 0) {
-        int sens = s_mouse_sens > 0 ? s_mouse_sens : 4;
+        int sens = s_mouse_sens > 0 ? s_mouse_sens : 1800;
         int rx = s_mouse_dx * sens;
         int ry = -s_mouse_dy * sens;
         if (rx > 32767) rx = 32767;
@@ -469,6 +492,7 @@ void xbox_KeyboardReleaseSlot(int slot)
 
 void xbox_MouseSetDelta(int dx, int dy)
 {
+    s_active = 1;   /* motion alone is input: the pad must report as present */
     pthread_mutex_lock(&s_lock);
     s_mouse_dx += dx;
     s_mouse_dy += dy;
