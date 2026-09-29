@@ -28,6 +28,9 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
+_SSE_COMPARES = ("comiss", "comisd", "ucomiss", "ucomisd")
+
+
 def _merge_flag_states(states):
     """Merge comparable snapshots without requiring identical source operands.
 
@@ -49,7 +52,49 @@ def _merge_flag_states(states):
             if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
                 return None
         return first
+    # comiss/ucomiss (and the double forms) each leave the two compared
+    # values in the function-local _fca/_fcb at runtime, and the branch reads
+    # only those. Two paths that compare different operands therefore join
+    # into a state either can satisfy, as cmp/test above do. Without this a
+    # jbe/ja reached from both fell back to the never-assigned _flags and
+    # never branched: Black's sub_001F5030 (the front-end's frame update) lost
+    # its scroll/limit test and the main menu ignored Start.
+    if first[0] in _SSE_COMPARES:
+        for kind, ops in states[1:]:
+            if kind != first[0]:
+                return None
+        return first
     return _merge_zero_flag(states)
+
+
+def _merge_snapshot_zero_flag(states):
+    """cmp and test reaching one je/jne: ZF is all that can be asked.
+
+    Both leave their operands in _fa/_fb, but ZF is _fa == _fb for a cmp and
+    (_fa & _fb) == 0 for a test, so the two cannot share the ordinary
+    condition. Black's flag-byte checks (`test byte [eax+0x30], 8` on one
+    path, `cmp al, 0` on another, then a shared `test al, al; jne`) join that
+    way; left unknown they lifted to the never-assigned _flags and the branch
+    never fired. The marker carries the widths, which must agree, and
+    _make_condition answers only je/jne from it.
+    """
+    from .lifter import _operand_width
+    if not states or any(not st or len(st) != 2 or not isinstance(st[0], str)
+                         for st in states):
+        return None
+    widths = set()
+    for kind, ops in states:
+        if kind not in ("cmp", "test") or len(ops) != 2:
+            return None
+        widths.add(_operand_width(ops[0]) or _operand_width(ops[1]))
+    if len(widths) != 1 or None in widths:
+        return None
+    if len({kind for kind, _ in states}) < 2:
+        return None
+    # ops stay a plain operand list (the first path's), which the clobber
+    # snapshot and the rest of the lifter read; the marker itself is what
+    # _make_condition answers je/jne from, via _fz.
+    return ("__zf_from_snapshot", list(states[0][1]))
 
 
 def _merge_zero_flag(states):
@@ -93,7 +138,15 @@ def _incoming_flag_state(sources, known, is_entry):
         return None
     if not all(p in known for p in sources):
         return None
-    return _merge_flag_states([known[p] for p in sources])
+    merged = _merge_flag_states([known[p] for p in sources])
+    if merged is None:
+        # _merge_flag_states keeps a cmp and a test apart on purpose: a jl or
+        # jb after the join would read an operation one edge never performed.
+        # A je/jne needs only ZF, which both leave in _fz, so hand the join
+        # on under a marker _make_condition answers for those two and
+        # refuses for everything else.
+        merged = _merge_snapshot_zero_flag([known[p] for p in sources])
+    return merged
 
 
 def write_if_changed(path, text):
@@ -2154,6 +2207,16 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
+        # _fz (ZF, already evaluated) is only produced where a cmp and a test
+        # could join at a je/jne: a function with both kinds of compare and a
+        # zero-flag branch. Everywhere else the ordinary condition is exact.
+        kinds = {insn.mnemonic for insn in instructions}
+        has_fz = ("cmp" in kinds and "test" in kinds
+                  and any(insn.mnemonic in ("je", "jz", "jne", "jnz")
+                          for insn in instructions))
+        if has_fz:
+            lines.append("    int _fz = 0; (void)_fz;")
+        self.lifter.needs_fz = has_fz
         self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
 
         # SSE and MMX are architectural state, declared globally by the

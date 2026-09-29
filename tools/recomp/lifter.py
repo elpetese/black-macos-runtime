@@ -516,6 +516,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # Only ZF is answerable from it. dec does not write CF, so a jb after the
     # same join would be reading a flag one predecessor never set; returning
     # None there leaves the existing fallback in place.
+    if flag_setter == "__zf_from_snapshot":
+        # cmp and test joined; each left ZF, already evaluated, in _fz.
+        if jcc in ("je", "jz"):
+            return "_fz", desc
+        if jcc in ("jne", "jnz"):
+            return "!_fz", desc
+        return None
+
     if flag_setter == "__zf_from_dest" and flag_ops:
         dest = _fmt_operand_read(flag_ops[0])
         if jcc in ("je", "jz"):
@@ -1282,6 +1290,7 @@ class Lifter:
         # register can hold. Set by the translator; see _lift_jmp.
         self.local_jump_targets = {}
         self.force_return_value = None   # Set per-function by --force-return
+        self.needs_fz = False            # Set per-function: a cmp/test joins another at a je/jne
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
@@ -2225,6 +2234,11 @@ class Lifter:
             f"_fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);"
             f" /* {kind} {lhs}, {rhs} ({size*8}-bit) */",
         ]
+        if self.needs_fz:
+            # ZF already evaluated: a cmp and a test that join at one je/jne
+            # cannot share _fa == _fb / (_fa & _fb) == 0, but can share this.
+            out.append("_fz = " + ("((_fa & _fb) == 0);" if kind == "test"
+                                  else "(_fa == _fb);"))
         # A cmp sets the carry flag too, and sbb/adc/setc/rcl read it directly
         # rather than through _fa/_fb. Leaving CF alone here let those pick up
         # whatever an earlier instruction had left in it.
@@ -3906,7 +3920,7 @@ def _snap_plan(insn, state):
             or state[0] in _FLAG_SETTERS_SNAPSHOTTED:
         return None
     setter, ops = state
-    if setter == FLAG_MERGE or not ops:
+    if setter == FLAG_MERGE or setter == "__zf_from_snapshot" or not ops:
         return None
     # Upstream snapshots these at the setter itself (_fa/_fas/_fb), so the
     # condition never reads the destination and there is nothing to save.
