@@ -18,7 +18,10 @@
 #include "xbox_dirty_tracking.h"
 #include "kernel.h"
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -809,6 +812,92 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
+/* RECOMP_XMV_PACKETS=<n>: play only the header and the first n packets of
+ * every .xmv movie (a packet is roughly half a second to two seconds of it;
+ * by size would not do -- the 2-minute credits are a 872 KB file).
+ *
+ * Black's intro logos, credits and mission cinematics are XMV files (the
+ * credits ~2 minutes, a mission cinematic ~1m45s), played at the pace of the
+ * audio clock and not skippable here. To reach a level quickly during
+ * testing, the movie is made to END early -- properly.
+ *
+ * An XMV is a chain of packets (128 KB-ish, after a header packet that says
+ * "xobX"). Every packet starts with a dword: the size of the packet that
+ * FOLLOWS it, 0 for the last one. Cutting the bytes off the end leaves the
+ * player asking for a packet the header promised and waiting for it for ever
+ * (the game freezes). So instead the packets up to the cap are served as they
+ * are, the "next packet size" of the last one served reads back as 0 -- a
+ * movie that simply ends there -- and the reported file size is that end.
+ * Only files named *.xmv are affected, and only when the variable is set.
+ * The chain model was checked on all 17 movies in Black's videos folder: the
+ * packet sizes add up to the file size exactly, each ending in a 0. */
+typedef struct { int64_t end; int64_t last; } xmv_cut_t;
+
+static int xmv_is_movie(int fd)
+{
+#if defined(__APPLE__)
+    char path[1024];
+    size_t n;
+    if (fcntl(fd, F_GETPATH, path) != 0)
+        return 0;
+    n = strlen(path);
+    return n > 4 && strcasecmp(path + n - 4, ".xmv") == 0;
+#else
+    char link[64], path[1024];
+    ssize_t n;
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    n = readlink(link, path, sizeof path - 1);
+    if (n <= 4)
+        return 0;
+    path[n] = 0;
+    return strcasecmp(path + n - 4, ".xmv") == 0;
+#endif
+}
+
+/* Where the cut falls for this file: end of the last packet kept, and the
+ * offset of that packet (whose first dword must read as 0). Returns 0 when
+ * the cut is off, the file is not a movie, or its packet chain does not look
+ * like one (then the file is served untouched). */
+static int xmv_cut_for_fd(int fd, xmv_cut_t *out)
+{
+    static int keep = -2;      /* packets kept after the header packet */
+    uint32_t hdr[3], nxt;
+    int64_t end, off;
+    int kept = 0;
+
+    if (keep == -2) {
+        const char *e = getenv("RECOMP_XMV_PACKETS");
+        int n = e ? atoi(e) : 0;
+        keep = n > 0 ? (n < 1 ? 1 : n) : -1;
+        if (keep > 0)
+            fprintf(stderr, "  [XMV] movies cut to the header + %d packets (RECOMP_XMV_PACKETS)\n", keep);
+    }
+    if (keep < 0 || !xmv_is_movie(fd))
+        return 0;
+    if (pread(fd, hdr, sizeof hdr, 0) != (ssize_t)sizeof hdr)
+        return 0;
+    /* hdr[0] = size of packet 1, hdr[1] = size of this (header) packet */
+    if (hdr[1] < 64 || hdr[1] > (8u << 20))
+        return 0;
+    off = 0;
+    end = hdr[1];
+    nxt = hdr[0];
+    while (nxt != 0 && kept < keep) {
+        uint32_t following;
+        if (nxt > (8u << 20))
+            return 0;                       /* not a sane packet chain */
+        off = end;
+        end = off + (int64_t)nxt;
+        if (pread(fd, &following, 4, off) != 4)
+            return 0;
+        nxt = following;
+        kept++;
+    }
+    out->end = end;
+    out->last = off;
+    return 1;
+}
+
 NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
@@ -827,6 +916,20 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
+    /* A movie being cut short (RECOMP_XMV_MAX_KB): never read past its new end. */
+    ULONG want = Length;
+    xmv_cut_t cut;
+    int cutting = xmv_cut_for_fd(fd, &cut);
+    int64_t start_pos = (int64_t)lseek(fd, 0, SEEK_CUR);
+    if (cutting) {
+        if (start_pos >= cut.end)
+            want = 0;
+        else if (start_pos + (int64_t)Length > cut.end)
+            want = (ULONG)(cut.end - start_pos);
+        if (start_pos == 0)
+            fprintf(stderr, "  [XMV] movie cut: %lld KB kept\n", (long long)(cut.end / 1024));
+    }
+
     /* read() is allowed to come back short, and on a large asset read it
      * routinely does. The Xbox call does not: a title asks for a block and
      * gets the whole block, so it never re-reads the tail. Black loaded every
@@ -838,8 +941,8 @@ NTSTATUS __stdcall xbox_NtReadFile(
     /* read() into a write-tracked page fails (EFAULT) instead of faulting;
      * release the range first (xbox_dirty_tracking.c). */
     xbox_dirty_prepare_write(Buffer, (size_t)Length);
-    while (done < (size_t)Length) {
-        ssize_t got = read(fd, (char *)Buffer + done, (size_t)Length - done);
+    while (done < (size_t)want) {
+        ssize_t got = read(fd, (char *)Buffer + done, (size_t)want - done);
         if (got < 0) {
             if (errno == EINTR)
                 continue;
@@ -853,6 +956,14 @@ NTSTATUS __stdcall xbox_NtReadFile(
         done += (size_t)got;
     }
     n = (ssize_t)done;
+
+    if (cutting) {   /* the last packet kept says "no packet follows" */
+        for (int i = 0; i < 4; i++) {
+            int64_t at = cut.last + i - start_pos;
+            if (at >= 0 && at < (int64_t)n)
+                ((unsigned char *)Buffer)[at] = 0;
+        }
+    }
 
     IoStatusBlock->Information = (ULONG_PTR)n;
     if (n == 0 && Length > 0) {
@@ -966,6 +1077,11 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
         }
         case XboxFileStandardInformation: {
             PXBOX_FILE_STANDARD_INFORMATION info = (PXBOX_FILE_STANDARD_INFORMATION)FileInformation;
+            {   /* a movie cut short reports the short size */
+                xmv_cut_t cut;
+                if (xmv_cut_for_fd(fd, &cut) && st.st_size > cut.end)
+                    st.st_size = (off_t)cut.end;
+            }
             info->EndOfFile.QuadPart = st.st_size;
             info->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
             info->NumberOfLinks = (ULONG)st.st_nlink;
@@ -990,6 +1106,11 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             unix_to_filetime(st.st_atime, 0, &info->LastAccessTime);
             unix_to_filetime(st.st_mtime, 0, &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
+            {
+                xmv_cut_t cut;
+                if (xmv_cut_for_fd(fd, &cut) && st.st_size > cut.end)
+                    st.st_size = (off_t)cut.end;
+            }
             info->EndOfFile.QuadPart = st.st_size;
             info->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
             info->FileAttributes = mode_to_xbox_attrs(st.st_mode);
