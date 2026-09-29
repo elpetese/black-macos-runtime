@@ -693,6 +693,12 @@ static int init_metal(void)
 {
     NSError *error = nil;
     NSString *source = [NSString stringWithUTF8String:shader_source];
+    /* Scaling: linear by default (the window is usually larger than 640x480,
+     * usually by a non-integer factor, where nearest looks uneven).
+     * RECOMP_FILTER=nearest keeps hard pixels. */
+    if (!getenv("RECOMP_FILTER") || strcmp(getenv("RECOMP_FILTER"), "nearest") != 0)
+        source = [source stringByReplacingOccurrencesOfString:@"filter::nearest"
+                                                   withString:@"filter::linear"];
     id<MTLLibrary> library;
     id<MTLFunction> vs, fs;
     MTLRenderPipelineDescriptor *desc;
@@ -798,6 +804,30 @@ static void xek_capture_mouse(BOOL on)
 @end
 @implementation XBFrameKeyView
 
+/* The layer is set on the view by hand (a layer-hosting view), so nothing
+ * resizes it for us: follow the view's size and the display's pixel scale, or
+ * a resized/full-screen window would keep presenting into the old drawable. */
+- (void)xek_syncLayer
+{
+    CGFloat sc = self.window ? self.window.backingScaleFactor : 1.0;
+    if (!s_layer)
+        return;
+    s_layer.frame = self.bounds;
+    s_layer.contentsScale = sc;
+    s_layer.drawableSize = CGSizeMake(self.bounds.size.width * sc,
+                                      self.bounds.size.height * sc);
+}
+- (void)setFrameSize:(NSSize)size
+{
+    [super setFrameSize:size];
+    [self xek_syncLayer];
+}
+- (void)viewDidChangeBackingProperties
+{
+    [super viewDidChangeBackingProperties];
+    [self xek_syncLayer];
+}
+
 /* ── Keyboard input ─────────────────────────────────────────── */
 
 /* Shift is a modifier: it produces flagsChanged, not keyDown. Left or right
@@ -823,6 +853,17 @@ static void xek_capture_mouse(BOOL on)
     /* RECOMP_BACKGROUND: scripted runs take input from RECOMP_INPUT_SCRIPT only. */
     if (getenv("RECOMP_BACKGROUND"))
         return;
+
+    /* Full screen: Cmd+Return, or Ctrl+Cmd+F (macOS's own shortcut, which a
+     * bare window has no menu to provide). */
+    if (down) {
+        NSEventModifierFlags mf = [event modifierFlags];
+        if (((code == 36 || code == 76) && (mf & NSEventModifierFlagCommand)) ||
+            (code == 3 && (mf & NSEventModifierFlagCommand) && (mf & NSEventModifierFlagControl))) {
+            [s_window toggleFullScreen:nil];
+            return;
+        }
+    }
 
     /* Esc: hand the mouse back and pause (Start), as in Critical Hour. */
     if (code == 53) {
@@ -981,6 +1022,37 @@ static void xek_capture_mouse(BOOL on)
 }
 @end
 
+/* RECOMP_FB_OUTSNAP=<prefix>: also save what the window really shows -- the
+ * composed drawable, after scaling and letterboxing -- about every 1.5 s, as
+ * <prefix>NNNNNN.bmp. For checking the presenter without a screen capture. */
+static void write_bmp24_wh(const char *path, const uint8_t *bgra, uint32_t w, uint32_t h)
+{
+    FILE *f = fopen(path, "wb");
+    uint32_t row = ((w * 3u) + 3u) & ~3u, image = row * h, file = 54u + image;
+    uint8_t hd[54] = { 'B', 'M' };
+    uint8_t *line = malloc(row);
+    if (!f || !line) { if (f) fclose(f); free(line); return; }
+    memcpy(hd + 2, &file, 4);
+    hd[10] = 54; hd[14] = 40;
+    memcpy(hd + 18, &w, 4);
+    memcpy(hd + 22, &h, 4);
+    hd[26] = 1; hd[28] = 24;
+    memcpy(hd + 34, &image, 4);
+    fwrite(hd, 1, 54, f);
+    for (int y = (int)h; y-- > 0;) {
+        const uint8_t *src = bgra + (size_t)y * w * 4u;
+        memset(line, 0, row);
+        for (uint32_t x = 0; x < w; x++) {
+            line[x * 3 + 0] = src[x * 4 + 0];
+            line[x * 3 + 1] = src[x * 4 + 1];
+            line[x * 3 + 2] = src[x * 4 + 2];
+        }
+        fwrite(line, 1, row, f);
+    }
+    free(line);
+    fclose(f);
+}
+
 static void render_frame(void)
 {
     id<CAMetalDrawable> drawable;
@@ -1014,18 +1086,55 @@ static void render_frame(void)
     pass.colorAttachments[0].texture = drawable.texture;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(1.0, 0.0, 0.0, 1.0);
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
     command = [s_queue commandBuffer];
     encoder = [command renderCommandEncoderWithDescriptor:pass];
+    {
+        /* Fit the 4:3 picture in the drawable, centred, black bars around it
+         * (full screen on a 16:9 display is pillarboxed, not stretched). */
+        double tw = (double)drawable.texture.width, th = (double)drawable.texture.height;
+        double aspect = (double)s_width / (double)s_height;
+        double vw = tw, vh = tw / aspect;
+        if (vh > th) { vh = th; vw = th * aspect; }
+        MTLViewport vp = { floor((tw - vw) / 2.0), floor((th - vh) / 2.0),
+                           floor(vw), floor(vh), 0.0, 1.0 };
+        [encoder setViewport:vp];
+    }
     [encoder setRenderPipelineState:s_pipeline];
     [encoder setFragmentTexture:s_texture atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     [encoder endEncoding];
     if (s_fb_debug) { fprintf(stderr, "[FBWIN] render_frame: encoder end OK\n"); fflush(stderr); }
 
+    static const char *outsnap;
+    static int outsnap_init;
+    id<MTLBuffer> outbuf = nil;
+    NSUInteger outw = 0, outh = 0;
+    if (!outsnap_init) { outsnap = getenv("RECOMP_FB_OUTSNAP"); outsnap_init = 1; }
+    if (outsnap && (s_fb_frames_presented % 90) == 0) {
+        outw = drawable.texture.width;
+        outh = drawable.texture.height;
+        outbuf = [s_device newBufferWithLength:outw * outh * 4 options:MTLResourceStorageModeShared];
+        id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+        [blit copyFromTexture:drawable.texture sourceSlice:0 sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(outw, outh, 1)
+                     toBuffer:outbuf destinationOffset:0
+            destinationBytesPerRow:outw * 4 destinationBytesPerImage:outw * outh * 4];
+        [blit endEncoding];
+    }
+
     [command presentDrawable:drawable];
     if (s_fb_debug) { fprintf(stderr, "[FBWIN] render_frame: presentDrawable OK\n"); fflush(stderr); }
     [command commit];
+    if (outbuf) {
+        char path[512];
+        [command waitUntilCompleted];
+        snprintf(path, sizeof path, "%s%06llu.bmp", outsnap,
+                 (unsigned long long)s_fb_frames_presented);
+        write_bmp24_wh(path, [outbuf contents], (uint32_t)outw, (uint32_t)outh);
+        fprintf(stderr, "  [FBWIN] output %lux%lu saved\n", (unsigned long)outw, (unsigned long)outh);
+        [outbuf release];
+    }
     if (s_fb_debug) { fprintf(stderr, "[FBWIN] render_frame: commit OK\n"); fflush(stderr); }
 
     static int frame_count = 0;
@@ -1211,24 +1320,48 @@ void xbox_FramebufferWindowStart(void)
             fprintf(stderr, "[FBWIN] Metal initialization failed\n");
             return;
         }
-        rect = NSMakeRect(0, 0, s_width, s_height);
+        /* Window size, as in the Critical Hour port: 4:3, 1080 points tall by
+         * default (1440x1080), RECOMP_WINDOW=<height> for another size. It is
+         * capped to what fits the screen, so a laptop gets the largest 4:3
+         * window it can show. The image is the game's 640x480 framebuffer
+         * scaled to it; the window can be resized (aspect locked) or made
+         * full screen. */
+        {
+            const char *we = getenv("RECOMP_WINDOW");
+            double avail = [[NSScreen mainScreen] visibleFrame].size.height - 32.0;
+            double wh = we ? atof(we) : (avail < 1080.0 ? avail : 1080.0);
+            if (wh < 240.0) wh = 240.0;
+            wh = floor(wh / 3.0) * 3.0;               /* keeps 4:3 whole */
+            rect = NSMakeRect(0, 0, floor(wh * s_width / s_height), wh);
+        }
         s_window = [[NSWindow alloc]
             initWithContentRect:rect
-                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable
                         backing:NSBackingStoreBuffered defer:NO];
         [s_window setReleasedWhenClosed:NO];
         [s_window setTitle:@"Black - Xbox Recomp Framebuffer"];
+        [s_window setContentAspectRatio:NSMakeSize(s_width, s_height)];
+        [s_window setContentMinSize:NSMakeSize(s_width / 2, s_height / 2)];
         [s_window center];
-        [s_window setLevel:NSFloatingWindowLevel];
-        [s_window setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorTransient];
+        if (getenv("RECOMP_BACKGROUND") || getenv("RECOMP_FLOAT")) {
+            /* Scripted runs / always-on-top: the old behaviour. */
+            [s_window setLevel:NSFloatingWindowLevel];
+            [s_window setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorTransient];
+        } else {
+            /* A normal window that can take the whole screen (green button,
+             * Cmd+Return, or RECOMP_FULLSCREEN=1). */
+            [s_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
+        }
         [s_window setAcceptsMouseMovedEvents:YES];
         s_layer = [CAMetalLayer layer];
         s_layer.device = s_device;
         s_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        s_layer.framebufferOnly = YES;
+        s_layer.framebufferOnly = getenv("RECOMP_FB_OUTSNAP") ? NO : YES;
         s_layer.opaque = YES;
-        s_layer.drawableSize = CGSizeMake(s_width * s_window.backingScaleFactor,
-                                          s_height * s_window.backingScaleFactor);
+        s_layer.contentsScale = s_window.backingScaleFactor;
+        s_layer.drawableSize = CGSizeMake(rect.size.width * s_window.backingScaleFactor,
+                                          rect.size.height * s_window.backingScaleFactor);
         {
             /* Install a key-capable content view so the window receives
              * keyboard events (the Metal framebuffer is otherwise click-through
@@ -1284,6 +1417,8 @@ void xbox_FramebufferWindowStart(void)
             [s_window makeKeyAndOrderFront:nil];
             [NSApp activateIgnoringOtherApps:YES];
             [s_window setAcceptsMouseMovedEvents:YES];
+            if (getenv("RECOMP_FULLSCREEN"))
+                [s_window toggleFullScreen:nil];
         }
         s_dump_at = now_ms() + 4000u;
         s_dumped = 0;
