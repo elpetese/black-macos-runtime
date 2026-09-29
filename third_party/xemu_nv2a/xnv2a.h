@@ -25,6 +25,13 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
 
 void xnv2a_report(void);
 
+/* The newest frame at internal resolution (RECOMP_SCALE > 1): BGRA, top row
+ * first, w x h with the given row stride in bytes. NULL when there is none.
+ * A non-NULL return holds a lock: copy the pixels out, then release. */
+const uint8_t *xnv2a_hires_acquire(uint64_t *seq, uint32_t *w, uint32_t *h,
+                                   uint32_t *stride);
+void xnv2a_hires_release(void);
+
 #ifdef __cplusplus
 }
 #endif

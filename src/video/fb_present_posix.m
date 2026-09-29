@@ -65,6 +65,24 @@ static volatile uint32_t s_fb_pitch;
 static uint32_t s_fb_va_history[FB_HISTORY];
 static uint32_t s_fb_pitch_history[FB_HISTORY];
 static int s_fb_history_count;
+/* Shape of the picture on screen. The game renders 4:3 (640x480); RECOMP_ASPECT
+ * stretches it horizontally to fill the window: "16:9" (the default),
+ * "16:10", "4:3" for the original shape, or a plain number such as 1.78. */
+static double display_aspect(void)
+{
+    static double a;
+    if (a == 0.0) {
+        const char *e = getenv("RECOMP_ASPECT");
+        double n = 0.0, d = 0.0, v = 0.0;
+        if (e && sscanf(e, "%lf:%lf", &n, &d) == 2 && n > 0.0 && d > 0.0)
+            v = n / d;
+        else if (e)
+            v = atof(e);
+        a = (v > 0.5 && v < 4.0) ? v : 16.0 / 9.0;
+    }
+    return a;
+}
+
 static uint32_t s_width = 640;
 static uint32_t s_height = 480;
 static uint8_t *s_pixels;
@@ -429,6 +447,26 @@ static float pvideo_scale(uint32_t din_dout, uint32_t out_size)
 }
 
 static inline uint8_t clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
+
+/* Is the NV2A video overlay showing? (A movie: the frame comes from the
+ * overlay buffer, composited on the CPU below, not from the GPU surface.) */
+static int pvideo_active(void)
+{
+    uint32_t buffer = pvideo_reg(PVIDEO_BUFFER);
+    return (buffer & 1u) && pvideo_reg(PVIDEO_SIZE_IN) != 0xFFFFFFFFu
+           && !(pvideo_reg(PVIDEO_STOP) & 1u);
+}
+
+/* The frame at internal resolution from xemu's renderer (RECOMP_SCALE > 1),
+ * weak so this file still links into a host without it. Used whenever no
+ * movie overlay is showing; otherwise, or if it stops arriving, the 640x480
+ * image from guest memory is presented as before. */
+extern const uint8_t *xnv2a_hires_acquire(uint64_t *seq, uint32_t *w, uint32_t *h,
+                                          uint32_t *stride) __attribute__((weak));
+extern void xnv2a_hires_release(void) __attribute__((weak));
+static id<MTLTexture> s_hr_texture;
+static uint32_t s_hr_tw, s_hr_th;
+static uint64_t s_hr_seq_up, s_hr_up_ms;
 
 static void composite_pvideo(uint32_t *dst)
 {
@@ -1074,6 +1112,34 @@ static void render_frame(void)
                  mipmapLevel:0 withBytes:s_pixels bytesPerRow:s_width * 4u];
     pthread_mutex_unlock(&s_pixels_lock);
 
+    id<MTLTexture> source = s_texture;
+    if (xnv2a_hires_acquire && !getenv("RECOMP_NO_HIRES") && !pvideo_active()) {
+        uint64_t seq = 0;
+        uint32_t w = 0, h = 0, stride = 0;
+        const uint8_t *px = xnv2a_hires_acquire(&seq, &w, &h, &stride);
+        if (px) {
+            if (seq != s_hr_seq_up && w && h) {
+                if (!s_hr_texture || w != s_hr_tw || h != s_hr_th) {
+                    MTLTextureDescriptor *td = [MTLTextureDescriptor
+                        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                     width:w height:h mipmapped:NO];
+                    [s_hr_texture release];
+                    s_hr_texture = [s_device newTextureWithDescriptor:td];
+                    s_hr_tw = w;
+                    s_hr_th = h;
+                    fprintf(stderr, "  [FBWIN] presenting the frame at %ux%u\n", w, h);
+                }
+                [s_hr_texture replaceRegion:MTLRegionMake2D(0, 0, w, h)
+                                mipmapLevel:0 withBytes:px bytesPerRow:stride];
+                s_hr_seq_up = seq;
+                s_hr_up_ms = now_ms();
+            }
+            xnv2a_hires_release();
+            if (s_hr_texture && now_ms() - s_hr_up_ms < 250)
+                source = s_hr_texture;
+        }
+    }
+
     drawable = [s_layer nextDrawable];
     if (!drawable) {
         fprintf(stderr, "[FBWIN] render_frame: nextDrawable returned nil\n");
@@ -1093,7 +1159,7 @@ static void render_frame(void)
         /* Fit the 4:3 picture in the drawable, centred, black bars around it
          * (full screen on a 16:9 display is pillarboxed, not stretched). */
         double tw = (double)drawable.texture.width, th = (double)drawable.texture.height;
-        double aspect = (double)s_width / (double)s_height;
+        double aspect = display_aspect();
         double vw = tw, vh = tw / aspect;
         if (vh > th) { vh = th; vw = th * aspect; }
         MTLViewport vp = { floor((tw - vw) / 2.0), floor((th - vh) / 2.0),
@@ -1101,7 +1167,7 @@ static void render_frame(void)
         [encoder setViewport:vp];
     }
     [encoder setRenderPipelineState:s_pipeline];
-    [encoder setFragmentTexture:s_texture atIndex:0];
+    [encoder setFragmentTexture:source atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     [encoder endEncoding];
     if (s_fb_debug) { fprintf(stderr, "[FBWIN] render_frame: encoder end OK\n"); fflush(stderr); }
@@ -1332,7 +1398,7 @@ void xbox_FramebufferWindowStart(void)
             double wh = we ? atof(we) : (avail < 1080.0 ? avail : 1080.0);
             if (wh < 240.0) wh = 240.0;
             wh = floor(wh / 3.0) * 3.0;               /* keeps 4:3 whole */
-            rect = NSMakeRect(0, 0, floor(wh * s_width / s_height), wh);
+            rect = NSMakeRect(0, 0, floor(wh * display_aspect()), wh);
         }
         s_window = [[NSWindow alloc]
             initWithContentRect:rect
@@ -1341,8 +1407,8 @@ void xbox_FramebufferWindowStart(void)
                         backing:NSBackingStoreBuffered defer:NO];
         [s_window setReleasedWhenClosed:NO];
         [s_window setTitle:@"Black - Xbox Recomp Framebuffer"];
-        [s_window setContentAspectRatio:NSMakeSize(s_width, s_height)];
-        [s_window setContentMinSize:NSMakeSize(s_width / 2, s_height / 2)];
+        [s_window setContentAspectRatio:NSMakeSize(display_aspect() * 1000.0, 1000.0)];
+        [s_window setContentMinSize:NSMakeSize(display_aspect() * 240.0, 240.0)];
         [s_window center];
         if (getenv("RECOMP_BACKGROUND") || getenv("RECOMP_FLOAT")) {
             /* Scripted runs / always-on-top: the old behaviour. */

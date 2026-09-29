@@ -21,6 +21,8 @@
  * after startup. */
 #define CGETENV(name) __extension__ ({ static int _ce_done; static const char *_ce_val; \
     if (!_ce_done) { _ce_val = getenv(name); _ce_done = 1; } _ce_val; })
+#include <pthread.h>
+#include <stdlib.h>
 #include <SDL3/SDL.h>
 
 struct config g_config = {
@@ -158,6 +160,19 @@ void xnv2a_init(uint8_t *vram, size_t vram_size, uint8_t *aperture)
     NV2AState *d = g_new0(NV2AState, 1);
     PGRAPHState *pg = &d->pgraph;
 
+    /* RECOMP_SCALE=<n>: render at n times the Xbox's 640x480 (xemu's "surface
+     * scale"). Guest memory still gets the 640x480 copy, shrunk back by xemu;
+     * the big frame goes to the presenter through xnv2a_hires_acquire. */
+    {
+        const char *e = getenv("RECOMP_SCALE");
+        int n = e ? atoi(e) : 1;
+        if (n < 1) n = 1;
+        if (n > 4) n = 4;
+        g_config.display.quality.surface_scale = n;
+        if (n > 1)
+            fprintf(stderr, "  [XNV2A] internal resolution x%d (%dx%d)\n", n, 640 * n, 480 * n);
+    }
+
     s_aperture = aperture;
     d->vram = g_new0(MemoryRegion, 1);
     d->vram->ptr = vram;
@@ -232,6 +247,85 @@ static int drawlog_active(void)
     return drawlog_this_frame();
 }
 
+/* ── The frame at internal resolution ────────────────────────────────────
+ *
+ * At each flip, once the draws are in, the colour surface the CRTC is scanning
+ * out (PCRTC_START) is read back at full size into a private buffer and
+ * published; the presenter picks it up instead of the 640x480 image in guest
+ * memory. Not done when the scale is 1, when the display surface cannot be
+ * found, or when it is not 32 bits per pixel: the presenter then falls back to
+ * guest memory, as before. */
+extern uint32_t xbox_Nv2aRegPeek(uint32_t off) __attribute__((weak));
+
+static pthread_mutex_t s_hr_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *s_hr_front, *s_hr_back;
+static size_t s_hr_cap;
+static uint32_t s_hr_w, s_hr_h, s_hr_stride;
+static uint64_t s_hr_seq;
+
+static void capture_hires(NV2AState *d)
+{
+    PGRAPHState *pg = &d->pgraph;
+    unsigned scale = pg->surface_scale_factor;
+    SurfaceBinding *sb;
+    size_t need;
+
+    if (scale <= 1 || !xbox_Nv2aRegPeek)
+        return;
+    sb = pgraph_gl_surface_get_within(d, xbox_Nv2aRegPeek(0x600800) & 0x0FFFFFFFu);
+    if (!sb || !sb->color || sb->fmt.bytes_per_pixel != 4 || !sb->width || !sb->height)
+        return;
+    need = (size_t)scale * scale * sb->size;
+    if (need > s_hr_cap) {
+        uint8_t *a = realloc(s_hr_back, need), *b;
+        if (!a)
+            return;
+        s_hr_back = a;
+        pthread_mutex_lock(&s_hr_lock);
+        b = realloc(s_hr_front, need);
+        if (b)
+            s_hr_front = b;
+        pthread_mutex_unlock(&s_hr_lock);
+        if (!b)
+            return;
+        s_hr_cap = need;
+    }
+    pgraph_gl_read_surface_scaled(d, sb, s_hr_back);
+    pthread_mutex_lock(&s_hr_lock);
+    {
+        uint8_t *t = s_hr_front;
+        s_hr_front = s_hr_back;
+        s_hr_back = t;
+    }
+    s_hr_w = sb->width * scale;
+    s_hr_h = sb->height * scale;
+    s_hr_stride = sb->pitch * scale;
+    s_hr_seq++;
+    pthread_mutex_unlock(&s_hr_lock);
+}
+
+/* The newest frame, or NULL if there is none. On a non-NULL return the frame
+ * is locked: copy it out and call xnv2a_hires_release(). */
+const uint8_t *xnv2a_hires_acquire(uint64_t *seq, uint32_t *w, uint32_t *h,
+                                   uint32_t *stride)
+{
+    pthread_mutex_lock(&s_hr_lock);
+    if (!s_hr_front || !s_hr_seq) {
+        pthread_mutex_unlock(&s_hr_lock);
+        return NULL;
+    }
+    *seq = s_hr_seq;
+    *w = s_hr_w;
+    *h = s_hr_h;
+    *stride = s_hr_stride;
+    return s_hr_front;
+}
+
+void xnv2a_hires_release(void)
+{
+    pthread_mutex_unlock(&s_hr_lock);
+}
+
 static void complete_flip(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -304,6 +398,7 @@ static void complete_flip(NV2AState *d)
         memset(&s_z, 0, sizeof s_z);
     }
     pgraph_gl_download_dirty_surfaces(d);
+    capture_hires(d);
     if (CGETENV("RECOMP_XEMU_VERBOSE")) {
         static unsigned flips;
         if ((flips++ % 100) == 0) {

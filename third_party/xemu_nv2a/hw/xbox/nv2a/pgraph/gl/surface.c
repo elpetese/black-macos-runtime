@@ -1476,3 +1476,18 @@ void pgraph_gl_surface_flush(NV2AState *d)
         pgraph_gl_surface_update(d, true, true, true);
     }
 }
+
+
+/* Read a colour surface at full internal resolution, top row first (the GL
+ * texture already holds it that way, so no vertical flip: flipping it, as the
+ * guest-memory download of a swizzled surface does, showed the picture upside
+ * down), without
+ * swizzling or shrinking it back: scale*width x scale*height pixels with a
+ * row stride of scale*pitch (so `pixels` needs scale^2 * surface->size bytes).
+ * Used by the host to present the frame at RECOMP_SCALE instead of the
+ * 640x480 copy that goes back to guest memory. */
+void pgraph_gl_read_surface_scaled(NV2AState *d, SurfaceBinding *surface,
+                                   uint8_t *pixels)
+{
+    surface_download_to_buffer(d, surface, false, false, false, pixels);
+}
