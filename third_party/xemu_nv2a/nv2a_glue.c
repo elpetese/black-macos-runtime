@@ -603,6 +603,38 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
         }
         fprintf(stderr, " dmaA=%08X dmaB=%08X contig_used=%08X",
                 (uint32_t)pg->dma_vertex_a, (uint32_t)pg->dma_vertex_b, xbox_ContiguousAllocatedBytes());
+        if (s_dump_frame) {
+            /* Skinned meshes (a weights attribute): where the vertices are and
+             * whether the vertex program's constants are sane. */
+            VertexAttribute *v0 = &pg->vertex_attributes[0], *v1 = &pg->vertex_attributes[1];
+            unsigned nv = dd_arrays ? dd_arrays : dd_elems;
+            if (v1->count && v0->count && v0->stride && nv && nv <= 1200) {
+                unsigned first = pg->draw_arrays_start[0];
+                float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+                unsigned bad = 0, seen = 0;
+                for (unsigned k = 0; k < nv && k < 400; k++) {
+                    unsigned vi = dd_arrays ? first + k : pg->inline_elements[k];
+                    const float *p3 = (const float *)(d->vram_ptr +
+                        ((v0->offset + (uint64_t)vi * v0->stride) & 0x03FFFFFF));
+                    seen++;
+                    for (int c = 0; c < 3; c++) {
+                        float f = p3[c];
+                        if (!(f > -1e6f && f < 1e6f)) { bad++; continue; }
+                        if (f < mn[c]) mn[c] = f;
+                        if (f > mx[c]) mx[c] = f;
+                    }
+                }
+                unsigned cn = 0, ci = 0;
+                for (int q = 0; q < NV2A_VERTEXSHADER_CONSTANTS; q++)
+                    for (int c = 0; c < 4; c++) {
+                        float f; memcpy(&f, &pg->vsh_constants[q][c], 4);
+                        if (f != f) cn++;
+                        else if (f > 1e30f || f < -1e30f) ci++;
+                    }
+                fprintf(stderr, "\n        skinned: first=%u verts=%u pos bbox x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f] bad=%u | vsh consts nan=%u inf=%u\n",
+                        first, seen, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], bad, cn, ci);
+            }
+        }
         fprintf(stderr, "\n        comb: ci0=%08X co0=%08X ai0=%08X ao0=%08X f0=%08X sf0=%08X sf1=%08X ci1=%08X ai1=%08X\n",
                 pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORI0), pgraph_reg_r(pg, NV_PGRAPH_COMBINECOLORO0),
                 pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAI0), pgraph_reg_r(pg, NV_PGRAPH_COMBINEALPHAO0),
