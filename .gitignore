@@ -32,3 +32,21 @@ bin/
 *.obj
 *.exe
 tools/split/output/
+
+# Local environments and agent state
+.venv/
+.kilo/
+
+# Logs, dumps and scratch files from debugging runs
+*.log
+*.dump
+black_xbe.txt
+imports.txt
+docs/*.png
+
+# Ad-hoc backups
+*.bak
+*.bak_*
+
+# Rust build output of the dsp56300 submodule
+third_party/dsp56300/target/
