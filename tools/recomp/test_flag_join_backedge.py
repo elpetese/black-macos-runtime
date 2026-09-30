@@ -67,7 +67,7 @@ def test_loop_head_inherits_flags_from_both_predecessors():
     assert "CMP_EQ" in code or "== 0" in code, code
 
 
-def test_disagreeing_predecessors_keep_the_fallback():
+def test_disagreeing_predecessors_get_their_condition_per_edge():
     # Two predecessors reach the jz: one after `sub`, one after `inc`, whose
     # flags come from a different operand. Neither operand can answer for
     # both, but each setter writes its own ZF into _fz, which can: the jz
@@ -90,5 +90,5 @@ def test_disagreeing_predecessors_keep_the_fallback():
 
 if __name__ == "__main__":
     test_loop_head_inherits_flags_from_both_predecessors()
-    test_disagreeing_predecessors_keep_the_fallback()
+    test_disagreeing_predecessors_get_their_condition_per_edge()
     print("ok")

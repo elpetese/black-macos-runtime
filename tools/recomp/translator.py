@@ -153,6 +153,100 @@ def _incoming_flag_state(sources, known, is_entry):
     return merged
 
 
+def _plan_edge_joins(lifter, blocks, preds, start, untracked_entries,
+                     settled=None):
+    """Joins whose jcc would otherwise read the never-assigned _flags.
+
+    A block reached by predecessors that set the flags with different
+    operations or widths (`test ecx, ecx` falling through, `cmp [eax+0x18], 2`
+    jumping in) inherits no state, and its jcc falls back to `_flags` -- a
+    variable nothing assigns, so the branch is silently never taken. In
+    Critical Hour that turned the AI's "is the weapon ready?" check into a
+    constant "no", and no enemy ever fired.
+
+    Every predecessor does know its own flags. So instead of merging, each
+    edge evaluates the consumer's condition from its own state, right where it
+    leaves, into _ej, and the consumer tests _ej. The condition is the one the
+    lifter would have emitted for that predecessor alone, evaluated at the
+    point the flags were still that predecessor's, which is at least as
+    faithful as evaluating it at the jcc.
+
+    Only applied when it is exact: every predecessor has a known state and a
+    condition for the consumer, the block reaches its jcc without touching the
+    flags, and no edge into it is invisible to the CFG (switch arm, taken
+    address) or already reads _flags/_ej itself.
+
+    Returns {join_start: (jcc mnemonic, [(pred_start, cond, "jump"|"fall")])}.
+    """
+    from .lifter import _make_condition, _EFLAGS_PRESERVE
+    by_start = {bb.start: bb for bb in blocks}
+    order = [bb.start for bb in blocks]
+    candidates = [bb for bb in blocks
+                  if bb.start != start and len(preds[bb.start]) >= 2
+                  and bb.start not in untracked_entries]
+    if not candidates:
+        return {}
+
+    if settled is None:
+        # No back edge: one pass in address order settles every state, the
+        # same computation the emit loop repeats.
+        saved = {k: list(v) for k, v in lifter.unimplemented.items()}
+        settled = {}
+        for bb in blocks:
+            incoming = _incoming_flag_state(preds[bb.start], settled,
+                                            bb.start == start)
+            _, settled[bb.start] = lift_basic_block(lifter, bb,
+                                                    flag_state=incoming)
+        lifter.unimplemented.clear()
+        lifter.unimplemented.update(saved)
+
+    plans = {}
+    for bb in candidates:
+        states = [settled.get(p) for p in preds[bb.start]]
+        if any(not st for st in states):
+            continue
+        consumer = None
+        for insn in bb.instructions:
+            if insn.is_cond_jump:
+                if insn.mnemonic not in ("jecxz", "jcxz"):
+                    consumer = insn
+                break
+            if (insn.mnemonic not in _EFLAGS_PRESERVE or insn.is_call
+                    or insn.is_ret or insn.is_branch):
+                break
+        if consumer is None:
+            continue
+        # A join the ordinary merge (or the ZF-only merge for je/jne) already
+        # answers for this consumer is left to it.
+        merged = _incoming_flag_state(preds[bb.start], settled, False)
+        if merged:
+            have = _make_condition(consumer.mnemonic, *merged)
+            if have and "_flags" not in have[0]:
+                continue
+        edges = []
+        for p in sorted(preds[bb.start]):
+            last = by_start[p].instructions[-1]
+            cond = _make_condition(consumer.mnemonic, *settled[p])
+            if not cond or "_flags" in cond[0] or "_ej" in cond[0]:
+                edges = None
+                break
+            jumps_in = last.jump_target == bb.start and last.is_branch
+            falls_in = (not last.is_jump and not last.is_ret
+                        and order.index(p) + 1 < len(order)
+                        and order[order.index(p) + 1] == bb.start)
+            if jumps_in == falls_in:
+                edges = None      # both (or neither): not one clear edge
+                break
+            edges.append((p, cond[0], "jump" if jumps_in else "fall"))
+        if edges:
+            plans[bb.start] = (consumer.mnemonic, edges)
+
+    # One predecessor can feed two joins -- its jcc into one, its fall-through
+    # into the other. That is still exact: the jump's assignment sits before
+    # its goto and the fall-through's after it.
+    return plans
+
+
 def write_if_changed(path, text):
     """Write text to path only when it differs from what is already there.
 
@@ -2291,6 +2385,11 @@ class FunctionTranslator:
         label_addrs |= self.lifter.imm_code_refs
         label_addrs.update(debug_slide_bypasses.values())
         label_addrs.update(switch_leaders)
+        # Entries the CFG below does not see as edges: a switch arm, a debug
+        # slide bypass and an address taken as an immediate. Edge-materialised
+        # joins skip them.
+        untracked_entries = (set(self.lifter.imm_code_refs) | set(switch_leaders)
+                             | set(debug_slide_bypasses.values()))
 
         # Which blocks can reach each block. Flag state has to follow control
         # flow, not address order: an optimising compiler routinely lets a jcc
@@ -2371,6 +2470,12 @@ class FunctionTranslator:
             settled_state = out_state
             out_state = {}
 
+        edge_joins = _plan_edge_joins(self.lifter, blocks, preds, start,
+                                      untracked_entries,
+                                      None if settled_state is out_state
+                                      else settled_state)
+        block_stmts = {}
+
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -2389,21 +2494,56 @@ class FunctionTranslator:
             incoming = _incoming_flag_state(preds[bb.start], settled_state,
                                             bb.start == start)
 
-            stmts, out_state[bb.start] = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
-            for stmt in stmts:
-                lines.append(f"    {stmt}")
+            if bb.start in edge_joins:
+                # Predecessors disagree on the flag setter; each one stores the
+                # consumer's condition in _ej on its way in (see
+                # _plan_edge_joins). The block itself sets no flags, so what
+                # leaves it is what a failed merge always left: unknown.
+                stmts, _ = lift_basic_block(
+                    self.lifter, bb, flag_state=("__edge_cond", []))
+                out_state[bb.start] = None
+            else:
+                stmts, out_state[bb.start] = lift_basic_block(
+                    self.lifter, bb, flag_state=incoming)
+            stmts = list(stmts)
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
             if bypass is not None:
-                lines.append(
-                    f"    goto loc_{bypass:08X}; /* int 0x2d skips slide int3 */")
+                stmts.append(
+                    f"goto loc_{bypass:08X}; /* int 0x2d skips slide int3 */")
             if (start in self.coalesced_function_starts
                     and (bb.last_insn.mnemonic in ("ud2", "hlt")
                          or (bb.last_insn.mnemonic == "int3"
                              and bb.last_insn.address not in debug_slide_int3s))):
-                lines.append("    return; /* trap ends recovered control flow */")
+                stmts.append("return; /* trap ends recovered control flow */")
+            block_stmts[bb.start] = (len(lines), stmts)
+            lines.append(None)  # placeholder, filled below
 
             lines.append(f"")
+
+        # Store each materialised join's condition on every edge into it.
+        for join, (consumer, edges) in edge_joins.items():
+            for pred, cond, how in edges:
+                _, pstmts = block_stmts[pred]
+                assign = f"_ej = ({cond}) ? 1 : 0; /* flags of this edge for the {consumer} at 0x{join:08X} */"
+                if how == "fall":
+                    pstmts.append(assign)
+                else:
+                    goto = f"goto loc_{join:08X};"
+                    k = max(i for i, t in enumerate(pstmts) if goto in t)
+                    pstmts.insert(k, assign)
+        # rebuild with the block statements in place of the placeholders
+        rebuilt = []
+        slot = {pos: st for pos, st in block_stmts.values()}
+        for idx, line in enumerate(lines):
+            if line is None:
+                rebuilt.extend(f"    {stmt}" for stmt in slot[idx])
+            else:
+                rebuilt.append(line)
+        lines = rebuilt
+        if edge_joins:
+            decl = "    int _flags = 0; /* fallback flag var */"
+            k = lines.index(decl)
+            lines.insert(k + 1, "    int _ej = 0; /* edge-materialised join condition */")
 
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:

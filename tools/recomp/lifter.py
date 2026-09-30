@@ -523,6 +523,10 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return "!_fz", desc
         return None
+    # A join whose predecessors each stored this jcc's condition into _ej on
+    # the way in (translator._plan_edge_joins).
+    if flag_setter == "__edge_cond":
+        return "_ej", desc
 
     if flag_setter == "__zf_from_dest" and flag_ops:
         dest = _fmt_operand_read(flag_ops[0])
