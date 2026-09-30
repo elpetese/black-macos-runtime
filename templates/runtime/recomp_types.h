@@ -274,6 +274,10 @@ static inline double fp_pc(double x)
 }
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS uint16_t g_fp_cc;
+extern RECOMP_TLS uint32_t g_mxcsr;   /* virtual MXCSR: stmxcsr/ldmxcsr */
+/* fptan: tan(x), times a per-site factor a title may set (1 by default). */
+double recomp_fptan(double x, uint32_t va);
+void recomp_fptan_scale(uint32_t va, double factor);
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
 /* Values in the existing double-backed stack are all representable as normal
  * x87 extended values, including binary64 subnormals. Empty stack tags and
@@ -424,6 +428,38 @@ void recomp_trace_esp(const char *name, const char *tag);
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+
+/* fld/fstp tbyte: 80-bit extended real <-> the double the stack holds.
+ * 64-bit mantissa with explicit integer bit, 15-bit exponent (bias 16383). */
+static inline double recomp_ld80(uint32_t addr)
+{
+    uint64_t mant = (uint64_t)MEM32(addr) | ((uint64_t)MEM32(addr + 4) << 32);
+    uint16_t se = MEM16(addr + 8);
+    int exp = se & 0x7FFF;
+    double v;
+    if (exp == 0x7FFF)
+        v = (mant == 0x8000000000000000ull) ? INFINITY : NAN;
+    else if (exp == 0 && mant == 0)
+        v = 0.0;
+    else
+        v = ldexp((double)mant, (exp ? exp : 1) - 16383 - 63);
+    return (se & 0x8000) ? -v : v;
+}
+static inline void recomp_st80(uint32_t addr, double v)
+{
+    uint16_t se = signbit(v) ? 0x8000 : 0;
+    uint64_t mant = 0;
+    v = fabs(v);
+    if (isnan(v)) { se |= 0x7FFF; mant = 0xC000000000000000ull; }
+    else if (isinf(v)) { se |= 0x7FFF; mant = 0x8000000000000000ull; }
+    else if (v != 0.0) {
+        int e; double f = frexp(v, &e);          /* v = f * 2^e, f in [0.5,1) */
+        mant = (uint64_t)ldexp(f, 64);
+        se |= (uint16_t)(e - 1 + 16383);
+    }
+    MEM32(addr) = (uint32_t)mant; MEM32(addr + 4) = (uint32_t)(mant >> 32);
+    MEM16(addr + 8) = se;
+}
 
 /* ================================================================
  * SSE / XMM register state
@@ -1135,6 +1171,16 @@ static inline int32_t MMX_CVT_F2I(float v, int truncate)
         return (int32_t)0x80000000u;       /* integer indefinite */
     return (int32_t)rounded;
 #endif
+}
+
+/** cvtsd2si / cvttsd2si: as above, from a double. Out-of-range and NaN give the
+ * integer indefinite 0x80000000 on x86; a bare C cast gives 0 or INT_MAX. */
+static inline int32_t SSE_CVT_D2I(double v, int truncate)
+{
+    double rounded = truncate ? trunc(v) : nearbyint(v);
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
+        return (int32_t)0x80000000u;
+    return (int32_t)rounded;
 }
 
 static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)

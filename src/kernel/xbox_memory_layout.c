@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <setjmp.h>
+#include <math.h>
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -1234,6 +1235,31 @@ RECOMP_TLS int g_fp_cmp = 0;
 /* x87 condition codes C0-C3 (FXAM, FCOM): the lifter since upstream v0.12
  * keeps them here. 0x4000 is C3 set, the power-on value. */
 RECOMP_TLS uint16_t g_fp_cc = 0x4000;
+RECOMP_TLS uint32_t g_mxcsr = 0x1F80;
+
+/* Per-site fptan factors (recomp_types.h). A handful at most, set once at
+ * startup, so a linear scan is enough. */
+static struct { uint32_t va; double k; } s_fptan_scale[8];
+static int s_fptan_n;
+
+void recomp_fptan_scale(uint32_t va, double factor)
+{
+    for (int i = 0; i < s_fptan_n; i++)
+        if (s_fptan_scale[i].va == va) { s_fptan_scale[i].k = factor; return; }
+    if (s_fptan_n < 8) {
+        s_fptan_scale[s_fptan_n].va = va;
+        s_fptan_scale[s_fptan_n].k = factor;
+        s_fptan_n++;
+    }
+}
+
+double recomp_fptan(double x, uint32_t va)
+{
+    double t = tan(x);
+    for (int i = 0; i < s_fptan_n; i++)
+        if (s_fptan_scale[i].va == va) return t * s_fptan_scale[i].k;
+    return t;
+}
 
 /* Defined below, with the other guest registers. */
 extern RECOMP_TLS uint32_t g_ebp;

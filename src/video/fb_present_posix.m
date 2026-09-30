@@ -718,13 +718,40 @@ static const char *shader_source =
     "  const float2 t[] = { {0,1}, {1,1}, {0,0}, {1,0} };\n"
     "  Out o; o.position=float4(p[id],0,1); o.uv=t[id]; return o;\n"
     "}\n"
+    "static float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
     "fragment float4 fs(Out in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
     "  constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);\n"
-    "  float4 t = tex.sample(s, in.uv);\n"
+    "  float2 uv = in.uv;\n"
+    "  float3 m = tex.sample(s, uv).rgb;\n"
     /* Black is black. This used to substitute a UV gradient for every pure
      * black texel, a bring-up aid that showed "nothing presented" at a
      * glance -- and, once titles render, painted it over every dark pixel. */
-    "  return float4(t.rgb, 1.0);\n"
+    "#if RECOMP_AA\n"
+    /* FXAA (the compact 3.x "console" variant) in source-texel space: the
+     * title renders without multisampling, so edges are smoothed here, on
+     * the frame the GPU produced, before it is scaled to the window. */
+    "  float2 px = 1.0 / float2(tex.get_width(), tex.get_height());\n"
+    "  float lNW = luma(tex.sample(s, uv + float2(-1,-1) * px).rgb);\n"
+    "  float lNE = luma(tex.sample(s, uv + float2( 1,-1) * px).rgb);\n"
+    "  float lSW = luma(tex.sample(s, uv + float2(-1, 1) * px).rgb);\n"
+    "  float lSE = luma(tex.sample(s, uv + float2( 1, 1) * px).rgb);\n"
+    "  float lM = luma(m);\n"
+    "  float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));\n"
+    "  float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));\n"
+    "  if (lMax - lMin >= max(0.0312, lMax * 0.125)) {\n"
+    "    float2 dir = float2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));\n"
+    "    float red = max((lNW + lNE + lSW + lSE) * 0.03125, 1.0 / 128.0);\n"
+    "    float rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + red);\n"
+    "    dir = clamp(dir * rcp, -8.0, 8.0) * px;\n"
+    "    float3 a = 0.5 * (tex.sample(s, uv + dir * (1.0/3.0 - 0.5)).rgb +\n"
+    "                      tex.sample(s, uv + dir * (2.0/3.0 - 0.5)).rgb);\n"
+    "    float3 b = a * 0.5 + 0.25 * (tex.sample(s, uv - dir * 0.5).rgb +\n"
+    "                                 tex.sample(s, uv + dir * 0.5).rgb);\n"
+    "    float lB = luma(b);\n"
+    "    m = (lB < lMin || lB > lMax) ? a : b;\n"
+    "  }\n"
+    "#endif\n"
+    "  return float4(m, 1.0);\n"
     "}\n";
 
 static int init_metal(void)
@@ -737,6 +764,13 @@ static int init_metal(void)
     if (!getenv("RECOMP_FILTER") || strcmp(getenv("RECOMP_FILTER"), "nearest") != 0)
         source = [source stringByReplacingOccurrencesOfString:@"filter::nearest"
                                                    withString:@"filter::linear"];
+    /* RECOMP_AA=0 turns the FXAA pass off (on by default). */
+    {
+        const char *aa = getenv("RECOMP_AA");
+        int on = !(aa && strcmp(aa, "0") == 0);
+        source = [[NSString stringWithFormat:@"#define RECOMP_AA %d\n", on]
+                  stringByAppendingString:source];
+    }
     id<MTLLibrary> library;
     id<MTLFunction> vs, fs;
     MTLRenderPipelineDescriptor *desc;

@@ -73,3 +73,28 @@ def test_packed_sqrt_rsqrt_rcp_write_all_four_lanes():
         out = " ".join(Lifter().lift_instruction(insn))
         assert f"xmm0 = {helper}(xmm1);" in out, (m, out)
         assert ".f[0]" not in out, (m, out)
+
+
+# `comiss; lahf; test ah, mask; jcc` -- MSVC's float-compare idiom. lahf used
+# to lift to a comment, leaving AH as whatever eax held.
+@pytest.mark.skipif(shutil.which("cc") is None, reason="needs a C compiler")
+def test_lahf_after_comiss_matches_the_hardware_flags():
+    from tools.recomp.lifter import _lift_lahf
+    stmt = _lift_lahf("comiss", OPS)[0]
+    lines = ["#include <stdint.h>", "#include <stdio.h>",
+             "#define RECOMP_PARITY8(x) (!__builtin_parity((x) & 0xFF))",
+             "int main(void){ double _fca, _fcb; uint32_t eax;"]
+    expect = []
+    for name, (z, p, c) in OUTCOMES.items():
+        a, b = VALUES[name]
+        lines.append(f"_fca = {a}; _fcb = {b}; eax = 0xDEADBEEFu;")
+        lines.append(stmt)
+        lines.append('printf("%02X ", (eax >> 8) & 0xFF);')
+        expect.append("%02X" % (0x02 | (z << 6) | (p << 2) | c))
+    lines.append("return 0; }")
+    with tempfile.TemporaryDirectory() as d:
+        src, exe = os.path.join(d, "t.c"), os.path.join(d, "t")
+        open(src, "w").write("\n".join(lines))
+        subprocess.check_call([shutil.which("cc"), "-w", src, "-o", exe])
+        got = subprocess.check_output([exe]).decode().split()
+    assert got == expect

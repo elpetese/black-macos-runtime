@@ -1626,6 +1626,7 @@ class Lifter:
             return self._lift_mmx(insn, m, ops)
 
         if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps",
+                 "stmxcsr", "ldmxcsr",
                  "movlhps", "movhlps", "movapd", "movupd",
                  "addss", "subss", "mulss", "divss", "sqrtss",
                  "addsd", "subsd", "mulsd", "divsd", "sqrtsd",
@@ -3263,6 +3264,15 @@ class Lifter:
                 a, b = _sse_read(ops[0]), _sse_read(ops[1])
                 return [_sse_write(ops[0], f"({a} > {b} ? {a} : {b})") + f" /* {m} */"]
 
+        # stmxcsr / ldmxcsr: a virtual MXCSR (reset value 0x1F80). They were
+        # left untranslated, so `stmxcsr [esp+c]; or eax,0x8000; ldmxcsr` in
+        # Black (0x2B5E1) OR'ed a bit into whatever the stack held.
+        if m in ("stmxcsr", "ldmxcsr") and nops >= 1 and ops[0].type == "mem":
+            addr = _fmt_mem(ops[0])
+            if m == "stmxcsr":
+                return [f"MEM32({addr}) = g_mxcsr; /* stmxcsr */"]
+            return [f"g_mxcsr = MEM32({addr}); /* ldmxcsr */"]
+
         # ── Packed arithmetic ──
         # These used to emit a bare comment, so a matrix concatenation built
         # from shufps + mulps + addps executed as nothing at all.
@@ -3281,14 +3291,16 @@ class Lifter:
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
         if m in ("cvtss2si", "cvttss2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                trunc = "1" if m == "cvttss2si" else "0"
+                return [_fmt_operand_write(ops[0], f"MMX_CVT_F2I({_sse_read(ops[1])}, {trunc})") + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
         if m in ("cvtsd2si", "cvttsd2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                trunc = "1" if m == "cvttsd2si" else "0"
+                return [_fmt_operand_write(ops[0], f"SSE_CVT_D2I({_sse_read(ops[1])}, {trunc})") + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
@@ -3491,6 +3503,10 @@ class Lifter:
                         return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld float */"]
                     elif ops[0].mem_size == 8:
                         return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
+                    elif ops[0].mem_size == 10:
+                        # tbyte: an 80-bit extended real. Read as a float it
+                        # was the low 4 bytes of the mantissa -- a denormal.
+                        return [f"fp_push(recomp_ld80({_fmt_mem(ops[0])})); /* fld tbyte */"]
                     return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
                 if ops[0].type == "reg":
                     # fld st(i) pushes a COPY of st(i). Was a no-op comment,
@@ -3518,6 +3534,8 @@ class Lifter:
                     return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
                 elif ops[0].mem_size == 8:
                     return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
+                elif ops[0].mem_size == 10:
+                    return [f"recomp_st80({_fmt_mem(ops[0])}, fp_top());{do_pop} /* {m} tbyte */"]
             # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
             # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
             # is the common idiom for "pop the value fptan/fsincos just pushed";
@@ -3654,7 +3672,11 @@ class Lifter:
         if m == "fptan":
             # st0 = tan(st0), then push 1.0. The constant push is not decoration:
             # callers use it as the denominator of a subsequent fdiv.
-            return [f"{{ fp_top() = tan(fp_top()); fp_push(1.0); }} /* fptan */"]
+            # Through recomp_fptan with the site's address, so a title can
+            # scale one site: Black's field of view is tan(fov/2) at two
+            # fptan sites, and RECOMP_FOV widens it there alone.
+            return [f"{{ fp_top() = recomp_fptan(fp_top(), 0x{insn.address:08X}u);"
+                    f" fp_push(1.0); }} /* fptan */"]
         if m == "fpatan":
             # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
             return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"
@@ -3795,6 +3817,26 @@ class Lifter:
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":
             return [f"fp_push(1.0); /* fld1 */"]
+
+        # Stack bookkeeping. The register tags are not modelled, so ffree is
+        # nothing; fincstp/fdecstp move TOP. `fptan; ffree st(0); fincstp` is
+        # MSVC's way of dropping the 1.0 fptan pushes: with both left out, the
+        # fstp that follows stored that 1.0, so tan() was 1 everywhere --
+        # Black's five field-of-view/projection sites (sub_000C3200,
+        # sub_002033A0, ...) -- and the x87 stack leaked a slot each time.
+        if m == "ffree":
+            return [f"(void)0; /* ffree {insn.op_str} (tags not modelled) */"]
+        if m == "fincstp":
+            return ["fp_pop(); /* fincstp */"]
+        if m == "fdecstp":
+            return ["g_fp_top = (g_fp_top + 7u) & 7u; /* fdecstp */"]
+        if m in ("fnclex", "fclex"):
+            return [f"(void)0; /* {m}: exception flags not modelled */"]
+        if m in ("ficom", "ficomp") and ops and ops[0].type == "mem":
+            acc = "SMEM16" if ops[0].mem_size == 2 else "SMEM32"
+            pop = " fp_pop();" if m == "ficomp" else ""
+            return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), (double){acc}({_fmt_mem(ops[0])}));"
+                    f" g_fp_cc = RECOMP_FCMP_CC(g_fp_cmp);{pop} /* {m} {insn.op_str} */"]
 
         return [f"/* FPU: {m} {insn.op_str} */"]
 
@@ -4033,6 +4075,26 @@ def _is_rep_compare(insn):
                                    "scasb", "scasw", "scasd"))
 
 
+def _lift_lahf(setter, ops):
+    """lahf: AH = SF:ZF:0:AF:0:PF:1:CF from the tracked flag setter.
+
+    It used to lift to a comment, which left AH holding whatever eax had.
+    MSVC compiles float compares as `ucomiss/comiss; lahf; test ah, 44h/05h/
+    41h; jp/jnp` -- 266 sites in Black -- so every one of those branches
+    went on garbage: a float ==, != or < that was right or wrong depending on
+    what eax happened to hold. AF is not tracked and reads as 0; a flag the
+    setter leaves undefined or clear (SF after comiss) reads as 0 as well.
+    """
+    bits = []
+    for jcc, bit in (("js", 0x80), ("je", 0x40), ("jp", 0x04), ("jb", 0x01)):
+        cond = _make_condition(jcc, setter, ops)
+        if cond:
+            bits.append(f"(({cond[0]}) ? 0x{bit:02X}u : 0u)")
+    ah = " | ".join(["0x02u"] + bits)
+    return [f"eax = (eax & 0xFFFF00FFu) | ((uint32_t)({ah}) << 8);"
+            f" /* lahf ({setter}) */"]
+
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -4174,6 +4236,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                         and insns[j].mnemonic in ("sbb", "adc"))
             results = lifter._lift_neg(
                 curr, curr.operands, preserve_carry=preserve)
+        elif curr.mnemonic == "lahf" and last_flag_setter:
+            results = _lift_lahf(last_flag_setter, last_flag_ops)
         else:
             results = lifter.lift_instruction(insns[i])
             # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
