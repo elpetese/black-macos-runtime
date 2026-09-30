@@ -14,6 +14,7 @@
 #include "qemu/bitmap.h"
 #include "xnv2a.h"
 #include <time.h>
+#include <unistd.h>
 
 /* getenv once per call site. These run per pushbuffer method -- millions of
  * times a second -- and each getenv walks the environment under a lock: 12% of
@@ -225,9 +226,18 @@ extern int xbox_Nv2aSoftwareInterrupt(uint32_t trapped_addr, uint32_t trapped_da
                                       uint32_t nsource) __attribute__((weak));
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
+/* RECOMP_DRAWDUMP=1: `touch /tmp/black_dump` while playing and the draws of
+ * the next frame are written to the log (what each draw binds and how many
+ * vertices it has). For finding what a frame is made of -- e.g. whether an
+ * enemy's weapon is submitted at all. */
+static int s_dump_frame;
+static int s_dump_idx;
+
 static int drawlog_this_frame(void)
 {
     const char *e = CGETENV("RECOMP_XEMU_DRAWLOG");
+    if (s_dump_frame)
+        return 1;
     if (!e)
         return 0;
     if (*e == 'L')
@@ -239,6 +249,8 @@ static int drawlog_active(void)
 {
     static int cached = -1;
     const char *e;
+    if (s_dump_frame)
+        return 1;
     if (cached < 0)
         cached = CGETENV("RECOMP_XEMU_DRAWLOG") != NULL;
     if (!cached)
@@ -364,6 +376,17 @@ static void complete_flip(NV2AState *d)
     pgraph_reg_w(pg, NV_PGRAPH_SURFACE, s);
     pg->waiting_for_flip = false;
     s_flips++;
+    if (s_dump_frame) {
+        s_dump_frame = 0;
+        fprintf(stderr, "[XDRAW] ===== end of dumped frame (%d draws) =====\n", s_dump_idx);
+        fflush(stderr);
+    }
+    if (CGETENV("RECOMP_DRAWDUMP") && access("/tmp/black_dump", F_OK) == 0) {
+        unlink("/tmp/black_dump");
+        s_dump_frame = 1;
+        s_dump_idx = 0;
+        fprintf(stderr, "[XDRAW] ===== dumping frame after flip %u =====\n", s_flips);
+    }
     if (s_frame_draws > 300)
         s_big_frames++;
     s_frame_draws = 0;
@@ -496,6 +519,15 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
         && (method == 0x304 || method == 0x344 || method == 0x348 || method == 0x350
             || method == 0x30C || method == 0x354 || method == 0x35C))
         fprintf(stderr, "  [XM] %04X = %08X\n", method, param);
+    unsigned dd_arrays = 0, dd_elems = 0, dd_inline = 0, dd_ibuf = 0, dd_prim = 0;
+    if (method == 0x17FC && param == 0 && s_dump_frame) {
+        PGRAPHState *pg = &d->pgraph;
+        dd_arrays = pg->draw_arrays_length;
+        dd_elems = pg->inline_elements_length;
+        dd_inline = pg->inline_array_length;
+        dd_ibuf = pg->inline_buffer_length;
+        dd_prim = pg->primitive_mode;
+    }
     qemu_mutex_lock(&d->pgraph.lock);
     n = pgraph_method(d, subch, method, param, params, avail, avail, inc != 0);
     /* RECOMP_XEMU_DRAWLOG=<flip>: PGRAPH's texture/shader state at each draw
@@ -504,9 +536,13 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
         s_frame_draws++;
     if (method == 0x17FC && param == 0 && drawlog_this_frame()) {
         PGRAPHState *pg = &d->pgraph;
-        static int idx;
+        static int idx_env;
+        int idx = s_dump_frame ? s_dump_idx++ : idx_env++;
+        if (s_dump_frame)
+            fprintf(stderr, "  [XDRAW %d] prim=%u arrays=%u elems=%u inlinearr=%u inlinebuf=%u\n",
+                    idx, dd_prim, dd_arrays, dd_elems, dd_inline, dd_ibuf);
         fprintf(stderr, "  [XDRAW %d] color=%08X zeta=%08X c0=%08X clip %ux%u shaderprog=%08X blend=%08X combctl=%08X",
-                idx++, pg->surface_color.offset, pg->surface_zeta.offset,
+                idx, pg->surface_color.offset, pg->surface_zeta.offset,
                 pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0),
                 pg->surface_shape.clip_width, pg->surface_shape.clip_height,
                 pgraph_reg_r(pg, NV_PGRAPH_SHADERPROG),
