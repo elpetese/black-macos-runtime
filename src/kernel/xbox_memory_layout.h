@@ -498,6 +498,13 @@ uint32_t xbox_AllocThreadStack(void);
  * template the loader built. Returns the new TIB's Xbox VA, or 0. */
 uint32_t xbox_AllocThreadTib(void);
 
+/* Guest thread ids (KTHREAD+0x12C, what GetCurrentThreadId returns). Each
+ * TIB from xbox_AllocThreadTib gets a fresh one; xbox_SetThreadId replaces it
+ * with the id PsCreateSystemThreadEx already handed the creator. */
+#define XBOX_MAIN_THREAD_ID 4u
+uint32_t xbox_NewThreadId(void);
+void xbox_SetThreadId(uint32_t tib, uint32_t id);
+
 /**
  * Return a worker's stack when the worker ends. Takes the value
  * xbox_AllocThreadStack returned. Without this the pool counts threads ever

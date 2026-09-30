@@ -387,7 +387,7 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
 struct bridge_thread_start {
     recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top;
+    uint32_t ctx1, ctx2, stack_top, thread_id;
 };
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -407,7 +407,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
-    uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+    uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2, thread_id = s->thread_id;
 
     fprintf(stderr, "  [KERNEL] worker thread START fn=%p ctx1=0x%08X ctx2=0x%08X\n",
             (void*)fn, ctx1, ctx2);
@@ -424,9 +424,10 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_thread_stack_top = s->stack_top;
     {
         uint32_t tib = xbox_AllocThreadTib();
-        if (tib)
+        if (tib) {
             g_fs_base = tib;
-        else
+            xbox_SetThreadId(tib, thread_id);
+        } else
             fprintf(stderr, "  [KERNEL] worker thread has no TIB of its own;"
                             " it shares the main thread's\n");
     }
@@ -444,13 +445,15 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 }
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top,
+                                  uint32_t thread_id)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->thread_id = thread_id;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
@@ -562,8 +565,18 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fflush(stderr);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                    /* The id goes to the creator now (XAPI's CreateThread
+                     * stores it; Black keeps its loader thread's and compares
+                     * GetCurrentThreadId against it), and to the thread's
+                     * own KTHREAD once it starts. It used to be left unset. */
+                    uint32_t thread_id_ptr = STACK_ARG(4);
+                    uint32_t thread_id = xbox_NewThreadId();
+                    HANDLE th;
+                    if (thread_id_ptr)
+                        BRIDGE_MEM32(thread_id_ptr) = thread_id;
+                    th = bridge_spawn_thread(fn, start_context1,
+                                             start_context2, stack_top,
+                                             thread_id);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);

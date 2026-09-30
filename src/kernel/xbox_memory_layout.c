@@ -1917,6 +1917,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
         /* TLS[0x28] = pointer to RW data area */
         MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
+        /* KTHREAD+0x12C is the thread's id: XAPI's GetCurrentThreadId is
+         * `mov eax, fs:[0x28]; mov eax, [eax+0x12C]`. Zero was every thread's
+         * answer, and PsCreateSystemThreadEx handed out zero ids too. */
+        MEM32_INIT(FAKE_TLS_VA + 0x12C, XBOX_MAIN_THREAD_ID);
 
         /*
          * XBE TLS directory.
@@ -2640,18 +2644,19 @@ uint32_t xbox_AllocThreadTib(void)
 {
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
     #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
-    const uint32_t tib_size = 0x40;
-    uint32_t tib, block, thread_data, total;
+    const uint32_t tib_size = 0x40, kthread_size = 0x200;
+    uint32_t tib, block, thread_data, kthread, total;
 
     if (!g_tls_total)
         return 0;                    /* image has no TLS; nothing to copy */
 
     total = g_tls_total;
-    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size, 16);
+    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size + kthread_size, 16);
     if (!tib)
         return 0;
     block       = tib + tib_size;
     thread_data = block + total;
+    kthread     = thread_data + g_tls_thread_size;
 
     /* The TIB itself, copied so stack bounds and the fields the title filled
      * in are inherited, then the two that must not be. */
@@ -2663,7 +2668,33 @@ uint32_t xbox_AllocThreadTib(void)
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
 
+    /* Its own KTHREAD (fs:[0x28]), copied from the main thread's so every
+     * field -- TlsData at +0x28 included -- reads as before, except the id
+     * at +0x12C. With one shared KTHREAD, GetCurrentThreadId was the same on
+     * every thread, and a title that asks "am I the loader thread?" got yes
+     * everywhere: Black's model lookup (sub_001F83E0) then only accepts models
+     * from the arena being loaded, on the render thread too. */
+    memcpy(TIB_VA(kthread),
+           TIB_VA(*(uint32_t *)TIB_VA(XBOX_TIB_MAIN + 0x28)), kthread_size);
+    *(uint32_t *)TIB_VA(kthread + 0x12C) = xbox_NewThreadId();
+    *(uint32_t *)TIB_VA(tib + 0x28)      = kthread;
+
     return tib;
+    #undef TIB_VA
+}
+
+uint32_t xbox_NewThreadId(void)
+{
+    static volatile uint32_t next = XBOX_MAIN_THREAD_ID;
+    return __sync_add_and_fetch(&next, 4);
+}
+
+void xbox_SetThreadId(uint32_t tib, uint32_t id)
+{
+    #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
+    uint32_t kthread = *(uint32_t *)TIB_VA(tib + 0x28);
+    if (kthread != *(uint32_t *)TIB_VA(XBOX_TIB_MAIN + 0x28))
+        *(uint32_t *)TIB_VA(kthread + 0x12C) = id;
     #undef TIB_VA
 }
 
