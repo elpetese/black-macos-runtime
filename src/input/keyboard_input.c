@@ -416,8 +416,22 @@ int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
     /* Mouse look: right stick from accumulated mouse delta. */
     if (s_mouse_dx != 0 || s_mouse_dy != 0) {
         int sens = s_mouse_sens > 0 ? s_mouse_sens : 1800;
+        /* Start every nonzero motion just past the game's stick dead zone.
+         * Without it a slow mouse -- a few pixels per poll, a few percent of
+         * the stick -- was inside the dead zone and turned nothing, while a
+         * fast one saturated: look felt heavy. RECOMP_MOUSE_DEADZONE sets it
+         * (default 8689, the XDK's right-stick dead zone; 0 = off). */
+        static int dz = -1;
+        if (dz < 0) {
+            const char *e = getenv("RECOMP_MOUSE_DEADZONE");
+            dz = e ? atoi(e) : 8689;
+            if (dz < 0) dz = 0;
+            if (dz > 20000) dz = 20000;
+        }
         int rx = s_mouse_dx * sens;
         int ry = -s_mouse_dy * sens;
+        if (rx) rx += rx > 0 ? dz : -dz;
+        if (ry) ry += ry > 0 ? dz : -dz;
         if (rx > 32767) rx = 32767;
         if (rx < -32768) rx = -32768;
         if (ry > 32767) ry = 32767;

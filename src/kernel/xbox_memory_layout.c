@@ -920,6 +920,21 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * PUT and GET are physical; the contiguous window is the
                  * physical view. */
                 uint32_t g = *get, p = *put;
+                /* The title's stores reach us through ARM's weak ordering:
+                 * x86 guarantees the pushbuffer words it wrote are visible
+                 * before the PUT store that publishes them, the host does
+                 * not, and nothing in the translated stores fences them. Seeing
+                 * PUT early walked words from the ring's previous lap --
+                 * data read as commands, one of which jumped out of RAM.
+                 * Give the writer's store buffer a few microseconds to drain,
+                 * then fence before reading. */
+                {
+                    struct timespec t0, t;
+                    clock_gettime(CLOCK_MONOTONIC, &t0);
+                    do clock_gettime(CLOCK_MONOTONIC, &t);
+                    while ((t.tv_sec - t0.tv_sec) * 1000000000L + (t.tv_nsec - t0.tv_nsec) < 20000);
+                    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                }
                 if (s_nv2a_trace) {           /* wrapped (p < g) too */
                     extern void nv2a_pb_scan(uint32_t, uint32_t);
                     nv2a_pb_scan(XBOX_CONTIG_BASE | (g & 0x0FFFFFFFu),

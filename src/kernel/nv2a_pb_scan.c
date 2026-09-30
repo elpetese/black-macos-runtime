@@ -203,6 +203,8 @@ void xbox_PbSetInlineFilter(xbox_pb_inline_filter_fn fn)
     s_inline_filter = fn;
 }
 
+static uint32_t s_last_word;
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -222,7 +224,21 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
      * wrapped segment, dropped every command in it -- texture and shader
      * state included, which xemu's PGRAPH then used unset. */
     while (va != end_va && words < 0x100000u) {
+        /* Every pushbuffer address must lie in the 64 MB contiguous window.
+         * A word that is not a command -- data read as one -- can carry a
+         * JUMP/CALL target anywhere in 256 MB; following it read unmapped
+         * memory and took the process down (SIGBUS at 0x8F30DE84). Drop the
+         * rest of this segment instead, and say where it went wrong. */
+        if (va < 0x80000000u || va >= 0x84000000u) {
+            static unsigned bad;
+            if (bad++ < 8)
+                fprintf(stderr, "[PB] address %08X outside RAM (segment %08X..%08X,"
+                        " %u words in, %u jumps, last word %08X); segment dropped\n",
+                        va, start_va, end_va, words, jumps, s_last_word);
+            break;
+        }
         uint32_t w = *(const uint32_t *)(mem + va);
+        s_last_word = w;
         va += 4;
         words++;
 

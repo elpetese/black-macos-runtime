@@ -397,8 +397,34 @@ static void complete_flip(NV2AState *d)
                     s_z.clear_param, s_z.zclear_value);
         memset(&s_z, 0, sizeof s_z);
     }
-    pgraph_gl_download_dirty_surfaces(d);
+    /* RECOMP_NO_FLIP_DOWNLOAD=1: skip reading every dirty surface back to
+     * guest RAM at each flip. Each readback drains the GPU; with the picture
+     * taken from GL (capture_hires) nothing needs them there, and xemu still
+     * downloads a surface when it is rebound elsewhere or blitted. */
+    static int no_dl = -1;
+    if (no_dl < 0) no_dl = CGETENV("RECOMP_NO_FLIP_DOWNLOAD") != NULL;
+    if (!no_dl)
+        pgraph_gl_download_dirty_surfaces(d);
     capture_hires(d);
+    /* RECOMP_FPSLOG=1: game frames per second (flips), every 2 s, with the
+     * slowest frame of the window -- stutter shows there, not in the mean. */
+    if (CGETENV("RECOMP_FPSLOG")) {
+        static struct timespec t0, tl;
+        static unsigned n;
+        static double worst;
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        if (t0.tv_sec == 0) { t0 = t; tl = t; }
+        double dt = (t.tv_sec - tl.tv_sec) * 1e3 + (t.tv_nsec - tl.tv_nsec) / 1e6;
+        if (dt > worst) worst = dt;
+        tl = t;
+        n++;
+        double span = (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9;
+        if (span >= 2.0) {
+            fprintf(stderr, "[FPS] %.1f fps, slowest frame %.0f ms\n", n / span, worst);
+            t0 = t; n = 0; worst = 0;
+        }
+    }
     if (CGETENV("RECOMP_XEMU_VERBOSE")) {
         static unsigned flips;
         if ((flips++ % 100) == 0) {

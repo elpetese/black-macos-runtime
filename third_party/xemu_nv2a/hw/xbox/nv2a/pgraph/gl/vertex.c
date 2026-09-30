@@ -46,8 +46,26 @@ static void update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size,
     size = end - addr;
     if (memory_region_test_and_clear_dirty(d->vram, addr, size,
                                            DIRTY_MEMORY_NV2A)) {
-        glBufferSubData(GL_ARRAY_BUFFER, addr, size,
-                        d->vram_ptr + addr);
+        /* RECOMP_GL_UNSYNC=1: write through an unsynchronised mapping.
+         * On Apple's GL-over-Metal a glBufferSubData into this buffer while
+         * earlier draws still read it is a blit, which ends the render pass
+         * and costs a fresh command buffer per draw. Memory is unified, so
+         * the map is a pointer into the same pages. */
+        static int unsync = -1;
+        if (unsync < 0)
+            unsync = getenv("RECOMP_GL_UNSYNC") && getenv("RECOMP_GL_UNSYNC")[0] == '1';
+        void *p = unsync ? glMapBufferRange(GL_ARRAY_BUFFER, addr, size,
+                                            GL_MAP_WRITE_BIT |
+                                            GL_MAP_UNSYNCHRONIZED_BIT |
+                                            GL_MAP_INVALIDATE_RANGE_BIT)
+                         : NULL;
+        if (p) {
+            memcpy(p, d->vram_ptr + addr, size);
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+        } else {
+            glBufferSubData(GL_ARRAY_BUFFER, addr, size,
+                            d->vram_ptr + addr);
+        }
         nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_1);
     }
 }
