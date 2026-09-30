@@ -1912,8 +1912,9 @@ class Lifter:
                     f" _fbs = (int32_t){sx}(_fb);"
                     f" /* {m} source, before the write */")
         dst = _fmt_operand_read(ops[0])
+        fz = " _fz = (_fa == 0);" if self.needs_fz else ""
         return (f"_fa = (uint32_t)({dst}) & {mask};"
-                f" _fas = (int32_t){sx}(_fa); /* {m} result */")
+                f" _fas = (int32_t){sx}(_fa);{fz} /* {m} result */")
 
     def _lift_alu_binop(self, insn, ops, m):
         if len(ops) < 2:
@@ -1960,7 +1961,9 @@ class Lifter:
         mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
         overflow_result = (1 << (size * 8 - 1)) - (m == "dec")
         out += [f"_fa = (uint32_t)({val}) & {mask};",
-                f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); /* {m} result/SF/OF; CF unchanged */"]
+                f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u);"
+                + (" _fz = (_fa == 0);" if self.needs_fz else "")
+                + f" /* {m} result/SF/OF; CF unchanged */"]
         return out
 
     def _lift_neg(self, insn, ops, preserve_carry=False):

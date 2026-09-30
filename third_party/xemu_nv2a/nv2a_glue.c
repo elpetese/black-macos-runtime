@@ -233,6 +233,7 @@ extern uint32_t xbox_ContiguousAllocatedBytes(void);
  * enemy's weapon is submitted at all. */
 static int s_dump_frame;
 static int s_dump_idx;
+static int s_dump_serial;
 
 static int drawlog_this_frame(void)
 {
@@ -410,6 +411,18 @@ static void complete_flip(NV2AState *d)
     pgraph_reg_w(pg, NV_PGRAPH_SURFACE, s);
     pg->waiting_for_flip = false;
     s_flips++;
+    {   /* RECOMP_FLIPFILE=<path>: the flip count, for tools that pace by frames */
+        static int fd = -2;
+        if (fd == -2) {
+            const char *pth = CGETENV("RECOMP_FLIPFILE");
+            fd = pth ? open(pth, O_CREAT | O_WRONLY | O_TRUNC, 0644) : -1;
+        }
+        if (fd >= 0) {
+            char b[16];
+            int n = snprintf(b, sizeof b, "%10u\n", s_flips);
+            pwrite(fd, b, (size_t)n, 0);
+        }
+    }
     if (s_dump_frame) {
         s_dump_frame = 0;
         fprintf(stderr, "[XDRAW] ===== end of dumped frame (%d draws) =====\n", s_dump_idx);
@@ -427,6 +440,7 @@ static void complete_flip(NV2AState *d)
         unlink("/tmp/black_dump");
         s_dump_frame = 1;
         s_dump_idx = 0;
+        s_dump_serial++;
         fprintf(stderr, "[XDRAW] ===== dumping frame after flip %u t=%.3f =====\n", s_flips, wall_now());
     }
     if (s_frame_draws > 300)
@@ -633,6 +647,71 @@ int xnv2a_method(uint32_t subch, uint32_t method, uint32_t param,
                     }
                 fprintf(stderr, "\n        skinned: first=%u verts=%u pos bbox x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f] bad=%u | vsh consts nan=%u inf=%u\n",
                         first, seen, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], bad, cn, ci);
+                {
+                    /* Everything needed to judge this draw offline: pipeline
+                     * state, the vertex program (once per distinct program),
+                     * a sample of raw vertices, and the vertex-program
+                     * constants that differ from the previous skinned draw of
+                     * this frame (the first draw prints all of the non-zero
+                     * ones). The bone matrix of each piece -- and of a
+                     * weapon -- is in that difference. */
+                    static uint32_t prev_c[NV2A_VERTEXSHADER_CONSTANTS][4];
+                    static int have_prev, last_dump_id = -1;
+                    static uint32_t last_prog_hash;
+                    if (last_dump_id != s_dump_serial) {
+                        last_dump_id = s_dump_serial;
+                        have_prev = 0;
+                    }
+                    fprintf(stderr, "        state: setupraster=%08X ctl0=%08X ctl1=%08X ctl2=%08X ctl3=%08X zcomp=%08X\n",
+                            pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER), pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0),
+                            pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1), pgraph_reg_r(pg, NV_PGRAPH_CONTROL_2),
+                            pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3), pgraph_reg_r(pg, NV_PGRAPH_ZCOMPRESSOCCLUDE));
+                    {
+                        uint32_t h = 2166136261u;
+                        for (int q = 0; q < NV2A_MAX_TRANSFORM_PROGRAM_LENGTH; q++)
+                            for (int c = 0; c < VSH_TOKEN_SIZE; c++)
+                                h = (h ^ pg->program_data[q][c]) * 16777619u;
+                        if (h != last_prog_hash) {
+                            last_prog_hash = h;
+                            fprintf(stderr, "        vsh-program hash=%08X:", h);
+                            for (int q = 0; q < NV2A_MAX_TRANSFORM_PROGRAM_LENGTH; q++) {
+                                if (!(pg->program_data[q][0] | pg->program_data[q][1] |
+                                      pg->program_data[q][2] | pg->program_data[q][3]))
+                                    continue;
+                                fprintf(stderr, "\n          [%3d] %08X %08X %08X %08X", q,
+                                        pg->program_data[q][0], pg->program_data[q][1],
+                                        pg->program_data[q][2], pg->program_data[q][3]);
+                            }
+                            fprintf(stderr, "\n");
+                        } else {
+                            fprintf(stderr, "        vsh-program hash=%08X (same)\n", h);
+                        }
+                    }
+                    fprintf(stderr, "        consts%s:", have_prev ? " (changed)" : " (all nonzero)");
+                    for (int q = 0; q < NV2A_VERTEXSHADER_CONSTANTS; q++) {
+                        int diff = have_prev ? memcmp(prev_c[q], pg->vsh_constants[q], 16) != 0
+                                             : (pg->vsh_constants[q][0] | pg->vsh_constants[q][1] |
+                                                pg->vsh_constants[q][2] | pg->vsh_constants[q][3]) != 0;
+                        if (diff) {
+                            float f[4];
+                            memcpy(f, pg->vsh_constants[q], 16);
+                            fprintf(stderr, " c%d=[%g,%g,%g,%g]", q, f[0], f[1], f[2], f[3]);
+                        }
+                    }
+                    fprintf(stderr, "\n");
+                    memcpy(prev_c, pg->vsh_constants, sizeof prev_c);
+                    have_prev = 1;
+                    /* four raw vertices, all bytes of the first stride */
+                    for (unsigned k = 0; k < 4 && k < nv; k++) {
+                        unsigned vi = dd_arrays ? first + k : pg->inline_elements[k];
+                        const uint8_t *vp = d->vram_ptr +
+                            ((v0->offset + (uint64_t)vi * v0->stride) & 0x03FFFFFF);
+                        fprintf(stderr, "        vtx[%u] idx=%u:", k, vi);
+                        for (unsigned b = 0; b < v0->stride && b < 48; b += 4)
+                            fprintf(stderr, " %08X", *(const uint32_t *)(vp + b));
+                        fprintf(stderr, "\n");
+                    }
+                }
             }
         }
         fprintf(stderr, "\n        comb: ci0=%08X co0=%08X ai0=%08X ao0=%08X f0=%08X sf0=%08X sf1=%08X ci1=%08X ai1=%08X\n",

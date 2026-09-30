@@ -77,6 +77,18 @@ def test_cmp_and_test_state_merge_marker():
     m = _incoming_flag_state([1, 2], known, False)
     assert m is not None and m[0] == '__zf_from_snapshot'
     assert _incoming_flag_state([1, 1], known, False) == ('cmp', a)
-    # Different widths stay unknown.
+    # Different widths join too: each cmp/test writes _fz at its own width.
+    # Black's sub_001DB910: `cmp ax, [edx+0x40]` (16-bit) on one path,
+    # `test al, al` (8-bit, normalised to cmp al, 0) on the other, then je.
     narrow = [Operand(type='reg', reg='al'), Operand(type='reg', reg='al')]
-    assert _incoming_flag_state([1, 3], {1: ('cmp', a), 3: ('test', narrow)}, False) is None
+    m = _incoming_flag_state([1, 3], {1: ('cmp', a), 3: ('test', narrow)}, False)
+    assert m is not None and m[0] == '__zf_from_snapshot'
+    word = [Operand(type='reg', reg='ax'), Operand(type='mem', mem_base='edx', mem_disp=0x40, mem_size=2)]
+    byte0 = [Operand(type='reg', reg='al'), Operand(type='imm', imm=0)]
+    m = _incoming_flag_state([1, 2], {1: ('cmp', word), 2: ('cmp', byte0)}, False)
+    assert m is not None and m[0] == '__zf_from_snapshot'
+    # An arithmetic setter joins too (it writes _fz from its result)...
+    m = _incoming_flag_state([1, 2], {1: ('cmp', a), 2: ('sub', a)}, False)
+    assert m is not None and m[0] == '__zf_from_snapshot'
+    # ...but a setter that does not write _fz keeps the join unknown.
+    assert _incoming_flag_state([1, 2], {1: ('cmp', a), 2: ('bt', a)}, False) is None

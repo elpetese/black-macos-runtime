@@ -82,15 +82,19 @@ def _merge_snapshot_zero_flag(states):
     if not states or any(not st or len(st) != 2 or not isinstance(st[0], str)
                          for st in states):
         return None
-    widths = set()
+    from .lifter import ZF_FROM_DEST
     for kind, ops in states:
-        if kind not in ("cmp", "test") or len(ops) != 2:
+        if kind in ("cmp", "test"):
+            if len(ops) != 2:
+                return None
+        elif kind not in ZF_FROM_DEST or not ops:
+            # add/sub/and/.../inc/dec write _fz from their result too (the
+            # lifter's _result_snapshot); anything else leaves it stale.
             return None
-        widths.add(_operand_width(ops[0]) or _operand_width(ops[1]))
-    if len(widths) != 1 or None in widths:
-        return None
-    if len({kind for kind, _ in states}) < 2:
-        return None
+    # Widths need not agree: each cmp/test evaluates ZF at its own width into
+    # _fz. Requiring them equal left Black's sub_001DB910 -- `cmp ax, [edx+0x40]`
+    # (16-bit) on one path and `test al, al` on the other, joined at a je --
+    # on the never-assigned _flags, so that branch never fired.
     # ops stay a plain operand list (the first path's), which the clobber
     # snapshot and the rest of the lifter read; the marker itself is what
     # _make_condition answers je/jne from, via _fz.
@@ -2211,9 +2215,13 @@ class FunctionTranslator:
         # could join at a je/jne: a function with both kinds of compare and a
         # zero-flag branch. Everywhere else the ordinary condition is exact.
         kinds = {insn.mnemonic for insn in instructions}
-        has_fz = ("cmp" in kinds and "test" in kinds
-                  and any(insn.mnemonic in ("je", "jz", "jne", "jnz")
-                          for insn in instructions))
+        # Any function with a zero-flag branch: a join of two different
+        # setters -- cmp/test, or those with an arithmetic result (Black's
+        # sub_00102460 joins `sub ecx, 2` and `cmp edi, 0x40000` at one je) --
+        # reads ZF from here. Dead stores where nothing joins are free after
+        # the compiler.
+        has_fz = any(insn.mnemonic in ("je", "jz", "jne", "jnz")
+                     for insn in instructions)
         if has_fz:
             lines.append("    int _fz = 0; (void)_fz;")
         self.lifter.needs_fz = has_fz

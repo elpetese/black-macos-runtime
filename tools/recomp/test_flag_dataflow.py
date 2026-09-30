@@ -64,7 +64,10 @@ class FlagDataflowTest(unittest.TestCase):
         code = _translate(_loop("49"))           # dec ecx
         je = [l for l in code.splitlines() if "/* je" in l]
         self.assertEqual(len(je), 1, code)
-        self.assertIn("_flags", je[0])
+        # Different destinations: neither (eax == 0) nor (ecx == 0) answers
+        # for both edges, but _fz -- written by each setter -- does.
+        self.assertIn("_fz", je[0])
+        self.assertNotIn("_flags", je[0])
         self.assertNotIn("(eax == 0)", je[0])
         self.assertNotIn("(ecx == 0)", je[0])
 
