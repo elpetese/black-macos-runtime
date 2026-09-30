@@ -15,6 +15,7 @@
 #include "xnv2a.h"
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 /* getenv once per call site. These run per pushbuffer method -- millions of
  * times a second -- and each getenv walks the environment under a lock: 12% of
@@ -275,7 +276,40 @@ static size_t s_hr_cap;
 static uint32_t s_hr_w, s_hr_h, s_hr_stride;
 static uint64_t s_hr_seq;
 
+static double wall_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* RECOMP_EVIDENCE=<dir>: keep a rolling set of screenshots of the game
+ * (every RECOMP_EVIDENCE_EVERY flips, default 120, i.e. about 2 s), each
+ * shrunk to half size, in <dir>/shot_NNN.bmp with the newest overwriting the
+ * oldest after 180. Each shot is announced in the log as
+ *   [EVID] slot=N t=<unix seconds> flip=F
+ * so it can be lined up with the pad log and the draw dumps. */
+static uint32_t s_hr_seq_prev;
+static void evidence_shot(unsigned flips);
+static void capture_hires(NV2AState *d);
+
+static void capture_hires_impl(NV2AState *d);
 static void capture_hires(NV2AState *d)
+{
+    capture_hires_impl(d);
+    {
+        const char *dir = CGETENV("RECOMP_EVIDENCE");
+        if (dir) {
+            const char *e = CGETENV("RECOMP_EVIDENCE_EVERY");
+            unsigned every = e ? (unsigned)atoi(e) : 120;
+            if (every < 1) every = 120;
+            if ((s_flips % every) == 0)
+                evidence_shot(s_flips);
+        }
+    }
+}
+
+static void capture_hires_impl(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     unsigned scale = pg->surface_scale_factor;
@@ -381,11 +415,19 @@ static void complete_flip(NV2AState *d)
         fprintf(stderr, "[XDRAW] ===== end of dumped frame (%d draws) =====\n", s_dump_idx);
         fflush(stderr);
     }
+    {
+        /* RECOMP_DRAWDUMP_EVERY=<flips>: also dump one frame's draws that
+         * often, without being asked. */
+        const char *ev = CGETENV("RECOMP_DRAWDUMP_EVERY");
+        unsigned every = ev ? (unsigned)atoi(ev) : 0;
+        if (every && (s_flips % every) == 0 && !s_dump_frame)
+            close(open("/tmp/black_dump", O_CREAT | O_WRONLY, 0644));
+    }
     if (CGETENV("RECOMP_DRAWDUMP") && access("/tmp/black_dump", F_OK) == 0) {
         unlink("/tmp/black_dump");
         s_dump_frame = 1;
         s_dump_idx = 0;
-        fprintf(stderr, "[XDRAW] ===== dumping frame after flip %u =====\n", s_flips);
+        fprintf(stderr, "[XDRAW] ===== dumping frame after flip %u t=%.3f =====\n", s_flips, wall_now());
     }
     if (s_frame_draws > 300)
         s_big_frames++;
@@ -660,6 +702,55 @@ uint32_t xnv2a_pgraph_reg(uint32_t offset)
 }
 
 /* Frames presented so far; the hang monitor's sign of life. */
+static void evidence_shot(unsigned flips)
+{
+    static int slot;
+    const char *dir = CGETENV("RECOMP_EVIDENCE");
+    char path[600];
+    uint32_t w, h, stride;
+    const uint8_t *px;
+    FILE *f;
+
+    pthread_mutex_lock(&s_hr_lock);
+    px = s_hr_front;
+    w = s_hr_w; h = s_hr_h; stride = s_hr_stride;
+    if (!px || !w || !h) {
+        pthread_mutex_unlock(&s_hr_lock);
+        return;
+    }
+    {
+        uint32_t ow = w / 2, oh = h / 2, rowb = (ow * 3 + 3) & ~3u;
+        uint32_t size = 54 + rowb * oh;
+        uint8_t hdr[54] = { 'B', 'M' };
+        uint8_t *row = malloc(rowb);
+        snprintf(path, sizeof path, "%s/shot_%03d.bmp", dir, slot);
+        f = row ? fopen(path, "wb") : NULL;
+        if (f) {
+            memcpy(hdr + 2, &size, 4);
+            hdr[10] = 54; hdr[14] = 40;
+            memcpy(hdr + 18, &ow, 4);
+            memcpy(hdr + 22, &oh, 4);
+            hdr[26] = 1; hdr[28] = 24;
+            fwrite(hdr, 1, 54, f);
+            for (uint32_t y = 0; y < oh; y++) {   /* BMP rows run bottom-up */
+                const uint8_t *r0 = px + (size_t)(2 * (oh - 1 - y)) * stride;
+                const uint8_t *r1 = r0 + stride;
+                memset(row, 0, rowb);
+                for (uint32_t x = 0; x < ow; x++)
+                    for (int c = 0; c < 3; c++)
+                        row[x * 3 + c] = (uint8_t)((r0[(2 * x) * 4 + c] + r0[(2 * x + 1) * 4 + c] +
+                                                    r1[(2 * x) * 4 + c] + r1[(2 * x + 1) * 4 + c]) / 4);
+                fwrite(row, 1, rowb, f);
+            }
+            fclose(f);
+            fprintf(stderr, "[EVID] slot=%d t=%.3f flip=%u\n", slot, wall_now(), flips);
+            slot = (slot + 1) % 180;
+        }
+        free(row);
+    }
+    pthread_mutex_unlock(&s_hr_lock);
+}
+
 unsigned xnv2a_flip_count(void)
 {
     return s_flips;
