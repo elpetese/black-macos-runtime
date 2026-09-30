@@ -363,6 +363,43 @@ int xbox_KeyboardMergeState(XBOX_GAMEPAD *pad)
         return 0;
 
     t = now_ms();
+    /* RECOMP_INPUT_FILE=<path>: live input for driving a run from outside.
+     * The file holds lines "button[+button...] hold_ms" (same names as
+     * RECOMP_INPUT_SCRIPT); each poll that finds it presses those buttons
+     * from now and deletes it. */
+    {
+        static const char *path = (const char *)1;
+        if (path == (const char *)1)
+            path = getenv("RECOMP_INPUT_FILE");
+        if (path) {
+            FILE *f = fopen(path, "r");
+            if (f) {
+                char line[256];
+                while (fgets(line, sizeof line, f)) {
+                    char *sp = strrchr(line, ' ');
+                    unsigned long hold = TAP_MS;
+                    char *q = line;
+                    if (sp) { hold = strtoul(sp + 1, NULL, 10); *sp = 0; }
+                    line[strcspn(line, "\r\n")] = 0;
+                    while (*q) {
+                        size_t len = strcspn(q, "+");
+                        int slot = slot_named(q, len);
+                        if (slot >= 0) {
+                            pthread_mutex_lock(&s_lock);
+                            s_until[slot] = t + hold;
+                            pthread_mutex_unlock(&s_lock);
+                        } else if (len) {
+                            fprintf(stderr, "  Keyboard: unknown button \"%.*s\" in RECOMP_INPUT_FILE\n", (int)len, q);
+                        }
+                        q += len;
+                        if (*q == '+') q++;
+                    }
+                }
+                fclose(f);
+                unlink(path);
+            }
+        }
+    }
     pthread_mutex_lock(&s_lock);
     for (i = 0; i < K_COUNT; i++)
         down[i] = s_until[i] > t;
