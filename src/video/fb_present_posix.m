@@ -902,17 +902,26 @@ static void xek_capture_mouse(BOOL on)
 
 /* ── Keyboard input ─────────────────────────────────────────── */
 
-/* Shift is a modifier: it produces flagsChanged, not keyDown. Left or right
- * Shift is the left-stick click (run), held for as long as it is down. */
+/* Shift and Ctrl are modifiers: they produce flagsChanged, not keyDown.
+ * Shift is the right-stick click (precision aim) and Ctrl is B (crouch),
+ * each held for as long as it is down. */
 - (void)flagsChanged:(NSEvent *)event
 {
     unsigned short code = [event keyCode];
-    if (getenv("RECOMP_BACKGROUND") || (code != 56 && code != 60))
+    NSEventModifierFlags mf = [event modifierFlags];
+    if (getenv("RECOMP_BACKGROUND"))
         return;
-    if ([event modifierFlags] & NSEventModifierFlagShift)
-        xbox_KeyboardPressSlot(K_LTHUMB);
-    else
-        xbox_KeyboardReleaseSlot(K_LTHUMB);
+    if (code == 56 || code == 60) {          /* kVK_Shift, kVK_RightShift */
+        if (mf & NSEventModifierFlagShift)
+            xbox_KeyboardPressSlot(K_RTHUMB);
+        else
+            xbox_KeyboardReleaseSlot(K_RTHUMB);
+    } else if (code == 59 || code == 62) {   /* kVK_Control, kVK_RightControl */
+        if (mf & NSEventModifierFlagControl)
+            xbox_KeyboardPressSlot(K_B);
+        else
+            xbox_KeyboardReleaseSlot(K_B);
+    }
 }
 - (void)keyDown:(NSEvent *)event  { [self xek_handleKey:event down:YES]; }
 - (void)keyUp:(NSEvent *)event    { [self xek_handleKey:event down:NO]; }
@@ -945,19 +954,6 @@ static void xek_capture_mouse(BOOL on)
         } else {
             xbox_KeyboardReleaseSlot(K_START);
         }
-        return;
-    }
-
-    /* Ctrl + key: map Ctrl to crouch (B). */
-    if (down && ([event modifierFlags] & NSEventModifierFlagControl)) {
-        unichar u = [chars characterAtIndex:0];
-        if (u == 'c' || u == 'C') {
-            xbox_KeyboardPressSlot(K_B);
-            return;
-        }
-    }
-    if (!down && ([event modifierFlags] & NSEventModifierFlagControl)) {
-        xbox_KeyboardReleaseSlot(K_B);
         return;
     }
 
@@ -1060,12 +1056,14 @@ static void xek_capture_mouse(BOOL on)
     xbox_MousePressButton(K_MOUSE_LEFT);
 }
 - (void)rightMouseDown:(NSEvent *)event { xbox_MousePressButton(K_MOUSE_RIGHT); }
+/* Middle button = Y (weapon), like the wheel; the side buttons = White
+ * (grenade). */
 - (void)otherMouseDown:(NSEvent *)event
 {
     if ([event buttonNumber] == 2)
         xbox_MousePressButton(K_MOUSE_WHEEL_UP);
-    else if ([event buttonNumber] == 3)
-        xbox_MousePressButton(K_MOUSE_WHEEL_DOWN);
+    else if ([event buttonNumber] >= 3)
+        xbox_KeyboardPressSlot(K_WHITE);
 }
 - (void)mouseUp:(NSEvent *)event     { xbox_MouseReleaseButton(K_MOUSE_LEFT); }
 - (void)rightMouseUp:(NSEvent *)event { xbox_MouseReleaseButton(K_MOUSE_RIGHT); }
@@ -1073,8 +1071,8 @@ static void xek_capture_mouse(BOOL on)
 {
     if ([event buttonNumber] == 2)
         xbox_MouseReleaseButton(K_MOUSE_WHEEL_UP);
-    else if ([event buttonNumber] == 3)
-        xbox_MouseReleaseButton(K_MOUSE_WHEEL_DOWN);
+    else if ([event buttonNumber] >= 3)
+        xbox_KeyboardReleaseSlot(K_WHITE);
 }
 - (void)scrollWheel:(NSEvent *)event
 {

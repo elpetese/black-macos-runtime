@@ -129,25 +129,26 @@ static int key_slot(unsigned char c)
     switch (c) {
     case '\r': case '\n':      return K_START;
     case '\t': case 0x7F: case 0x08: return K_BACK;
-    /* The layout the Critical Hour port used, so both games play the same:
-     *   Space / E  A          C  B          R  X (reload)     Q  Y (weapon)
-     *   F  Black   G  White   Z  right-stick click
-     *   1 2 3 4    d-pad up / right / down / left
-     * plus V = left trigger and X = B kept as extras (no clash), WASD left
-     * stick, I/J/K/L right stick, H left-stick click, Shift = left-stick click
-     * (run; handled by the window), arrows d-pad, Enter Start, Tab Back. */
+    /* PC FPS layout (Ctrl, Shift and the side mouse buttons are handled by
+     * the window):
+     *   E / Space  A (use)        C / Ctrl  B (crouch)      R  X (reload)
+     *   1 / 2 / Q / wheel  Y (weapon)   G / side mouse button  White (grenade)
+     *   F / V  Black (melee)      B / X / H  left-stick click (fire mode)
+     *   Shift / Z  right-stick click (precision aim)
+     *   arrows, 3 (down), 4 (left)  d-pad    Esc / Enter  Start    Tab  Back
+     * plus WASD left stick, mouse or I/J/K/L right stick. */
     case ' ':                  return K_A;
     case 'e': case 'E':        return K_A;
     case 'c': case 'C':        return K_B;
-    case 'x': case 'X':        return K_B;
     case 'r': case 'R':        return K_X;
     case 'q': case 'Q':        return K_Y;
-    case 'f': case 'F':        return K_BLACK;
+    case '1': case '2':        return K_Y;
     case 'g': case 'G':        return K_WHITE;
-    case 'v': case 'V':        return K_LT;
+    case 'f': case 'F':        return K_BLACK;
+    case 'v': case 'V':        return K_BLACK;
+    case 'b': case 'B':        return K_LTHUMB;
+    case 'x': case 'X':        return K_LTHUMB;
     case 'z': case 'Z':        return K_RTHUMB;
-    case '1':                  return K_UP;
-    case '2':                  return K_RIGHT;
     case '3':                  return K_DOWN;
     case '4':                  return K_LEFT;
     case 'w': case 'W':        return K_LS_UP;
@@ -209,9 +210,9 @@ static void start_tty(void)
     pthread_detach(th);
     s_active = 1;
     fprintf(stderr, "  Keyboard: WASD move, mouse or IJKL look, click = fire, "
-                    "right click = aim, wheel = weapon, Space/E A, C B, "
-                    "R reload, Q weapon, F Black, G White, Shift run, "
-                    "1-4 d-pad, Enter Start, Esc = release mouse + Start\n");
+                    "right click = aim, wheel/1/2 = weapon, E use, C/Ctrl "
+                    "crouch, R reload, G grenade, F/V melee, B/X fire mode, "
+                    "Shift precision aim, Esc pause, Tab objectives\n");
 }
 
 static int slot_named(const char *name, size_t len)
