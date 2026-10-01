@@ -74,6 +74,10 @@ static GLuint create_gl_shader(GLenum gl_shader_type,
     compiled = 0;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
     if (!compiled) {
+#ifdef XBOXRECOMP_ANGLE
+        fprintf(stderr, "[ANGLE] shader %s handle %u GL error 0x%x\n",
+                name, shader, glGetError());
+#endif
         GLchar* log;
         GLint log_length;
         glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &log_length);

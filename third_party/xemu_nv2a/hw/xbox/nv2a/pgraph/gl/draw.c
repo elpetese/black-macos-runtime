@@ -378,6 +378,43 @@ void pgraph_gl_draw_end(NV2AState *d)
     NV2A_GL_DGROUP_END();
 }
 
+#ifdef XBOXRECOMP_ANGLE
+/* Quads as indexed triangles: (v0 v1 v2) (v0 v2 v3) per quad, from the
+ * guest's element list or from consecutive vertices starting at `first`. */
+static void angle_draw_quads(const uint32_t *elements, GLint first,
+                             GLsizei count)
+{
+    static GLuint ebo;
+    static uint32_t *buf;
+    static size_t cap;
+    size_t n = (size_t)(count / 4) * 6;
+
+    if (!n) {
+        return;
+    }
+    if (n > cap) {
+        buf = g_realloc(buf, n * sizeof(*buf));
+        cap = n;
+    }
+    for (GLsizei q = 0; q < count / 4; q++) {
+        uint32_t v[4], *o = buf + q * 6;
+        for (int j = 0; j < 4; j++) {
+            v[j] = elements ? elements[q * 4 + j] : (uint32_t)(first + q * 4 + j);
+        }
+        o[0] = v[0]; o[1] = v[1]; o[2] = v[2];
+        o[3] = v[0]; o[4] = v[2]; o[5] = v[3];
+    }
+    if (!ebo) {
+        glGenBuffers(1, &ebo);
+    }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, n * sizeof(*buf), buf,
+                 GL_STREAM_DRAW);
+    glDrawElements(GL_TRIANGLES, n, GL_UNSIGNED_INT, (void *)0);
+}
+#define ANGLE_QUADS(r) ((r)->shader_binding->gl_primitive_mode == GL_LINES_ADJACENCY)
+#endif
+
 void pgraph_gl_flush_draw(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -399,6 +436,14 @@ void pgraph_gl_flush_draw(NV2AState *d)
                                       pg->draw_arrays_max_count - 1,
                                       false, 0,
                                       pg->draw_arrays_max_count - 1);
+#ifdef XBOXRECOMP_ANGLE
+        if (ANGLE_QUADS(r)) {
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                angle_draw_quads(NULL, pg->draw_arrays_start[i],
+                                 pg->draw_arrays_count[i]);
+            }
+        } else
+#endif
         glMultiDrawArrays(r->shader_binding->gl_primitive_mode,
                           pg->draw_arrays_start,
                           pg->draw_arrays_count,
@@ -420,6 +465,13 @@ void pgraph_gl_flush_draw(NV2AState *d)
                 d, min_element, max_element, false, 0,
                 pg->inline_elements[pg->inline_elements_length - 1]);
 
+#ifdef XBOXRECOMP_ANGLE
+        if (ANGLE_QUADS(r)) {
+            angle_draw_quads(pg->inline_elements, 0,
+                             pg->inline_elements_length);
+            return;
+        }
+#endif
         VertexKey k;
         memset(&k, 0, sizeof(VertexKey));
         k.count = pg->inline_elements_length;
@@ -474,6 +526,11 @@ void pgraph_gl_flush_draw(NV2AState *d)
             }
         }
 
+#ifdef XBOXRECOMP_ANGLE
+        if (ANGLE_QUADS(r)) {
+            angle_draw_quads(NULL, 0, pg->inline_buffer_length);
+        } else
+#endif
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, pg->inline_buffer_length);
     } else if (pg->inline_array_length) {
@@ -481,6 +538,11 @@ void pgraph_gl_flush_draw(NV2AState *d)
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ARRAYS);
 
         unsigned int index_count = pgraph_gl_bind_inline_array(d);
+#ifdef XBOXRECOMP_ANGLE
+        if (ANGLE_QUADS(r)) {
+            angle_draw_quads(NULL, 0, index_count);
+        } else
+#endif
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, index_count);
     } else {

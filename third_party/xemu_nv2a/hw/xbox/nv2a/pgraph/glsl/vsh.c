@@ -202,18 +202,18 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         "vec4 oT3 = vec4(0.0,0.0,0.0,1.0);\n"
         "\n"
         "vec4 decompress_11_11_10(int cmp) {\n"
-        "    float x = float(bitfieldExtract(cmp, 0,  11)) / 1023.0;\n"
-        "    float y = float(bitfieldExtract(cmp, 11, 11)) / 1023.0;\n"
-        "    float z = float(bitfieldExtract(cmp, 22, 10)) / 511.0;\n"
+        "    float x = float((cmp << 21) >> 21) / 1023.0;\n"
+        "    float y = float((cmp << 10) >> 21) / 1023.0;\n"
+        "    float z = float(cmp >> 22) / 511.0;\n"
         "    return vec4(x, y, z, 1);\n"
         "}\n"
         "\n"
         // Clamp to range [2^(-64), 2^64] or [-2^64, -2^(-64)].
         "float clampAwayZeroInf(float t) {\n"
-        "  if (t > 0.0 || floatBitsToUint(t) == 0) {\n"
-        "    t = clamp(t, uintBitsToFloat(0x1F800000), uintBitsToFloat(0x5F800000));\n"
+        "  if (t > 0.0 || floatBitsToUint(t) == 0u) {\n"
+        "    t = clamp(t, uintBitsToFloat(0x1F800000u), uintBitsToFloat(0x5F800000u));\n"
         "  } else {\n"
-        "    t = clamp(t, uintBitsToFloat(0xDF800000), uintBitsToFloat(0x9F800000));\n"
+        "    t = clamp(t, uintBitsToFloat(0xDF800000u), uintBitsToFloat(0x9F800000u));\n"
         "  }\n"
         "  return t;\n"
         "}\n"
@@ -305,7 +305,7 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
             VSH_VERSION_XVS, (uint32_t *)state->programmable.program_data,
             state->programmable.program_length, header, body);
         if (!state->point_params_enable) {
-            mstring_append_fmt(body, "  oPts.x = %f * %d;\n",
+            mstring_append_fmt(body, "  oPts.x = %f * %d.0;\n",
                                state->point_size <= 0.f ? 1.f :
                                                           state->point_size,
                                state->surface_scale_factor);
@@ -405,7 +405,11 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
                    "  vtxT1 = oT1;\n"
                    "  vtxT2 = oT2;\n"
                    "  vtxT3 = oT3;\n"
+#ifdef XBOXRECOMP_ANGLE
+                   "  vtxPos0 = vec4(vtxPos.z * vtxPos.w, vtxPos.w, 0.0, 0.0);\n"
+#else
                    "  vtxPos0 = vtxPos;\n"
+#endif
                    "  vtxPos1 = vtxPos;\n"
                    "  vtxPos2 = vtxPos;\n"
                    "  triMZ = 0.0;\n"

@@ -121,7 +121,11 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             gl_type = GL_UNSIGNED_BYTE;
             gl_normalize = GL_TRUE;
             // http://www.opengl.org/registry/specs/ARB/vertex_array_bgra.txt
+#ifdef XBOXRECOMP_ANGLE
+            gl_count = 4; /* GLES vertex array size has no BGRA token. */
+#else
             gl_count = GL_BGRA;
+#endif
             break;
         case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL:
             gl_type = GL_UNSIGNED_BYTE;
@@ -173,9 +177,34 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             attrib_data_addr = attr_data + attr->offset - d->vram_ptr;
             stride = attr->stride;
             start = attrib_data_addr + min_element * stride;
+#ifdef XBOXRECOMP_ANGLE
+            /* ANGLE's Metal backend answers a glBufferSubData into a buffer
+             * the GPU still reads by copying the whole buffer into a new
+             * one; on the VRAM-sized memory buffer that stalls every draw
+             * on waitUntilCompleted. Give each attribute a fresh buffer
+             * holding just this draw's vertices instead. Indices stay
+             * absolute, so the buffer spans element 0 to max_element and
+             * only the used range is written. */
+            if (stride) {
+                hwaddr vram_size = memory_region_size(d->vram);
+                size_t used = num_elements * stride;
+                if (start + used > vram_size) {
+                    used = start < vram_size ? vram_size - start : 0;
+                }
+                glBindBuffer(GL_ARRAY_BUFFER, r->gl_inline_buffer[i]);
+                glBufferData(GL_ARRAY_BUFFER,
+                             (GLsizeiptr)(max_element + 1) * stride, NULL,
+                             GL_STREAM_DRAW);
+                glBufferSubData(GL_ARRAY_BUFFER, min_element * stride, used,
+                                d->vram_ptr + start);
+                attrib_data_addr = 0;
+            }
+            (void)updated_memory_buffer;
+#else
             update_memory_buffer(d, start, num_elements * stride,
                                         updated_memory_buffer);
             updated_memory_buffer = true;
+#endif
         }
 
         uint32_t provoking_element_index = provoking_element - min_element;

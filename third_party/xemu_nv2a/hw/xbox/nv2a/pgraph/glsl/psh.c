@@ -795,7 +795,7 @@ static void apply_convolution_filter(const struct PixelShader *ps, MString *vars
         "vec4 t%d = vec4(0.0);\n"
         "for (int i = 0; i < 9; i++) {\n"
         "    vec3 texCoordDelta = vec3(convolution3x3[i], 0);\n"
-        "    texCoordDelta.xy /= textureSize(texSamp%d, 0);\n"
+        "    texCoordDelta.xy /= vec2(textureSize(texSamp%d, 0));\n"
         "    t%d += textureProj(texSamp%d, %s(pT%d.xyw) + texCoordDelta) * gaussian3x3[i];\n"
         "}\n", tex, tex, tex, tex, tex_remap, tex);
 }
@@ -880,8 +880,8 @@ static MString* psh_convert(struct PixelShader *ps)
         "               else return (x)/127.0;\n"
         "}\n"
         "float sign3_to_0_to_1(float x) {\n"
-        "    if (x >= 0) return x/2;\n"
-        "           else return 1+x/2;\n"
+        "    if (x >= 0.0) return x/2.0;\n"
+        "           else return 1.0+x/2.0;\n"
         "}\n"
         "vec3 dotmap_zero_to_one(vec4 col) {\n"
         "    return col.rgb;\n"
@@ -1006,10 +1006,42 @@ static MString* psh_convert(struct PixelShader *ps)
                              "}\n");
     }
 
+#ifdef XBOXRECOMP_ANGLE
+    /* Without the geometry shader there are no triangle corners to
+     * interpolate from. Perspective-correct interpolation of w gives the
+     * w-buffer value directly; interp(z*w)/interp(w) gives the screen-linear
+     * z. The slope term comes from screen-space derivatives (per unscaled
+     * pixel) instead of from the corners. */
     if (ps->state->z_perspective) {
         mstring_append(
             clip,
-            "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
+            "precise float zvalue = vtxPos0.y;\n"
+            "float triMZa = max(abs(dFdx(1.0 / zvalue)), abs(dFdy(1.0 / zvalue)))"
+            " * float(surfaceScale.x);\n"
+            "if (zvalue > 0.0) {\n"
+            "  float zslopeofs = depthFactor*triMZa*zvalue*zvalue;\n"
+            "  zvalue += depthOffset;\n"
+            "  zvalue += zslopeofs;\n"
+            "} else {\n"
+            "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
+            "}\n"
+            "if (isnan(zvalue) || isinf(zvalue)) {\n"
+            "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
+            "}\n");
+    } else {
+        mstring_append(
+            clip,
+            "precise float zvalue = vtxPos0.x / vtxPos0.y;\n"
+            "float triMZa = max(abs(dFdx(zvalue)), abs(dFdy(zvalue)))"
+            " * float(surfaceScale.x);\n"
+            "zvalue += depthOffset;\n"
+            "zvalue += depthFactor*triMZa;\n");
+    }
+#else
+    if (ps->state->z_perspective) {
+        mstring_append(
+            clip,
+            "vec2 unscaled_xy = gl_FragCoord.xy / vec2(surfaceScale);\n"
             "precise float bc0 = area(unscaled_xy, vtxPos1.xy, vtxPos2.xy);\n"
             "precise float bc1 = area(unscaled_xy, vtxPos2.xy, vtxPos0.xy);\n"
             "precise float bc2 = area(unscaled_xy, vtxPos0.xy, vtxPos1.xy);\n"
@@ -1043,7 +1075,7 @@ static MString* psh_convert(struct PixelShader *ps)
     } else {
         mstring_append(
             clip,
-            "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
+            "vec2 unscaled_xy = gl_FragCoord.xy / vec2(surfaceScale);\n"
             "precise float bc0 = area(unscaled_xy, vtxPos1.xy, vtxPos2.xy);\n"
             "precise float bc1 = area(unscaled_xy, vtxPos2.xy, vtxPos0.xy);\n"
             "precise float bc2 = area(unscaled_xy, vtxPos0.xy, vtxPos1.xy);\n"
@@ -1059,6 +1091,8 @@ static MString* psh_convert(struct PixelShader *ps)
             "zvalue += depthOffset;\n"
             "zvalue += depthFactor*triMZ;\n");
     }
+
+#endif
 
     /* Depth clipping */
     if (ps->state->depth_clipping) {
@@ -1423,7 +1457,7 @@ static MString* psh_convert(struct PixelShader *ps)
             if (ps->state->rect_tex[i]) {
                 mstring_append_fmt(preflight,
                 "vec2 norm%d(vec2 coord) {\n"
-                "    return coord / (textureSize(texSamp%d, 0) / texScale[%d]);\n"
+                "    return coord / (vec2(textureSize(texSamp%d, 0)) / texScale[%d]);\n"
                 "}\n",
                 i, i, i);
                 mstring_append_fmt(preflight,

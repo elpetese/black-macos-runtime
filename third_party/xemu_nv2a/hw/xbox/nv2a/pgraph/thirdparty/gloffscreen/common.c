@@ -27,6 +27,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "gloffscreen.h"
 
@@ -47,6 +48,16 @@ void glo_readpixels(GLenum gl_format, GLenum gl_type,
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
 
     glReadPixels(0, 0, width, height, gl_format, gl_type, data);
+#ifdef XBOXRECOMP_ANGLE
+    if (getenv("RECOMP_ANGLE_DIAG")) {
+        static unsigned bad_reads;
+        GLenum error = glGetError();
+        if (error != GL_NO_ERROR && bad_reads++ < 25)
+            fprintf(stderr, "[ANGLE] readpixels format=0x%x type=0x%x bpp=%u"
+                            " size=%ux%u error=0x%x\n",
+                    gl_format, gl_type, bytes_per_pixel, width, height, error);
+    }
+#endif
 
     if (vflip) {
         GLubyte *b = (GLubyte *) data;
@@ -69,5 +80,16 @@ void glo_readpixels(GLenum gl_format, GLenum gl_type,
 
 bool glo_check_extension(const char* ext_name)
 {
+#ifdef XBOXRECOMP_ANGLE
+    GLint count = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+    for (GLint i = 0; i < count; i++) {
+        const char *name = (const char *)glGetStringi(GL_EXTENSIONS, i);
+        if (name && strcmp(name, ext_name) == 0)
+            return true;
+    }
+    return false;
+#else
     return epoxy_has_gl_extension(ext_name);
+#endif
 }

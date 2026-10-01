@@ -36,10 +36,16 @@ static void early_context_init(void)
     // context is created so the temporary context will not become the thread
     // context. After destroying the context, some a durable context should be
     // selected.
+#ifndef XBOXRECOMP_ANGLE
     GloContext *context = glo_context_create();
     pgraph_gl_determine_gpu_properties();
     glo_context_destroy(context);
+#endif
     glo_set_current(g_nv2a_context_display);
+#ifdef XBOXRECOMP_ANGLE
+    /* EGL contexts may be current on only one thread at a time. */
+    glo_set_current(NULL);
+#endif
 }
 
 static void pgraph_gl_init(NV2AState *d, Error **errp)
@@ -57,9 +63,11 @@ static void pgraph_gl_init(NV2AState *d, Error **errp)
 #endif
 
     /* DXT textures */
+#ifndef XBOXRECOMP_ANGLE
     assert(glo_check_extension("GL_EXT_texture_compression_s3tc"));
     /*  Internal RGB565 texture format */
     assert(glo_check_extension("GL_ARB_ES2_compatibility"));
+#endif
 
     glGetFloatv(GL_SMOOTH_LINE_WIDTH_RANGE, r->supported_smooth_line_width_range);
     glGetFloatv(GL_ALIASED_LINE_WIDTH_RANGE, r->supported_aliased_line_width_range);
@@ -102,7 +110,14 @@ static void pgraph_gl_finalize(NV2AState *d)
 static void pgraph_gl_flip_stall(NV2AState *d)
 {
     NV2A_GL_DFRAME_TERMINATOR();
+#ifdef XBOXRECOMP_ANGLE
+    /* Submit, don't drain: on Metal glFinish waits for the whole frame,
+     * and the frame shown in the window is read back asynchronously
+     * (pgraph_gl_read_surface_scaled_async). */
+    glFlush();
+#else
     glFinish();
+#endif
 }
 
 static void pgraph_gl_flush(NV2AState *d)

@@ -48,7 +48,13 @@ MString *pgraph_glsl_get_vtx_header(MString *out, bool location, bool smooth,
         { smooth_s,    vec4_s,  "vtxT1"  },
         { smooth_s,    vec4_s,  "vtxT2"  },
         { smooth_s,    vec4_s,  "vtxT3"  },
+#ifdef XBOXRECOMP_ANGLE
+        /* No geometry shader: vtxPos0 carries (z*w, w), interpolated, and
+         * the fragment shader derives depth from it (see psh.c). */
+        { smooth_s,    vec4_s,  "vtxPos0" },
+#else
         { flat_s,      vec4_s,  "vtxPos0" },
+#endif
         { flat_s,      vec4_s,  "vtxPos1" },
         { flat_s,      vec4_s,  "vtxPos2" },
         { flat_s,      float_s, "triMZ"  },

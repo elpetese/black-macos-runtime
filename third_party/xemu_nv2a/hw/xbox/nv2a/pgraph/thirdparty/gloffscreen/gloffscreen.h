@@ -30,7 +30,13 @@
 #define GLOFFSCREEN_H_
 
 #include <stdbool.h>
+#ifdef XBOXRECOMP_ANGLE
+#include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
+#include "angle_gl_compat.h"
+#else
 #include <epoxy/gl.h>
+#endif
 
 /* Used to hold data for the OpenGL context */
 struct _GloContext;

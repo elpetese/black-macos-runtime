@@ -337,16 +337,39 @@ static void capture_hires_impl(NV2AState *d)
             return;
         s_hr_cap = need;
     }
+#ifdef XBOXRECOMP_ANGLE
+    uint32_t aw, ah, astride;
+    if (!pgraph_gl_read_surface_scaled_async(d, sb, s_hr_back, s_hr_cap,
+                                             &aw, &ah, &astride))
+        return;
+#else
     pgraph_gl_read_surface_scaled(d, sb, s_hr_back);
+#endif
+#ifdef XBOXRECOMP_ANGLE
+    if (getenv("RECOMP_ANGLE_DIAG") && s_flips % 120 == 0) {
+        size_t lit = 0;
+        for (size_t i = 0; i < need; i += 4)
+            lit += s_hr_back[i] != 0 || s_hr_back[i + 1] != 0 || s_hr_back[i + 2] != 0;
+        fprintf(stderr, "[ANGLE] flip %u surface 0x%llx %ux%u lit=%zu/%zu glerr=0x%x\n",
+                s_flips, (unsigned long long)sb->vram_addr, sb->width, sb->height,
+                lit, need / 4, glGetError());
+    }
+#endif
     pthread_mutex_lock(&s_hr_lock);
     {
         uint8_t *t = s_hr_front;
         s_hr_front = s_hr_back;
         s_hr_back = t;
     }
+#ifdef XBOXRECOMP_ANGLE
+    s_hr_w = aw;
+    s_hr_h = ah;
+    s_hr_stride = astride;
+#else
     s_hr_w = sb->width * scale;
     s_hr_h = sb->height * scale;
     s_hr_stride = sb->pitch * scale;
+#endif
     s_hr_seq++;
     pthread_mutex_unlock(&s_hr_lock);
 }

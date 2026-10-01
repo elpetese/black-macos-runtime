@@ -82,6 +82,13 @@ static const char *get_vertex_order(int rot)
 
 bool pgraph_glsl_need_geom(const GeomState *state)
 {
+#ifdef XBOXRECOMP_ANGLE
+    /* ANGLE Metal exposes GLES 3.0 without geometry shaders. This first
+     * pass uses the vertex-to-fragment path while geometry emulation is
+     * developed. Triangle depth interpolation is not yet equivalent. */
+    (void)state;
+    return false;
+#endif
     /* FIXME: Missing support for 2-sided-poly mode */
     assert(state->polygon_front_mode == state->polygon_back_mode);
     enum ShaderPolygonMode polygon_mode = state->polygon_front_mode;

@@ -137,7 +137,7 @@ static void init_render_to_texture(PGRAPHState *pg)
         "layout(location = 0) out vec4 out_Color;\n"
         "void main()\n"
         "{\n"
-        "    vec2 texCoord = gl_FragCoord.xy / textureSize(tex, 0).xy;\n"
+        "    vec2 texCoord = gl_FragCoord.xy / vec2(textureSize(tex, 0).xy);\n"
         "    out_Color.rgba = texture(tex, texCoord);\n"
         "}\n";
 
@@ -764,6 +764,14 @@ static void surface_download_to_buffer(NV2AState *d, SurfaceBinding *surface,
 
 static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force)
 {
+#ifdef XBOXRECOMP_ANGLE
+    /* GLES 3.0 cannot read packed depth/stencil from this framebuffer via
+     * glReadPixels. The guest depth shadow will need a separate conversion. */
+    if (!surface->color) {
+        surface->download_pending = false;
+        return;
+    }
+#endif
     if (!(surface->download_pending || force) || !surface->width ||
         !surface->height) {
         return;
@@ -1491,3 +1499,84 @@ void pgraph_gl_read_surface_scaled(NV2AState *d, SurfaceBinding *surface,
 {
     surface_download_to_buffer(d, surface, false, false, false, pixels);
 }
+
+#ifdef XBOXRECOMP_ANGLE
+/* pgraph_gl_read_surface_scaled, one frame late and without stalling.
+ * This flip's surface is copied into a pixel pack buffer on the GPU, fenced,
+ * and the previous flip's copy -- finished by now, or nearly -- is mapped
+ * into `pixels` (at most `cap` bytes) with its size in *w, *h, *stride.
+ * Returns false when there is no earlier copy to hand out yet. */
+bool pgraph_gl_read_surface_scaled_async(NV2AState *d, SurfaceBinding *surface,
+                                         uint8_t *pixels, size_t cap,
+                                         uint32_t *w, uint32_t *h,
+                                         uint32_t *stride)
+{
+    static GLuint pbo[2];
+    static GLsync fence[2];
+    static size_t size[2];
+    static uint32_t pw[2], ph[2], pstride[2];
+    static int cur;
+    unsigned scale = d->pgraph.surface_scale_factor;
+    int prev = cur ^ 1;
+    bool got = false;
+
+    if (!pbo[0])
+        glGenBuffers(2, pbo);
+
+    /* Issue this flip's copy. */
+    size[cur] = (size_t)scale * scale * surface->size;
+    pw[cur] = scale * surface->width;
+    ph[cur] = scale * surface->height;
+    pstride[cur] = scale * surface->pitch;
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D,
+                           0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                           GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, surface->fmt.gl_attachment,
+                           GL_TEXTURE_2D, surface->gl_buffer, 0);
+
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo[cur]);
+    glBufferData(GL_PIXEL_PACK_BUFFER, size[cur], NULL, GL_STREAM_READ);
+    glPixelStorei(GL_PACK_ROW_LENGTH, pstride[cur] / surface->fmt.bytes_per_pixel);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, pw[cur], ph[cur], surface->fmt.gl_format,
+                 surface->fmt.gl_type, NULL);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    if (fence[cur])
+        glDeleteSync(fence[cur]);
+    fence[cur] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+
+    /* Hand out the previous one. */
+    if (fence[prev]) {
+        glClientWaitSync(fence[prev], GL_SYNC_FLUSH_COMMANDS_BIT,
+                         GL_TIMEOUT_IGNORED);
+        glDeleteSync(fence[prev]);
+        fence[prev] = 0;
+        if (size[prev] <= cap) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo[prev]);
+            void *p = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, size[prev],
+                                       GL_MAP_READ_BIT);
+            if (p) {
+                memcpy(pixels, p, size[prev]);
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                *w = pw[prev];
+                *h = ph[prev];
+                *stride = pstride[prev];
+                got = true;
+            }
+        }
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, surface->fmt.gl_attachment,
+                           GL_TEXTURE_2D, 0, 0);
+    bind_current_surface(d);
+    cur = prev;
+    return got;
+}
+#endif

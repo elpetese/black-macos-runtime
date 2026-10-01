@@ -284,6 +284,12 @@ SurfaceBinding *pgraph_gl_surface_get(NV2AState *d, hwaddr addr);
 SurfaceBinding *pgraph_gl_surface_get_within(NV2AState *d, hwaddr addr);
 void pgraph_gl_read_surface_scaled(NV2AState *d, SurfaceBinding *surface,
                                    uint8_t *pixels);
+#ifdef XBOXRECOMP_ANGLE
+bool pgraph_gl_read_surface_scaled_async(NV2AState *d, SurfaceBinding *surface,
+                                         uint8_t *pixels, size_t cap,
+                                         uint32_t *w, uint32_t *h,
+                                         uint32_t *stride);
+#endif
 void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *e);
 void pgraph_gl_unbind_surface(NV2AState *d, bool color);
 void pgraph_gl_upload_surface_data(NV2AState *d, SurfaceBinding *surface, bool force);
