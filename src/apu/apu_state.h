@@ -313,8 +313,10 @@ static inline int adpcm_decode_block(int16_t *outbuf, const uint8_t *inbuf,
 
     for (int ch = 0; ch < channels; ch++) {
         *outbuf++ = pcmdata[ch] = (int16_t)(inbuf[0] | (inbuf[1] << 8));
-        index[ch] = inbuf[2];
-        if (index[ch] < 0 || index[ch] > 88 || inbuf[3]) return 0;
+        /* The fourth header byte is reserved, and valid game blocks can
+         * leave it nonzero. Clamp the initial index before table lookup. */
+        index[ch] = (int8_t)inbuf[2];
+        ADPCM_CLIP(index[ch], 0, 88);
         inbufsize -= 4;
         inbuf += 4;
     }

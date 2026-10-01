@@ -8,7 +8,7 @@
  * For initial audio, we bypass the DSP entirely:
  * - VP mixbins are passed directly to the EP output
  * - GP effects processing is skipped
- * - The EP just copies mixbin 0/1 (front L/R) to the monitor buffer
+ * - The EP mixes even/odd mixbins to stereo in the monitor buffer
  *
  * This gives us basic voice playback without effects. The DSP can be
  * connected later for reverb, EQ, and other processing.
@@ -138,8 +138,10 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             float left = 0.0f, right = 0.0f;
             for (int b = 0; b < NUM_MIXBINS; b++) {
                 float s = mixbins[b][i];
-                if (b < 16) left += s;
-                else right += s;
+                /* Adjacent bins form stereo pairs. Black routes audio to
+                 * bins 19 and 20, which must reach separate channels. */
+                if (b & 1) right += s;
+                else left += s;
             }
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
