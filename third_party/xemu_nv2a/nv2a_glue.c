@@ -169,7 +169,7 @@ void xnv2a_init(uint8_t *vram, size_t vram_size, uint8_t *aperture)
         const char *e = getenv("RECOMP_SCALE");
         int n = e ? atoi(e) : 1;
         if (n < 1) n = 1;
-        if (n > 4) n = 4;
+        if (n > 6) n = 6;
         g_config.display.quality.surface_scale = n;
         if (n > 1)
             fprintf(stderr, "  [XNV2A] internal resolution x%d (%dx%d)\n", n, 640 * n, 480 * n);
